@@ -25,7 +25,10 @@ const (
 )
 
 type (
-	// memtable 在数据被刷新到索引和值日志之前保存数据。
+	// memtable 在数据被刷新到索引和值日志之前保存数据
+	// 刷新后数据最终会被持久化到两个地方：
+	//		- 索引（B树）：存储键和位置信息
+	//		- 值日志（vlog）：存储实际的值数据
 	memtable struct {
 		mu      sync.RWMutex
 		wal     *wal.WAL           // 预写日志
