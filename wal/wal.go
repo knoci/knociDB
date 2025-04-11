@@ -186,7 +186,7 @@ func (wal *WAL) SetIsStartupTraversal(v bool) {
 	wal.activeSegment.isStartupTraversal = v
 }
 
-// NewReaderWithMax 返回一个新的 WAL 读取器，
+// NewReaderWithMax 返回一个新的 WAL 读取器
 func (wal *WAL) NewReaderWithMax(segId SegmentID) *Reader {
 	wal.mu.RLock()
 	defer wal.mu.RUnlock()
@@ -234,8 +234,7 @@ func (wal *WAL) NewReaderWithStart(startPos *ChunkPosition) (*Reader, error) {
 		}
 		// 跳过位置小于给定位置的数据块。
 		currentPos := reader.CurrentChunkPosition()
-		if currentPos.BlockNumber >= startPos.BlockNumber &&
-			currentPos.ChunkOffset >= startPos.ChunkOffset {
+		if currentPos.BlockNumber >= startPos.BlockNumber && currentPos.ChunkOffset >= startPos.ChunkOffset {
 			break
 		}
 		// 调用 Next 继续查找。

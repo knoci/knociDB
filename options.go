@@ -1,6 +1,9 @@
 package knocidb
 
-import "time"
+import (
+	"os"
+	"time"
+)
 
 type Options struct {
 	// DirPath 指定存储所有数据库文件的目录路径
@@ -55,4 +58,38 @@ type IteratorOptions struct {
 
 	// Reverse 表示迭代器是否反向 false 是正向，true 是反向
 	Reverse bool
+}
+
+const (
+	B  = 1
+	KB = 1024 * B
+	MB = 1024 * KB
+	GB = 1024 * MB
+)
+
+// 默认选项
+var DefaultOptions = Options{
+	DirPath:               tempDBDir(),
+	MemtableSize:          64 * MB,
+	MemtableNums:          15,
+	Sync:                  false,
+	BytesPerSync:          0,
+	AdvisedCompactionRate: 0.3,
+	ForceCompactionRate:   0.5,
+	WaitMemSpaceTimeout:   100 * time.Millisecond,
+}
+
+var DefaultBatchOptions = BatchOptions{
+	WriteOptions: DefaultWriteOptions,
+	ReadOnly:     false,
+}
+
+var DefaultWriteOptions = WriteOptions{
+	Sync:       false,
+	DisableWal: false,
+}
+
+func tempDBDir() string {
+	dir, _ := os.MkdirTemp("", "knocidb-temp")
+	return dir
 }

@@ -67,8 +67,9 @@ type segmentIter struct {
 	chunkOffset int64
 }
 
-// ChunkPosition 表示段文件中的位置。 用于从段文件中读取范围数据。
+// ChunkPosition 表示在段文件中的位置信息。 用于从段文件中读取范围数据。
 type ChunkPosition struct {
+	// SegmentID标记唯一段
 	SegmentId SegmentID
 	// BlockNumber 数据块在段文件中的块号
 	BlockNumber uint32
@@ -282,6 +283,7 @@ func (seg *segment) writeAll(data [][]byte) (positions []*ChunkPosition, err err
 	// 初始化数据块缓冲区
 	chunkBuffer := bytebufferpool.Get()
 	chunkBuffer.Reset()
+	// 如果出错，就回滚
 	defer func() {
 		if err != nil {
 			seg.currentBlockNumber = originBlockNumber
@@ -319,6 +321,7 @@ func (seg *segment) Write(data []byte) (pos *ChunkPosition, err error) {
 	// 初始化数据块缓冲区
 	chunkBuffer := bytebufferpool.Get()
 	chunkBuffer.Reset()
+	// 如果出错，就回滚
 	defer func() {
 		if err != nil {
 			seg.currentBlockNumber = originBlockNumber
@@ -390,12 +393,15 @@ func (seg *segment) readInternal(blockNumber uint32, chunkOffset int64) ([]byte,
 	)
 
 	if seg.isStartupTraversal {
+		// 复用startupBlock
 		block = seg.startupBlock.block
 	} else {
+		// 请求block内存池
 		block = getBuffer()
 		if len(block) != blockSize {
 			block = make([]byte, blockSize)
 		}
+		// 释放
 		defer putBuffer(block)
 	}
 
@@ -435,7 +441,7 @@ func (seg *segment) readInternal(blockNumber uint32, chunkOffset int64) ([]byte,
 		// 长度
 		length := binary.LittleEndian.Uint16(header[4:6])
 
-		// 复制数据
+		// 切片复制数据
 		start := chunkOffset + chunkHeaderSize
 		result = append(result, block[start:start+int64(length)]...)
 

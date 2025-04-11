@@ -43,7 +43,7 @@ type (
 	}
 )
 
-// 查找指定 ID 的内存表的 WAL 文件
+// 打开WAL获取所有memtable
 func openMemtables(options Options) ([]*memtable, error) {
 	entries, err := os.ReadDir(options.DirPath)
 	if err != nil {
@@ -85,7 +85,6 @@ func openMemtables(options Options) ([]*memtable, error) {
 		}
 		tables[i] = table
 	}
-
 	return tables, nil
 }
 
