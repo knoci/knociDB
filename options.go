@@ -21,11 +21,8 @@ type Options struct {
 	// BytesPerSync 指定在调用 fsync 之前要写入的字节数
 	BytesPerSync uint32
 
-	// 废弃表推荐压缩率
-	AdvisedCompactionRate float32
-
-	// 废弃表强制压缩率
-	ForceCompactionRate float32
+	// PartitionNum 指定用于索引和值日志的分区数
+	PartitionNum int
 
 	// WaitMemSpaceTimeout 指定等待内存表空间的超时时间
 	// 当所有内存表都已满时，将由后台协程刷新到磁盘 但如果刷新速度慢于写入速度，内存表中可能没有空间
@@ -69,14 +66,13 @@ const (
 
 // 默认选项
 var DefaultOptions = Options{
-	DirPath:               tempDBDir(),
-	MemtableSize:          64 * MB,
-	MemtableNums:          15,
-	Sync:                  false,
-	BytesPerSync:          0,
-	AdvisedCompactionRate: 0.3,
-	ForceCompactionRate:   0.5,
-	WaitMemSpaceTimeout:   100 * time.Millisecond,
+	DirPath:             tempDBDir(),
+	MemtableSize:        64 * MB,
+	MemtableNums:        15,
+	Sync:                false,
+	BytesPerSync:        0,
+	PartitionNum:        3,
+	WaitMemSpaceTimeout: 100 * time.Millisecond,
 }
 
 var DefaultBatchOptions = BatchOptions{
