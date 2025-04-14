@@ -2,6 +2,8 @@ package knocidb
 
 import (
 	"encoding/binary"
+	"github.com/google/uuid"
+	"knocidb/wal"
 )
 
 // LogRecordType 是日志记录的类型
@@ -92,4 +94,62 @@ func decodeLogRecord(buf []byte) *LogRecord {
 		BatchID: batchID,
 		Type:    recordType,
 	}
+}
+
+// KeyPosition 是键在值日志中的位置
+type KeyPosition struct {
+	key       []byte
+	partition uint32
+	uid       uuid.UUID
+	position  *wal.ChunkPosition
+}
+
+// ValueLogRecord 是值日志中键值对的记录
+type ValueLogRecord struct {
+	uid   uuid.UUID
+	key   []byte
+	value []byte
+}
+
+func encodeValueLogRecord(record *ValueLogRecord) []byte {
+	keySize := 4
+	index := 0
+	uidBytes, _ := record.uid.MarshalBinary()
+	buf := make([]byte, len(uidBytes)+4+len(record.key)+len(record.value))
+
+	copy(buf[index:], uidBytes)
+	index += len(uidBytes)
+	// 小端序
+	binary.LittleEndian.PutUint32(buf[index:index+keySize], uint32(len(record.key)))
+	index += keySize
+
+	copy(buf[index:index+len(record.key)], record.key)
+	index += len(record.key)
+
+	copy(buf[index:], record.value)
+	return buf
+}
+
+func decodeValueLogRecord(buf []byte) *ValueLogRecord {
+	keySize := 4
+	index := 0
+	var uid uuid.UUID
+	uidBytes := buf[:len(uid)]
+	err := uid.UnmarshalBinary(uidBytes)
+	if err != nil {
+		return nil
+	}
+	index += len(uid)
+
+	keyLen := (int)(binary.LittleEndian.Uint32(buf[index : index+keySize]))
+	index += keySize
+
+	key := make([]byte, keyLen)
+	copy(key, buf[index:index+keyLen])
+	index += keyLen
+
+	value := make([]byte, len(buf)-len(uid)-keyLen-keySize)
+	copy(value, buf[index:])
+
+	return &ValueLogRecord{uid: uid, key: key, value: value}
 }
