@@ -45,8 +45,7 @@ type valueLogOptions struct {
 	totalNumber uint32
 }
 
-// 为值日志打开 WAL 文件，它将打开多个 WAL 文件用于并发读写
-// WAL 文件的数量由 partitionNum 指定
+// 为值日志打开 WAL 文件，将打开多个 WAL 文件用于并发读写
 // 为每个 WAL 初始化废弃表，构建 dpTable
 func openValueLog(options valueLogOptions) (*valueLog, error) {
 	var walFiles []*wal.WAL
