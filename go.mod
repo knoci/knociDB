@@ -9,6 +9,7 @@ require (
 	github.com/spaolacci/murmur3 v1.1.0
 	github.com/stretchr/testify v1.10.0
 	github.com/valyala/bytebufferpool v1.0.0
+	go.etcd.io/bbolt v1.4.0
 	golang.org/x/sync v0.13.0
 )
 

@@ -32,8 +32,8 @@ type valueLogOptions struct {
 	// 值日志被分成多个部分用于并发读写
 	partitionNum uint32
 
-	// 用于分片的函数
-	KeyFunction func([]byte) uint64
+	// 用于分片的哈希函数
+	hashKeyFunction func([]byte) uint64
 
 	// 在读取指定内存容量的条目后将有效条目写入磁盘
 	compactBatchCapacity int
@@ -85,7 +85,7 @@ func (vlog *valueLog) read(pos *KeyPosition) (*ValueLogRecord, error) {
 	return log, nil
 }
 
-// 将值日志记录写入值日志，它将被分成多个分区并同时写入相应的分区
+// 将vlog记录写入，它将被写入相应的分区
 func (vlog *valueLog) writeBatch(records []*ValueLogRecord) ([]*KeyPosition, error) {
 	// 按分区对记录进行分组
 	partitionRecords := make([][]*ValueLogRecord, vlog.options.partitionNum)
@@ -182,8 +182,7 @@ func (vlog *valueLog) close() error {
 }
 
 func (vlog *valueLog) getKeyPartition(key []byte) int {
-	// TODO 要先设计分区算法
-	return 0
+	return int(vlog.options.hashKeyFunction(key) % uint64(vlog.options.partitionNum))
 }
 
 func (vlog *valueLog) setDiscard(partition uint32, id uuid.UUID) {
