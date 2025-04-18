@@ -134,7 +134,7 @@ func (bt *BPTree) PutBatch(positions []*KeyPosition, _ ...diskhash.MatchKeyFunc)
 					default:
 						uidBytes, _ := record.uid.MarshalBinary()
 						encPos := record.position.Encode()
-						//nolint:gocritic // 需要将 uidbytes 与 encPos 合并后存入 bptree
+						// 需要将 uidbytes 与 encPos 合并后存入 bptree。
 						valueBytes := append(uidBytes, encPos...)
 						oldValue := bucket.Get(record.key)
 						if err := bucket.Put(record.key, valueBytes); err != nil {
@@ -271,7 +271,7 @@ func (bt *BPTree) Close() error {
 	return nil
 }
 
-// Sync 对数据库文件句柄执行 fdatasync()。
+// Sync 对数据库文件sync()。
 func (bt *BPTree) Sync() error {
 	for _, tree := range bt.trees {
 		err := tree.Sync()
