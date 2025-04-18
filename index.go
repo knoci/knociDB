@@ -32,10 +32,10 @@ type Index interface {
 func openIndex(options indexOptions) (Index, error) {
 	switch options.indexType {
 	case BTree:
+
 		return openBTreeIndex(options)
 	case Hash:
-		// TODO
-		return nil, nil
+		return openHashIndex(options)
 	default:
 		panic("unknown index type")
 	}
