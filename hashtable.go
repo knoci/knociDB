@@ -1,9 +1,11 @@
 package knocidb
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"fmt"
+	"knocidb/wal"
 	"path/filepath"
 
 	"golang.org/x/sync/errgroup"
@@ -161,4 +163,33 @@ func (ht *HashTable) Close() error {
 		}
 	}
 	return nil
+}
+
+// 匹配，如果不需要keyPos或value，则设置为nil
+func MatchKeyFunc(db *DB, key []byte, keyPos **KeyPosition, value *[]byte) func(slot diskhash.Slot) (bool, error) {
+	return func(slot diskhash.Slot) (bool, error) {
+		chunkPosition := wal.DecodeChunkPosition(slot.Value)
+		checkKeyPos := &KeyPosition{
+			key:       key,
+			partition: uint32(db.vlog.getKeyPartition(key)),
+			position:  chunkPosition,
+		}
+		valueLogRecord, err := db.vlog.read(checkKeyPos)
+		if err != nil {
+			return false, err
+		}
+		if valueLogRecord == nil {
+			return false, nil
+		}
+		if !bytes.Equal(valueLogRecord.key, key) {
+			return false, nil
+		}
+		if keyPos != nil {
+			*keyPos = checkKeyPos
+		}
+		if value != nil {
+			*value = valueLogRecord.value
+		}
+		return true, nil
+	}
 }

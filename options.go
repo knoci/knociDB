@@ -24,6 +24,27 @@ type Options struct {
 	// PartitionNum 指定用于索引和值日志的分区数
 	PartitionNum int
 
+	// KeyHashFunction 指定用于分片的哈希函数 用于确定键属于哪个分区 默认值为 xxhash
+	KeyHashFunction func([]byte) uint64
+
+	// ValueLogFileSize 单个值日志文件的大小 默认值为 1GB
+	ValueLogFileSize int64
+
+	// indexType 索引类型 默认值为 bptree
+	IndexType IndexType
+
+	// 是否启用磁盘监控
+	EnableDiskIO bool
+
+	// 磁盘IO采样间隔，单位为毫秒
+	DiskIOSamplingInterval int
+
+	// 用于检索一段时间内IO繁忙状态的窗口
+	DiskIOSamplingWindow int
+
+	// 采样时间内IO时间的比率，用于表示IO的繁忙状态
+	DiskIOBusyRate float32
+
 	// WaitMemSpaceTimeout 指定等待内存表空间的超时时间
 	// 当所有内存表都已满时，将由后台协程刷新到磁盘 但如果刷新速度慢于写入速度，内存表中可能没有空间
 	// 因此写入操作将等待内存表中的空间，超时时间由 WaitMemSpaceTimeout 指定
