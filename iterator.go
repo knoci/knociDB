@@ -83,6 +83,7 @@ type Iterator struct {
 	h          iterHeap
 	itrs       []*singleIter       // 用于重建堆
 	versionMap map[int]*singleIter // 映射 version->singleIter
+	db         *DB
 }
 
 // Rewind 将迭代器定位到第一个键
@@ -210,4 +211,84 @@ func (mi *Iterator) Close() error {
 		}
 	}
 	return nil
+}
+
+// NewIterator 返回一个新的迭代器
+// 该迭代器将遍历数据库中的所有键
+// 调用者有责任在不再使用迭代器时调用Close，否则会导致资源泄漏
+// 迭代器不是线程安全的，不应该从多个goroutine并发使用同一个迭代器
+func (db *DB) NewIterator(options IteratorOptions) (*Iterator, error) {
+	if db.options.IndexType == Hash {
+		return nil, ErrDBIteratorUnsupportedTypeHASH
+	}
+	db.mu.Lock()
+	defer func() {
+		if r := recover(); r != nil {
+			db.mu.Unlock()
+		}
+	}()
+
+	itrs := make([]*singleIter, 0, db.options.PartitionNum+len(db.immuMems)+1)
+	itrsM := make(map[int]*singleIter)
+	version := 0
+	index, ok := db.index.(*BPTree)
+	if !ok {
+		panic("index type not support")
+	}
+
+	for i := 0; i < db.options.PartitionNum; i++ {
+		tx, err := index.trees[i].Begin(false)
+		if err != nil {
+			return nil, err
+		}
+		itr := newBptreeIterator(
+			tx,
+			options,
+		)
+		itr.Rewind()
+		// is empty
+		if !itr.Valid() {
+			_ = itr.Close()
+			continue
+		}
+		itrs = append(itrs, &singleIter{
+			iType:   BptreeItr,
+			options: options,
+			version: version,
+			idx:     version,
+			iter:    itr,
+		})
+		itrsM[version] = itrs[len(itrs)-1]
+		version++
+	}
+	memtableList := make([]*memtable, len(db.immuMems)+1)
+	copy(memtableList, append(db.immuMems, db.activeMem))
+	for i := 0; i < len(memtableList); i++ {
+		itr := newMemtableIterator(options, memtableList[i])
+		itr.Rewind()
+		// is empty
+		if !itr.Valid() {
+			_ = itr.Close()
+			continue
+		}
+		itrs = append(itrs, &singleIter{
+			iType:   MemItr,
+			options: options,
+			version: version,
+			idx:     version,
+			iter:    itr,
+		})
+		itrsM[version] = itrs[len(itrs)-1]
+		version++
+	}
+
+	h := iterHeap(itrs)
+	heap.Init(&h)
+
+	return &Iterator{
+		h:          h,
+		itrs:       itrs,
+		versionMap: itrsM,
+		db:         db,
+	}, nil
 }

@@ -4,6 +4,14 @@ import (
 	"github.com/google/uuid"
 )
 
+type ThresholdState int
+
+const (
+	ArriveAdvisedThreshold int = iota // 建议在此时执行压缩操作
+	ArriveForceThreshold              // 此时强制执行压缩操作
+	UnarriveThreshold                 // 不需要执行压缩操作
+)
+
 type (
 	// Discardtable 用于存储已删除/更新的键的旧信息。
 	// 对于每次写入/更新生成的 uuid，我们将其存储在表中。
@@ -13,6 +21,11 @@ type (
 		partition int                    // vlog 中的分片
 		table     map[uuid.UUID]struct{} // 在内存中存储已废弃的键的 uuid
 		size      uint32                 // 当前废弃条目的数量
+	}
+
+	// 用于向自动压缩发送消息
+	discardState struct {
+		thresholdState ThresholdState
 	}
 )
 

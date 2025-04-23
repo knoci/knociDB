@@ -1,6 +1,7 @@
 package knocidb
 
 import (
+	"github.com/cespare/xxhash/v2"
 	"os"
 	"time"
 )
@@ -33,6 +34,15 @@ type Options struct {
 	// indexType 索引类型 默认值为 bptree
 	IndexType IndexType
 
+	// 在读取指定内存容量的条目后将条目写入磁盘
+	CompactBatchCapacity int
+
+	// 废弃表推荐压缩率
+	AdvisedCompactionRate float32
+
+	// 废弃表强制压缩率
+	ForceCompactionRate float32
+
 	// 是否启用磁盘监控
 	EnableDiskIO bool
 
@@ -44,6 +54,9 @@ type Options struct {
 
 	// 采样时间内IO时间的比率，用于表示IO的繁忙状态
 	DiskIOBusyRate float32
+
+	// 是否支持自动压缩
+	AutoCompactSupport bool
 
 	// WaitMemSpaceTimeout 指定等待内存表空间的超时时间
 	// 当所有内存表都已满时，将由后台协程刷新到磁盘 但如果刷新速度慢于写入速度，内存表中可能没有空间
@@ -87,13 +100,24 @@ const (
 
 // 默认选项
 var DefaultOptions = Options{
-	DirPath:             tempDBDir(),
-	MemtableSize:        64 * MB,
-	MemtableNums:        15,
-	Sync:                false,
-	BytesPerSync:        0,
-	PartitionNum:        3,
-	WaitMemSpaceTimeout: 100 * time.Millisecond,
+	DirPath:                tempDBDir(),
+	MemtableSize:           64 * MB,
+	MemtableNums:           15,
+	Sync:                   false,
+	BytesPerSync:           0,
+	PartitionNum:           3,
+	KeyHashFunction:        xxhash.Sum64,
+	ValueLogFileSize:       1 * GB,
+	IndexType:              BTree,
+	CompactBatchCapacity:   1 << 30,
+	AdvisedCompactionRate:  0.3,
+	ForceCompactionRate:    0.5,
+	EnableDiskIO:           false,
+	DiskIOSamplingInterval: 100,
+	DiskIOSamplingWindow:   10,
+	DiskIOBusyRate:         0.5,
+	AutoCompactSupport:     false,
+	WaitMemSpaceTimeout:    100 * time.Millisecond,
 }
 
 var DefaultBatchOptions = BatchOptions{

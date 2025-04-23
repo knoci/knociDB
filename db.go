@@ -1,14 +1,24 @@
 package knocidb
 
 import (
+	"context"
 	"encoding/binary"
+	"errors"
+	"fmt"
 	"github.com/dgraph-io/badger/v4/y"
 	"github.com/google/uuid"
+	"golang.org/x/sync/errgroup"
+	"io"
 	"knocidb/diskhash"
+	"knocidb/wal"
 	"log"
 	"os"
+	"os/signal"
 	"path/filepath"
+	"reflect"
 	"sync"
+	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/gofrs/flock"
@@ -20,14 +30,15 @@ const (
 )
 
 type DB struct {
-	activeMem        *memtable      // 用于写入的活跃内存表
-	immuMems         []*memtable    // 不可变内存表，等待刷新到磁盘
-	index            Index          // 多分区索引，用于存储键和块位置
-	vlog             *valueLog      // 值日志
-	fileLock         *flock.Flock   // 文件锁，防止多个进程使用相同的数据库目录
-	flushChan        chan *memtable // 用于通知刷新协程将内存表刷新到磁盘
-	flushLock        sync.Mutex     // 刷新锁，防止在压缩未发生时进行刷新
-	diskIO           *DiskIO        // 监控磁盘的 IO 状态并在适当时允许自动压缩
+	activeMem        *memtable         // 用于写入的活跃内存表
+	immuMems         []*memtable       // 不可变内存表，等待刷新到磁盘
+	index            Index             // 多分区索引，用于存储键和块位置
+	vlog             *valueLog         // 值日志
+	fileLock         *flock.Flock      // 文件锁，防止多个进程使用相同的数据库目录
+	flushChan        chan *memtable    // 用于通知刷新协程将内存表刷新到磁盘
+	flushLock        sync.Mutex        // 刷新锁，防止在压缩未发生时进行刷新
+	diskIO           *DiskIO           // 监控磁盘的 IO 状态并在适当时允许自动压缩
+	compactChan      chan discardState // 用于通知需要压缩的分片
 	mu               sync.RWMutex
 	closed           bool
 	closeflushChan   chan struct{} // 用于优雅地关闭刷新监听协程
@@ -136,9 +147,19 @@ func Open(options Options) (*DB, error) {
 
 	// 异步启动刷新内存表的协程，
 	// 当活跃内存表已满时，带有新写入的内存表将被刷新到磁盘。
-	/* TODO
 	go db.listenMemtableFlush()
-	*/
+
+	if options.AutoCompactSupport {
+		// 异步启动自动压缩协程，
+		// 监听废弃表状态，并自动压缩。
+		go db.listenAutoCompact()
+
+		// 启动磁盘IO监控，
+		// 在繁忙时阻塞低阈值压缩操作。
+		if options.EnableDiskIO {
+			go db.listenDiskIOState()
+		}
+	}
 
 	return db, nil
 }
@@ -416,7 +437,7 @@ func (db *DB) flushMemtable(table *memtable) {
 		return
 	}
 
-	// 将旧键uuid添加到废弃表中，将所有键和位置写入索引。
+	// 将所有键和位置写入索引。
 	var putMatchKeys []diskhash.MatchKeyFunc
 	if db.options.IndexType == Hash && len(keyPos) > 0 {
 		putMatchKeys = make([]diskhash.MatchKeyFunc, len(keyPos))
@@ -452,11 +473,6 @@ func (db *DB) flushMemtable(table *memtable) {
 		return
 	}
 
-	// uuid添加到废弃表中
-	for _, oldKeyPostion := range oldKeyPostions {
-		db.vlog.setDiscard(oldKeyPostion.partition, oldKeyPostion.uid)
-	}
-
 	// 同步索引
 	if err = db.index.Sync(); err != nil {
 		log.Println("index sync failed:", err)
@@ -488,57 +504,427 @@ func (db *DB) flushMemtable(table *memtable) {
 			db.immuMems = db.immuMems[1:]
 		}
 	}
+	db.sendThresholdState()
+}
+
+func (db *DB) sendThresholdState() {
+	if db.options.AutoCompactSupport {
+		// 检查废弃表大小
+		lowerThreshold := uint32((float32)(db.vlog.totalNumber) * db.options.AdvisedCompactionRate)
+		upperThreshold := uint32((float32)(db.vlog.totalNumber) * db.options.ForceCompactionRate)
+		thresholdState := discardState{
+			thresholdState: ThresholdState(UnarriveThreshold),
+		}
+		if db.vlog.discardNumber >= upperThreshold {
+			thresholdState = discardState{
+				thresholdState: ThresholdState(ArriveForceThreshold),
+			}
+		} else if db.vlog.discardNumber > lowerThreshold {
+			thresholdState = discardState{
+				thresholdState: ThresholdState(ArriveAdvisedThreshold),
+			}
+		}
+		select {
+		case db.compactChan <- thresholdState:
+		default: // 正在压缩，什么都不做。
+		}
+	}
+}
+
+func (db *DB) listenMemtableFlush() {
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, os.Interrupt, syscall.SIGHUP, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT)
+	for {
+		select {
+		// 定时器
+		case table, ok := <-db.flushChan:
+			if ok {
+				db.flushMemtable(table)
+			} else {
+				db.closeflushChan <- struct{}{}
+				return
+			}
+		case <-sig:
+			return
+		}
+	}
+}
+
+// listenAutoComapct 是一种自动化且更细粒度的方法，不会阻塞Bptree。
+// 它动态检测每个分片的冗余情况，并根据当前IO状态决定是否进行压缩。
+//
+//nolint:gocognit
+func (db *DB) listenAutoCompact() {
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, os.Interrupt, syscall.SIGHUP, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT)
+	firstCompact := true
+	thresholdstate := ThresholdState(UnarriveThreshold)
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case state, ok := <-db.compactChan:
+			if ok {
+				thresholdstate = state.thresholdState
+			} else {
+				db.closeCompactChan <- struct{}{}
+				return
+			}
+		case <-sig:
+			return
+		case <-ticker.C:
+			//nolint:nestif // 需要多层嵌套条件以处理不同阈值和错误判断。
+			if thresholdstate == ThresholdState(ArriveForceThreshold) {
+				var err error
+				if firstCompact {
+					firstCompact = false
+					err = db.Compact()
+				} else {
+					err = db.CompactWithDiscardtable()
+				}
+				if err != nil {
+					panic(err)
+				}
+				thresholdstate = ThresholdState(UnarriveThreshold)
+			} else if thresholdstate == ThresholdState(ArriveAdvisedThreshold) {
+				// 根据当前IO状态判断是否进行压缩
+				free := true
+				var err error = nil
+				if db.options.EnableDiskIO {
+					free, err = db.diskIO.IsFree()
+					if err != nil {
+						panic(err)
+					}
+				}
+				if free {
+					if firstCompact {
+						firstCompact = false
+						err = db.Compact()
+					} else {
+						err = db.CompactWithDiscardtable()
+					}
+					if err != nil {
+						panic(err)
+					}
+					thresholdstate = ThresholdState(UnarriveThreshold)
+				} else {
+					log.Println("IO 当前繁忙")
+				}
+			}
+		}
+	}
+}
+
+func (db *DB) listenDiskIOState() {
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, os.Interrupt, syscall.SIGHUP, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT)
+	for {
+		select {
+		case <-sig:
+			return
+		default:
+			err := db.diskIO.Monitor()
+			if err != nil {
+				panic(err)
+			}
+		}
+	}
+}
+
+// Compact 会遍历vlog中的所有值，并将有效值写入新的vlog文件。
+// 然后用新文件替换旧的vlog文件，并删除旧文件。
+//
+//nolint:gocognit
+func (db *DB) Compact() error {
+	db.flushLock.Lock()
+	defer db.flushLock.Unlock()
+
+	log.Println("[Compact data]")
+	openVlogFile := func(part int, ext string) *wal.WAL {
+		walFile, err := wal.Open(wal.Options{
+			DirPath:        db.vlog.options.dirPath,
+			SegmentSize:    db.vlog.options.segmentSize,
+			SegmentFileExt: fmt.Sprintf(ext, part),
+			Sync:           false, // 我们会手动同步
+			BytesPerSync:   0,     // 与Sync相同
+		})
+		if err != nil {
+			_ = walFile.Delete()
+			panic(err)
+		}
+		return walFile
+	}
+
+	g, _ := errgroup.WithContext(context.Background())
+	var capacity int64
+	var capacityList = make([]int64, db.options.PartitionNum)
+	for i := 0; i < int(db.vlog.options.partitionNum); i++ {
+		part := i
+		g.Go(func() error {
+			newVlogFile := openVlogFile(part, tempValueLogFileExt)
+			validRecords := make([]*ValueLogRecord, 0)
+			reader := db.vlog.walFiles[part].NewReader()
+			// 遍历wal中的所有记录，找到有效记录
+			for {
+				chunk, pos, err := reader.Next()
+				atomic.AddInt64(&capacity, int64(len(chunk)))
+				capacityList[part] += int64(len(chunk))
+				if err != nil {
+					if errors.Is(err, io.EOF) {
+						break
+					}
+					_ = newVlogFile.Delete()
+					return err
+				}
+
+				record := decodeValueLogRecord(chunk)
+				var hashTableKeyPos *KeyPosition
+				var matchKey func(diskhash.Slot) (bool, error)
+				if db.options.IndexType == Hash {
+					matchKey = MatchKeyFunc(db, record.key, &hashTableKeyPos, nil)
+				}
+				keyPos, err := db.index.Get(record.key, matchKey)
+				if err != nil {
+					_ = newVlogFile.Delete()
+					return err
+				}
+
+				if db.options.IndexType == Hash {
+					keyPos = hashTableKeyPos
+				}
+
+				if keyPos == nil {
+					continue
+				}
+				if keyPos.partition == uint32(part) && reflect.DeepEqual(keyPos.position, pos) {
+					validRecords = append(validRecords, record)
+				}
+
+				if capacity >= int64(db.vlog.options.compactBatchCapacity) {
+					err = db.rewriteValidRecords(newVlogFile, validRecords, part)
+					if err != nil {
+						_ = newVlogFile.Delete()
+						return err
+					}
+					validRecords = validRecords[:0]
+					atomic.AddInt64(&capacity, -capacityList[part])
+					capacityList[part] = 0
+				}
+			}
+
+			if len(validRecords) > 0 {
+				err := db.rewriteValidRecords(newVlogFile, validRecords, part)
+				if err != nil {
+					_ = newVlogFile.Delete()
+					return err
+				}
+			}
+
+			// 用新文件替换wal。
+			_ = db.vlog.walFiles[part].Delete()
+			_ = newVlogFile.Close()
+			if err := newVlogFile.RenameFileExt(fmt.Sprintf(valueLogFileExt, part)); err != nil {
+				return err
+			}
+			db.vlog.walFiles[part] = openVlogFile(part, valueLogFileExt)
+
+			// 压缩后清理dpTable
+			db.vlog.dpTables[part].clean()
+
+			return nil
+		})
+	}
+	db.vlog.cleanDiscardTable()
+	return g.Wait()
+}
+
+// CompactWithDiscardtable 会遍历vlog中的所有值，通过discardtable查找旧值，
+// 并将有效值写入新的vlog文件。
+// 然后用新文件替换旧的vlog文件，并删除旧文件。
+//
+//nolint:gocognit
+func (db *DB) CompactWithDiscardtable() error {
+	db.flushLock.Lock()
+	defer db.flushLock.Unlock()
+
+	log.Println("[CompactWithDiscardtable data]")
+	openVlogFile := func(part int, ext string) *wal.WAL {
+		walFile, err := wal.Open(wal.Options{
+			DirPath:        db.vlog.options.dirPath,
+			SegmentSize:    db.vlog.options.segmentSize,
+			SegmentFileExt: fmt.Sprintf(ext, part),
+			Sync:           false, // 我们会手动同步
+			BytesPerSync:   0,     // 与Sync相同
+		})
+		if err != nil {
+			_ = walFile.Delete()
+			panic(err)
+		}
+		return walFile
+	}
+
+	g, _ := errgroup.WithContext(context.Background())
+	var capacity int64
+	var capacityList = make([]int64, db.options.PartitionNum)
+	for i := 0; i < int(db.vlog.options.partitionNum); i++ {
+		part := i
+		g.Go(func() error {
+			newVlogFile := openVlogFile(part, tempValueLogFileExt)
+			validRecords := make([]*ValueLogRecord, 0)
+			reader := db.vlog.walFiles[part].NewReader()
+			// 遍历wal中的所有记录，找到有效记录
+			for {
+				chunk, pos, err := reader.Next()
+				atomic.AddInt64(&capacity, int64(len(chunk)))
+				capacityList[part] += int64(len(chunk))
+				if err != nil {
+					if errors.Is(err, io.EOF) {
+						break
+					}
+					_ = newVlogFile.Delete()
+					return err
+				}
+
+				record := decodeValueLogRecord(chunk)
+				if !db.vlog.isDiscard(part, record.uid) {
+					// 在dptable中未找到旧uuid，加入有效记录。
+					validRecords = append(validRecords, record)
+				}
+				if db.options.IndexType == Hash {
+					var hashTableKeyPos *KeyPosition
+					// var matchKey func(diskhash.Slot) (bool, error)
+					matchKey := MatchKeyFunc(db, record.key, &hashTableKeyPos, nil)
+					var keyPos *KeyPosition
+					keyPos, err = db.index.Get(record.key, matchKey)
+					if err != nil {
+						_ = newVlogFile.Delete()
+						return err
+					}
+
+					if db.options.IndexType == Hash {
+						keyPos = hashTableKeyPos
+					}
+
+					if keyPos == nil {
+						continue
+					}
+					if keyPos.partition == uint32(part) && reflect.DeepEqual(keyPos.position, pos) {
+						validRecords = append(validRecords, record)
+					}
+				}
+
+				if capacity >= int64(db.vlog.options.compactBatchCapacity) {
+					err = db.rewriteValidRecords(newVlogFile, validRecords, part)
+					if err != nil {
+						_ = newVlogFile.Delete()
+						return err
+					}
+					validRecords = validRecords[:0]
+					atomic.AddInt64(&capacity, -capacityList[part])
+					capacityList[part] = 0
+				}
+			}
+			if len(validRecords) > 0 {
+				err := db.rewriteValidRecords(newVlogFile, validRecords, part)
+				if err != nil {
+					_ = newVlogFile.Delete()
+					return err
+				}
+			}
+
+			// 用新文件替换wal。
+			_ = db.vlog.walFiles[part].Delete()
+			_ = newVlogFile.Close()
+			if err := newVlogFile.RenameFileExt(fmt.Sprintf(valueLogFileExt, part)); err != nil {
+				return err
+			}
+			db.vlog.walFiles[part] = openVlogFile(part, valueLogFileExt)
+			return nil
+		})
+	}
+
+	err := g.Wait()
+	db.vlog.cleanDiscardTable()
+	return err
+}
+
+func (db *DB) rewriteValidRecords(walFile *wal.WAL, validRecords []*ValueLogRecord, part int) error {
+	for _, record := range validRecords {
+		walFile.PendingWrites(encodeValueLogRecord(record))
+	}
+
+	walChunkPositions, err := walFile.WriteAll()
+	if err != nil {
+		return err
+	}
+
+	positions := make([]*KeyPosition, len(walChunkPositions))
+	for i, walChunkPosition := range walChunkPositions {
+		positions[i] = &KeyPosition{
+			key:       validRecords[i].key,
+			partition: uint32(part),
+			position:  walChunkPosition,
+		}
+	}
+	matchKeys := make([]diskhash.MatchKeyFunc, len(positions))
+	if db.options.IndexType == Hash {
+		for i := range matchKeys {
+			matchKeys[i] = MatchKeyFunc(db, positions[i].key, nil, nil)
+		}
+	}
+	_, err = db.index.PutBatch(positions, matchKeys...)
+	return err
 }
 
 // 加载废弃条目元数据，如果首次打开则创建元数据文件。
-func loadDiscardEntryMeta(deprecatedMetaPath string) (uint32, uint32, error) {
+func loadDiscardEntryMeta(discardMetaPath string) (uint32, uint32, error) {
 	var err error
-	var deprecatedNumber uint32
+	var discardNumber uint32
 	var totalEntryNumber uint32
-	if _, err = os.Stat(deprecatedMetaPath); os.IsNotExist(err) {
+	if _, err = os.Stat(discardMetaPath); os.IsNotExist(err) {
 		// 不存在则创建一个
 		var file *os.File
-		file, err = os.Create(deprecatedMetaPath)
+		file, err = os.Create(discardMetaPath)
 		if err != nil {
-			return deprecatedNumber, totalEntryNumber, err
+			return discardNumber, totalEntryNumber, err
 		}
-		deprecatedNumber = 0
+		discardNumber = 0
 		totalEntryNumber = 0
 		file.Close()
 	} else if err != nil {
-		return deprecatedNumber, totalEntryNumber, err
+		return discardNumber, totalEntryNumber, err
 	} else {
 		// 没有错误，我们加载元数据
 		var file *os.File
-		file, err = os.Open(deprecatedMetaPath)
+		file, err = os.Open(discardMetaPath)
 		if err != nil {
-			return deprecatedNumber, totalEntryNumber, err
+			return discardNumber, totalEntryNumber, err
 		}
 
 		// 将文件指针设置为0
 		_, err = file.Seek(0, 0)
 		if err != nil {
-			return deprecatedNumber, totalEntryNumber, err
+			return discardNumber, totalEntryNumber, err
 		}
 
 		// 读取废弃数量
-		err = binary.Read(file, binary.LittleEndian, &deprecatedNumber)
+		err = binary.Read(file, binary.LittleEndian, &discardNumber)
 		if err != nil {
-			return deprecatedNumber, totalEntryNumber, err
+			return discardNumber, totalEntryNumber, err
 		}
 
 		// 读取总条目数量
 		err = binary.Read(file, binary.LittleEndian, &totalEntryNumber)
 		if err != nil {
-			return deprecatedNumber, totalEntryNumber, err
+			return discardNumber, totalEntryNumber, err
 		}
 	}
-	return deprecatedNumber, totalEntryNumber, nil
+	return discardNumber, totalEntryNumber, nil
 }
 
 // 持久化废弃数量和总条目数量.
-func storeDiscardEntryMeta(deprecatedMetaPath string, deprecatedNumber uint32, totalNumber uint32) error {
-	file, err := os.OpenFile(deprecatedMetaPath, os.O_RDWR|os.O_TRUNC, 0666)
+func storeDiscardEntryMeta(discardMetaPath string, discardNumber uint32, totalNumber uint32) error {
+	file, err := os.OpenFile(discardMetaPath, os.O_RDWR|os.O_TRUNC, 0666)
 	if err != nil {
 		return err
 	}
@@ -550,7 +936,7 @@ func storeDiscardEntryMeta(deprecatedMetaPath string, deprecatedNumber uint32, t
 	}
 
 	// 写入废弃数量
-	err = binary.Write(file, binary.LittleEndian, &deprecatedNumber)
+	err = binary.Write(file, binary.LittleEndian, &discardNumber)
 	if err != nil {
 		return err
 	}

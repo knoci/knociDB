@@ -9,7 +9,8 @@ import (
 )
 
 const (
-	valueLogFileExt = ".VLOG.%d"
+	valueLogFileExt     = ".VLOG.%d"
+	tempValueLogFileExt = ".VLOG.%d.temp"
 )
 
 // valueLog 值日志是基于 Wisckey 论文中的概念命名的
