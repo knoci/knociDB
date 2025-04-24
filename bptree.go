@@ -65,7 +65,6 @@ func openBTreeIndex(options indexOptions, _ ...diskhash.MatchKeyFunc) (*BPTree, 
 		}
 		trees[i] = tree
 	}
-
 	return &BPTree{trees: trees, options: options}, nil
 }
 

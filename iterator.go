@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"container/heap"
 	"github.com/dgraph-io/badger/v4/y"
+	"knocidb/wal"
 )
 
 type iterType uint8
@@ -115,6 +116,11 @@ func (mi *Iterator) Seek(key []byte) {
 // cleanKey 从所有迭代器中移除一个键。
 // 如果迭代器在清理后变为空，则从堆中移除它们。
 func (mi *Iterator) cleanKey(oldKey []byte, version int) {
+	defer func() {
+		if r := recover(); r != nil {
+			mi.db.mu.Unlock()
+		}
+	}()
 	for i := 0; i < len(mi.itrs); i++ {
 		// 版本相同
 		if i == version {
@@ -170,8 +176,15 @@ func (mi *Iterator) Value() []byte {
 	switch topIter.iType {
 	// 磁盘B+树迭代器
 	case BptreeItr:
-		// TODO
-		return nil
+		keyPos := new(KeyPosition)
+		keyPos.key = topIter.iter.Key()
+		keyPos.partition = uint32(mi.db.vlog.getKeyPartition(topIter.iter.Key()))
+		keyPos.position = wal.DecodeChunkPosition(topIter.iter.Value().([]byte))
+		record, err := mi.db.vlog.read(keyPos)
+		if err != nil {
+			panic(err)
+		}
+		return record.value
 	// memtable迭代器
 	case MemItr:
 		return topIter.iter.Value().(y.ValueStruct).Value
