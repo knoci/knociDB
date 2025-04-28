@@ -122,12 +122,7 @@ func (s *S3Storage) Upload(localPath, objectKey string) error {
 	if err != nil {
 		return fmt.Errorf("failed to open file %s: %w", localPath, err)
 	}
-	defer func(file *os.File) {
-		err := file.Close()
-		if err != nil {
-
-		}
-	}(file)
+	defer file.Close()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
@@ -160,12 +155,7 @@ func (s *S3Storage) Download(objectKey, localPath string) error {
 	if err != nil {
 		return fmt.Errorf("failed to create file %s: %w", localPath, err)
 	}
-	defer func(file *os.File) {
-		err := file.Close()
-		if err != nil {
-
-		}
-	}(file)
+	defer file.Close()
 
 	// 从S3下载对象
 	resp, err := s.client.GetObject(ctx, &s3.GetObjectInput{
