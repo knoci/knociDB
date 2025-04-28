@@ -39,6 +39,7 @@ type WAL struct {
 	pendingWritesLock sync.Mutex
 	closeC            chan struct{}
 	syncTicker        *time.Ticker
+	objectStorage     ObjectStorage // 对象存储接口
 }
 
 // Reader 表示 WAL 的读取器。
@@ -54,10 +55,14 @@ type Reader struct {
 // Open 使用给定的选项打开一个 WAL。
 // 如果目录不存在，它会创建目录，并打开目录中的所有段文件。
 // 如果目录中没有段文件，它会创建一个新的段文件。
+// 如果配置了对象存储，它会尝试从对象存储下载段文件。
 func Open(options Options) (*WAL, error) {
 	if !strings.HasPrefix(options.SegmentFileExt, ".") {
 		return nil, fmt.Errorf("segment file extension must start with '.'")
 	}
+
+	// 不再使用临时目录，直接使用本地目录
+
 	wal := &WAL{
 		options:       options,
 		olderSegments: make(map[SegmentID]*segment),
@@ -65,9 +70,42 @@ func Open(options Options) (*WAL, error) {
 		closeC:        make(chan struct{}),
 	}
 
+	// 初始化对象存储
+	if options.ObjectStorage != nil {
+		storage, err := NewObjectStorage(*options.ObjectStorage)
+		if err != nil {
+			return nil, fmt.Errorf("failed to initialize object storage: %w", err)
+		}
+		wal.objectStorage = storage
+	}
+
 	// 如果目录不存在则创建
 	if err := os.MkdirAll(options.DirPath, os.ModePerm); err != nil {
 		return nil, err
+	}
+
+	// 如果配置了对象存储，尝试从对象存储下载段文件
+	if wal.objectStorage != nil {
+		// 列出对象存储中的所有段文件
+		objects, err := wal.objectStorage.List()
+		if err != nil {
+			return nil, fmt.Errorf("failed to list objects in storage: %w", err)
+		}
+
+		// 下载所有段文件到本地目录
+		var id int
+		for _, obj := range objects {
+			_, err := fmt.Sscanf(obj, "%d"+options.SegmentFileExt, &id)
+			if err != nil {
+				continue
+			}
+
+			localPath := filepath.Join(options.DirPath, filepath.Base(obj))
+			err = wal.objectStorage.Download(obj, localPath)
+			if err != nil {
+				return nil, fmt.Errorf("failed to download segment file %s: %w", obj, err)
+			}
+		}
 	}
 
 	// 遍历目录并打开所有段文件
@@ -420,6 +458,7 @@ func (wal *WAL) Read(pos *ChunkPosition) ([]byte, error) {
 }
 
 // Close 关闭 WAL。
+// 如果配置了对象存储，它会将所有段文件上传到对象存储。
 func (wal *WAL) Close() error {
 	wal.mu.Lock()
 	defer wal.mu.Unlock()
@@ -430,16 +469,61 @@ func (wal *WAL) Close() error {
 		close(wal.closeC)
 	}
 
-	// 关闭所有段文件。
-	for _, segment := range wal.olderSegments {
-		if err := segment.Close(); err != nil {
-			return err
+	// 如果配置了对象存储，上传所有段文件
+	if wal.objectStorage != nil {
+		// 确保所有段文件已同步到磁盘
+		for _, segment := range wal.olderSegments {
+			if err := segment.Sync(); err != nil {
+				return fmt.Errorf("failed to sync segment %d: %w", segment.id, err)
+			}
 		}
-		wal.renameIds = append(wal.renameIds, segment.id)
+		if err := wal.activeSegment.Sync(); err != nil {
+			return fmt.Errorf("failed to sync active segment: %w", err)
+		}
+
+		// 上传所有段文件到对象存储
+		for _, segment := range wal.olderSegments {
+			fileName := fmt.Sprintf("%09d%s", segment.id, wal.options.SegmentFileExt)
+			localPath := filepath.Join(wal.options.DirPath, fileName)
+
+			err := wal.objectStorage.Upload(localPath, fileName)
+			if err != nil {
+				return fmt.Errorf("failed to upload segment file %s: %w", fileName, err)
+			}
+			wal.renameIds = append(wal.renameIds, segment.id)
+		}
+
+		// 上传活动段文件
+		fileName := fmt.Sprintf("%09d%s", wal.activeSegment.id, wal.options.SegmentFileExt)
+		localPath := filepath.Join(wal.options.DirPath, fileName)
+
+		err := wal.objectStorage.Upload(localPath, fileName)
+		if err != nil {
+			return fmt.Errorf("failed to upload active segment file %s: %w", fileName, err)
+		}
+		wal.renameIds = append(wal.renameIds, wal.activeSegment.id)
+
+		// 关闭对象存储连接
+		if err := wal.objectStorage.Close(); err != nil {
+			return fmt.Errorf("failed to close object storage: %w", err)
+		}
+
+		// 不再使用临时目录，无需清理
+	} else {
+		// 关闭所有段文件。
+		for _, segment := range wal.olderSegments {
+			if err := segment.Close(); err != nil {
+				return err
+			}
+			wal.renameIds = append(wal.renameIds, segment.id)
+		}
 	}
+
 	wal.olderSegments = nil
 
-	wal.renameIds = append(wal.renameIds, wal.activeSegment.id)
+	if wal.objectStorage == nil {
+		wal.renameIds = append(wal.renameIds, wal.activeSegment.id)
+	}
 	// 关闭活跃段。
 	return wal.activeSegment.Close()
 }

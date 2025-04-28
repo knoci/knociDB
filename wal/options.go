@@ -30,6 +30,9 @@ type Options struct {
 
 	// SyncInterval 是执行显式同步的时间间隔。 如果 SyncInterval 为零，则不执行定期同步。
 	SyncInterval time.Duration
+
+	// ObjectStorage 指定对象存储的配置。如果不为nil，WAL将使用对象存储。
+	ObjectStorage *ObjectStorageConfig
 }
 
 const (
@@ -46,4 +49,5 @@ var DefaultOptions = Options{
 	Sync:           false,
 	BytesPerSync:   0,
 	SyncInterval:   0,
+	ObjectStorage:  nil,
 }
