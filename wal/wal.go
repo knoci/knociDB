@@ -61,8 +61,6 @@ func Open(options Options) (*WAL, error) {
 		return nil, fmt.Errorf("segment file extension must start with '.'")
 	}
 
-	// 不再使用临时目录，直接使用本地目录
-
 	wal := &WAL{
 		options:       options,
 		olderSegments: make(map[SegmentID]*segment),
@@ -71,8 +69,8 @@ func Open(options Options) (*WAL, error) {
 	}
 
 	// 初始化对象存储
-	if options.ObjectStorage != nil {
-		storage, err := NewObjectStorage(*options.ObjectStorage)
+	if options.ObjectStorage == true {
+		storage, err := NewObjectStorage()
 		if err != nil {
 			return nil, fmt.Errorf("failed to initialize object storage: %w", err)
 		}

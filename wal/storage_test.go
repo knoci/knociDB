@@ -4,10 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"os"
 	"testing"
 	"time"
+
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -72,16 +73,7 @@ func TestS3StorageOperations(t *testing.T) {
 	}
 	defer cleanupTestFiles()
 
-	config := ObjectStorageConfig{
-		Type:      R2ObjectStorage,
-		Endpoint:  "your-endpoint", // 替换为你的测试S3端点
-		Region:    "APAC",
-		Bucket:    testBucket,
-		AccessKey: "your-accesskey", // 替换为你的测试访问密钥
-		SecretKey: "your-secretkey", // 替换为你的测试秘密密钥
-	}
-
-	storage, err := NewObjectStorage(config)
+	storage, err := NewObjectStorage()
 	if err != nil {
 		t.Fatalf("Failed to create object storage: %v", err)
 	}
@@ -154,19 +146,4 @@ func TestS3StorageOperations(t *testing.T) {
 			t.Errorf("Close failed: %v", err)
 		}
 	})
-}
-
-func TestNoObjectStorage(t *testing.T) {
-	// 测试不使用对象存储的情况
-	config := ObjectStorageConfig{
-		Type: NoObjectStorage,
-	}
-
-	storage, err := NewObjectStorage(config)
-	if err != nil {
-		t.Errorf("Unexpected error for NoObjectStorage: %v", err)
-	}
-	if storage != nil {
-		t.Error("Expected nil storage for NoObjectStorage")
-	}
 }

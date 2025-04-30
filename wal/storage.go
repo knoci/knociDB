@@ -12,14 +12,13 @@ import (
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/spf13/viper"
 )
 
 // ObjectStorageType 表示对象存储的类型
 type ObjectStorageType string
 
 const (
-	// NoObjectStorage 表示不使用对象存储
-	NoObjectStorage ObjectStorageType = ""
 	// S3ObjectStorage 表示使用亚马逊S3对象存储
 	S3ObjectStorage ObjectStorageType = "s3"
 	// R2ObjectStorage 表示使用Cloudflare R2对象存储
@@ -61,14 +60,25 @@ type S3Storage struct {
 }
 
 // NewObjectStorage 创建一个新的对象存储
-func NewObjectStorage(config ObjectStorageConfig) (ObjectStorage, error) {
-	if config.Type == NoObjectStorage {
-		return nil, nil
+func NewObjectStorage() (ObjectStorage, error) {
+	viper.SetConfigName("config")
+	viper.SetConfigType("yaml")
+	viper.AddConfigPath("./")
+
+	if err := viper.ReadInConfig(); err != nil {
+		return nil, fmt.Errorf("failed to read config file: %v", err)
 	}
 
 	var storage ObjectStorage
 	var err error
-
+	config := ObjectStorageConfig{
+		Type:      ObjectStorageType(viper.GetString("object_storage.type")),
+		Endpoint:  viper.GetString("object_storage.endpoint"),
+		Region:    viper.GetString("object_storage.region"),
+		Bucket:    viper.GetString("object_storage.bucket"),
+		AccessKey: viper.GetString("object_storage.accesskey"),
+		SecretKey: viper.GetString("object_storage.secretkey"),
+	}
 	switch config.Type {
 	case S3ObjectStorage, R2ObjectStorage:
 		storage, err = newS3Storage(config)
