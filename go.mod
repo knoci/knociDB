@@ -12,6 +12,7 @@ require (
 	github.com/dgraph-io/badger/v4 v4.7.0
 	github.com/gofrs/flock v0.12.1
 	github.com/google/uuid v1.6.0
+	github.com/lni/dragonboat/v4 v4.0.0-20230921
 	github.com/shirou/gopsutil v3.21.11+incompatible
 	github.com/spaolacci/murmur3 v1.1.0
 	github.com/stretchr/testify v1.10.0
