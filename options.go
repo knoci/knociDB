@@ -1,14 +1,21 @@
 package knocidb
 
 import (
-	"github.com/cespare/xxhash/v2"
 	"os"
 	"time"
+
+	"github.com/cespare/xxhash/v2"
 )
 
 type Options struct {
-	// DirPath 指定存储所有数据库文件的目录路径
+	// DirPath 指定存储数据库数据文件的目录路径
 	DirPath string
+
+	// SnapshotPath 指定存储快照文件的目录路径
+	SnapshotPath string
+
+	// RaftPath 指定Raft有关目录路径
+	RaftPath string
 
 	// MemtableSize 表示内存表的最大字节大小 默认值为 64MB
 	MemtableSize uint32
@@ -101,6 +108,8 @@ const (
 // 默认选项
 var DefaultOptions = Options{
 	DirPath:                tempDBDir(),
+	SnapshotPath:           tempSnapDir(),
+	RaftPath:               tempRaftDir(),
 	MemtableSize:           64 * MB,
 	MemtableNums:           15,
 	Sync:                   false,
@@ -131,6 +140,16 @@ var DefaultWriteOptions = WriteOptions{
 }
 
 func tempDBDir() string {
-	dir, _ := os.MkdirTemp("", "knocidb-temp")
+	dir, _ := os.MkdirTemp("", "knocidb-data")
+	return dir
+}
+
+func tempSnapDir() string {
+	dir, _ := os.MkdirTemp("", "knocidb-sanpshot")
+	return dir
+}
+
+func tempRaftDir() string {
+	dir, _ := os.MkdirTemp("", "knocidb-raft")
 	return dir
 }

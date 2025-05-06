@@ -2,17 +2,15 @@ package raft
 
 import (
 	"fmt"
+	"knocidb"
 	"log"
 	"os"
-	"path/filepath"
-
-	"knocidb"
 )
 
 // RaftDB 是支持Raft共识的分布式数据库
 type RaftDB struct {
-	db      *knocidb.DB
-	adapter *DBAdapter
+	db   *knocidb.DB
+	node *NodeManager
 }
 
 // OpenRaftDB 打开一个支持Raft共识的分布式数据库
@@ -27,25 +25,25 @@ func OpenRaftDB(db *knocidb.DB, config Config) (*RaftDB, error) {
 	}
 
 	// 确保Raft数据目录存在
-	raftDir := filepath.Join(config.DataDir, "raft")
+	raftDir := knocidb.DefaultOptions.RaftPath
 	if err := os.MkdirAll(raftDir, os.ModePerm); err != nil {
 		return nil, fmt.Errorf("创建Raft数据目录失败: %w", err)
 	}
 
 	// 创建适配器
-	adapter, err := NewDBAdapter(db, config)
+	node, err := NewNodeManager(config, db)
 	if err != nil {
 		return nil, err
 	}
 
 	// 创建RaftDB
 	raftDB := &RaftDB{
-		db:      db,
-		adapter: adapter,
+		db:   db,
+		node: node,
 	}
 
 	// 启动Raft节点
-	if err := adapter.Start(); err != nil {
+	if err := node.Start(); err != nil {
 		return nil, err
 	}
 
@@ -57,12 +55,11 @@ func OpenRaftDB(db *knocidb.DB, config Config) (*RaftDB, error) {
 
 // Close 关闭RaftDB
 func (r *RaftDB) Close() error {
-	if r.adapter != nil {
-		if err := r.adapter.Stop(); err != nil {
+	if r.node != nil {
+		if err := r.node.Stop(); err != nil {
 			return err
 		}
 	}
-
 	return nil
 }
 
@@ -70,42 +67,42 @@ func (r *RaftDB) Close() error {
 // 在Leader节点上，通过Raft共识写入数据
 // 在Follower节点上，转发请求到Leader
 func (r *RaftDB) Put(key, value []byte) error {
-	return r.adapter.Put(key, value)
+	return r.node.Put(key, value)
 }
 
 // Delete 删除键
+// 操作通过Raft共识机制处理，确保数据一致性。
+// 如果当前节点是Leader，它将提议该操作；如果是Follower，请求将转发给Leader。
 func (r *RaftDB) Delete(key []byte) error {
-	return r.adapter.Delete(key)
+	return r.node.Delete(key)
 }
 
 // Get 读取键值
-// 在Leader节点上，通过Raft共识读取（线性一致性读）
-// 在Follower节点上，直接从本地读取（可能不是最新数据）
 func (r *RaftDB) Get(key []byte) ([]byte, error) {
-	return r.adapter.Get(key)
+	return r.node.Get(key)
 }
 
 // IsLeader 检查当前节点是否是Leader
 func (r *RaftDB) IsLeader() bool {
-	return r.adapter.IsLeader()
+	return r.node.IsLeader()
 }
 
 // GetLeaderID 获取当前Leader的NodeID
 func (r *RaftDB) GetLeaderID() (uint64, error) {
-	return r.adapter.GetLeaderID()
+	return r.node.GetLeaderID()
 }
 
 // GetClusterMembership 获取集群成员信息
 func (r *RaftDB) GetClusterMembership() (map[uint64]string, error) {
-	return r.adapter.GetClusterMembership()
+	return r.node.GetClusterMembership()
 }
 
 // AddNode 向集群添加新节点
 func (r *RaftDB) AddNode(nodeID uint64, address string) error {
-	return r.adapter.AddNode(nodeID, address)
+	return r.node.AddNode(nodeID, address)
 }
 
 // RemoveNode 从集群移除节点
 func (r *RaftDB) RemoveNode(nodeID uint64) error {
-	return r.adapter.RemoveNode(nodeID)
+	return r.node.RemoveNode(nodeID)
 }

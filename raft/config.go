@@ -3,7 +3,6 @@ package raft
 import (
 	"fmt"
 	"path/filepath"
-	"time"
 
 	"github.com/lni/dragonboat/v4/config"
 )
@@ -39,19 +38,23 @@ func (c *Config) GetNodeHostConfig() config.NodeHostConfig {
 		NodeHostDir:    filepath.Join(c.DataDir, "nodehost"),
 		RTTMillisecond: c.TickMs,
 		WALDir:         filepath.Join(c.DataDir, "wal"),
+		DeploymentID:   1,
 	}
 }
 
 // GetRaftConfig 返回Raft节点配置
 func (c *Config) GetRaftConfig() config.Config {
 	return config.Config{
-		NodeID:             c.NodeID,
-		ClusterID:          c.ClusterID,
-		ElectionRTT:        c.ElectionRTTMs,
-		HeartbeatRTT:       c.HeartbeatRTTMs,
-		CheckQuorum:        true,
-		SnapshotEntries:    c.SnapshotIntervalSeconds * 10,
-		CompactionOverhead: 5,
+		ReplicaID:               c.NodeID,
+		ShardID:                 c.ClusterID,
+		ElectionRTT:             c.ElectionRTTMs,
+		HeartbeatRTT:            c.HeartbeatRTTMs,
+		CheckQuorum:             true,
+		SnapshotEntries:         c.SnapshotIntervalSeconds * 10,
+		CompactionOverhead:      5,
+		SnapshotCompressionType: config.Snappy,
+		EntryCompressionType:    config.Snappy,
+		DisableAutoCompactions:  false,
 	}
 }
 
@@ -87,6 +90,15 @@ func ValidateConfig(cfg *Config) error {
 	}
 	if !cfg.JoinCluster && len(cfg.InitialMembers) == 0 {
 		return fmt.Errorf("初始集群必须至少有一个成员")
+	}
+	if cfg.ElectionRTTMs == 0 {
+		return fmt.Errorf("ElectionRTTMs不能为0")
+	}
+	if cfg.ElectionRTTMs <= 2*cfg.HeartbeatRTTMs {
+		return fmt.Errorf("ElectionRTTMs必须大于HeartbeatRTTMs的2倍")
+	}
+	if cfg.ElectionRTTMs < 10*cfg.HeartbeatRTTMs {
+		fmt.Printf("警告: ElectionRTTMs建议至少是HeartbeatRTTMs的10倍\n")
 	}
 	return nil
 }

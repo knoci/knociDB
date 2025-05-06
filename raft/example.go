@@ -22,7 +22,7 @@ func StartRaftNode(nodeID, clusterID uint64, raftAddress, dataDir string, initia
 	}
 
 	// 打开数据库
-	db, err := knocidb.Open(knocidb.DefaultOptions(dbPath))
+	db, err := knocidb.Open(knocidb.DefaultOptions)
 	if err != nil {
 		return nil, fmt.Errorf("打开数据库失败: %w", err)
 	}
