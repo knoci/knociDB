@@ -15,7 +15,6 @@ const (
 	OpPut    uint32 = 1
 	OpDelete uint32 = 2
 	OpBatch  uint32 = 3
-	OpGet    uint32 = 4
 )
 
 // Command 表示要通过Raft共识执行的命令
@@ -41,14 +40,6 @@ type KVStateMachine struct {
 	db           *knocidb.DB // 数据库操作接口
 	appliedIndex uint64
 	mu           sync.RWMutex
-}
-
-// DBOperator 定义了状态机需要的数据库操作接口
-type DBOperator interface {
-	Put(key, value []byte) error
-	Delete(key []byte) error
-	Get(key []byte) ([]byte, error)
-	BatchWrite(commands []Command, batchID uint64) error
 }
 
 // NewKVStateMachine 创建一个新的KV状态机实例
@@ -77,8 +68,7 @@ func (s *KVStateMachine) Lookup(query interface{}) (interface{}, error) {
 		return nil, err
 	}
 
-	// 在Leader节点上直接从数据库读取数据
-	// 这里的调用最终会到达Leader节点的本地数据库
+	// 在Leader节点上直接从数据库读取数据, 这里的调用最终会到达Leader节点的本地数据库
 	return s.db.Get(cmd.Key)
 }
 
@@ -103,8 +93,24 @@ func (s *KVStateMachine) Update(entries []statemachine.Entry) ([]statemachine.En
 			}
 
 			// 执行批处理命令
-			if err := s.db.BatchWrite(batchCmd.Commands, batchCmd.BatchID); err != nil {
-				return nil, err
+			batch := s.db.NewBatch(knocidb.DefaultBatchOptions)
+			for _, command := range batchCmd.Commands {
+				if command.Op == OpPut {
+					if err := batch.Put(command.Key, command.Value); err != nil {
+						return nil, err
+					}
+				}
+				if command.Op == OpBatch {
+					continue
+				}
+				if command.Op == OpDelete {
+					if err := batch.Delete(command.Key); err != nil {
+						return nil, err
+					}
+				}
+			}
+			if err := batch.Commit(); err != nil {
+				return nil, errors.New("batch update failed")
 			}
 		} else {
 			// 执行单个命令
@@ -116,10 +122,6 @@ func (s *KVStateMachine) Update(entries []statemachine.Entry) ([]statemachine.En
 			case OpDelete:
 				if err := s.db.Delete(cmd.Key); err != nil {
 					return nil, err
-				}
-			case OpGet:
-				{
-					continue
 				}
 			default:
 				return nil, errors.New("unknown operation")
@@ -179,8 +181,7 @@ func (s *KVStateMachine) RecoverFromSnapshot(r io.Reader, files []statemachine.S
 
 // Close 实现了statemachine.IStateMachine接口的Close方法
 func (s *KVStateMachine) Close() error {
-	// 这里不需要关闭数据库，因为数据库的生命周期由外部管理
-	return nil
+	return s.db.Close()
 }
 
 // GetHash 实现了statemachine.IStateMachine接口的GetHash方法

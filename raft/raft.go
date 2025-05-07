@@ -9,14 +9,13 @@ import (
 
 // RaftDB 是支持Raft共识的分布式数据库
 type RaftDB struct {
-	db   *knocidb.DB
 	node *NodeManager
 }
 
 // OpenRaftDB 打开一个支持Raft共识的分布式数据库
 func OpenRaftDB(db *knocidb.DB, config Config) (*RaftDB, error) {
 	if db == nil {
-		return nil, fmt.Errorf("数据库不能为空")
+		return nil, fmt.Errorf("database is necessary")
 	}
 
 	// 验证配置
@@ -25,7 +24,7 @@ func OpenRaftDB(db *knocidb.DB, config Config) (*RaftDB, error) {
 	}
 
 	// 确保Raft数据目录存在
-	raftDir := knocidb.DefaultOptions.RaftPath
+	raftDir := db.GetOptions().RaftPath
 	if err := os.MkdirAll(raftDir, os.ModePerm); err != nil {
 		return nil, fmt.Errorf("创建Raft数据目录失败: %w", err)
 	}
@@ -38,7 +37,6 @@ func OpenRaftDB(db *knocidb.DB, config Config) (*RaftDB, error) {
 
 	// 创建RaftDB
 	raftDB := &RaftDB{
-		db:   db,
 		node: node,
 	}
 
@@ -47,7 +45,7 @@ func OpenRaftDB(db *knocidb.DB, config Config) (*RaftDB, error) {
 		return nil, err
 	}
 
-	log.Printf("RaftDB已启动，NodeID: %d, ClusterID: %d, 地址: %s\n",
+	log.Printf("RaftDB set up, NodeID: %d, ClusterID: %d, Address: %s\n",
 		config.NodeID, config.ClusterID, config.RaftAddress)
 
 	return raftDB, nil
@@ -64,15 +62,11 @@ func (r *RaftDB) Close() error {
 }
 
 // Put 写入键值对
-// 在Leader节点上，通过Raft共识写入数据
-// 在Follower节点上，转发请求到Leader
 func (r *RaftDB) Put(key, value []byte) error {
 	return r.node.Put(key, value)
 }
 
 // Delete 删除键
-// 操作通过Raft共识机制处理，确保数据一致性。
-// 如果当前节点是Leader，它将提议该操作；如果是Follower，请求将转发给Leader。
 func (r *RaftDB) Delete(key []byte) error {
 	return r.node.Delete(key)
 }

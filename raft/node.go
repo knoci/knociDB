@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"knocidb"
 	"log"
-	"os"
 	"sync"
 	"time"
 
@@ -17,17 +16,17 @@ import (
 
 var (
 	// ErrNotLeader 表示当前节点不是Leader
-	ErrNotLeader = errors.New("当前节点不是Leader")
+	ErrNotLeader = errors.New("current node not Leader")
 	// ErrTimeout 表示操作超时
-	ErrTimeout = errors.New("操作超时")
+	ErrTimeout = errors.New("operation timeout")
 	// ErrCanceled 表示操作被取消
-	ErrCanceled = errors.New("操作被取消")
+	ErrCanceled = errors.New("operation canceled")
 	// ErrInvalidCommand 表示无效的命令
-	ErrInvalidCommand = errors.New("无效的命令")
+	ErrInvalidCommand = errors.New("invalid command")
 	// ErrDBNotOpen 表示数据库为空
-	ErrDBEmpty = errors.New("Database not open")
+	ErrDBEmpty = errors.New("database not open")
 	// ErrRaftNotStartted 表示节点未开启
-	ErrNodeNotStarted = errors.New("Raft not started")
+	ErrNodeNotStarted = errors.New("raft not started")
 )
 
 // NodeManager 管理Raft节点和处理共识操作
@@ -47,15 +46,6 @@ func NewNodeManager(config Config, db *knocidb.DB) (*NodeManager, error) {
 	if db == nil {
 		return nil, ErrDBEmpty
 	}
-	if err := ValidateConfig(&config); err != nil {
-		return nil, err
-	}
-
-	// 确保Raft数据目录存在
-	raftDir := knocidb.DefaultOptions.RaftPath
-	if err := os.MkdirAll(raftDir, os.ModePerm); err != nil {
-		return nil, fmt.Errorf("创建Raft数据目录失败: %w", err)
-	}
 
 	// 创建NodeHost配置
 	nhc := config.GetNodeHostConfig()
@@ -63,7 +53,7 @@ func NewNodeManager(config Config, db *knocidb.DB) (*NodeManager, error) {
 	// 创建NodeHost
 	nodeHost, err := dragonboat.NewNodeHost(nhc)
 	if err != nil {
-		return nil, fmt.Errorf("创建NodeHost失败: %w", err)
+		return nil, fmt.Errorf("create nodehost failed: %w", err)
 	}
 
 	// 创建节点管理器
@@ -73,7 +63,7 @@ func NewNodeManager(config Config, db *knocidb.DB) (*NodeManager, error) {
 		db:       db,
 		leaderID: 0,
 		state:    false,
-		Sync:     false, // 默认使用异步模式
+		Sync:     config.Sync,
 	}
 
 	return nm, nil
@@ -97,7 +87,7 @@ func (nm *NodeManager) Start() error {
 	// 检查是否需要加入现有集群
 	if nm.config.JoinCluster {
 		// 加入现有集群
-		log.Printf("正在加入现有集群，NodeID: %d, ClusterID: %d\n", nm.config.NodeID, nm.config.ClusterID)
+		log.Printf("joining raft group, NodeID: %d, ClusterID: %d\n", nm.config.NodeID, nm.config.ClusterID)
 		// 在Dragonboat v4中，StartCluster方法的参数顺序有变化
 		if err := nm.nodeHost.StartReplica(
 			nm.config.InitialMembers,
@@ -105,18 +95,18 @@ func (nm *NodeManager) Start() error {
 			factory,
 			rc,
 		); err != nil {
-			return fmt.Errorf("加入集群失败: %w", err)
+			return fmt.Errorf("join goup failed: %w", err)
 		}
 	} else {
 		// 启动新集群
-		log.Printf("正在启动新集群，NodeID: %d, ClusterID: %d\n", nm.config.NodeID, nm.config.ClusterID)
+		log.Printf("create new raft group, NodeID: %d, ClusterID: %d\n", nm.config.NodeID, nm.config.ClusterID)
 		if err := nm.nodeHost.StartReplica(
 			nm.config.InitialMembers,
 			false,
 			factory,
 			rc,
 		); err != nil {
-			return fmt.Errorf("启动集群失败: %w", err)
+			return fmt.Errorf("create new raft group failed: %w", err)
 		}
 	}
 
@@ -164,7 +154,7 @@ func (nm *NodeManager) leaderMonitor() {
 
 			// 如果Leader发生变化，记录日志
 			if oldLeaderID != leaderID {
-				log.Printf("Leader变更: %d -> %d\n", oldLeaderID, leaderID)
+				log.Printf("Leader changed: %d -> %d\n", oldLeaderID, leaderID)
 			}
 		}
 	}
@@ -187,7 +177,6 @@ func (nm *NodeManager) GetLeaderID() (uint64, error) {
 		return 0, ErrNodeNotStarted
 	}
 
-	// 在Dragonboat v4中，GetLeaderID返回三个值：leaderID, valid, error
 	leaderID, _, valid, err := nm.nodeHost.GetLeaderID(nm.config.ClusterID)
 	if err != nil {
 		return 0, err
@@ -232,19 +221,20 @@ func (nm *NodeManager) Put(key, value []byte) error {
 		}
 
 		// 等待操作完成
-		<-rs.ResultC()
-		if rs.Completed() {
+		res := <-rs.ResultC()
+		if res.Completed() {
 			return nil
 		}
 
 		// 处理错误
-		if rs.Timeout() {
+		if res.Timeout() {
 			return ErrTimeout
 		}
-		if rs.Terminated() {
+		if res.Terminated() {
 			return ErrCanceled
 		}
-		return errors.New("提议失败")
+		rs.Release()
+		return errors.New("propose failed")
 	}
 }
 
@@ -280,19 +270,20 @@ func (nm *NodeManager) Delete(key []byte) error {
 		}
 
 		// 等待操作完成
-		<-rs.ResultC()
-		if rs.Completed() {
+		res := <-rs.ResultC()
+		if res.Completed() {
 			return nil
 		}
 
 		// 处理错误
-		if rs.Timeout() {
+		if res.Timeout() {
 			return ErrTimeout
 		}
-		if rs.Terminated() {
+		if res.Terminated() {
 			return ErrCanceled
 		}
-		return errors.New("删除操作失败")
+		rs.Release()
+		return errors.New("delete failed")
 	}
 }
 
@@ -303,7 +294,6 @@ func (nm *NodeManager) Get(key []byte) ([]byte, error) {
 	}
 	// 创建查询命令
 	cmd := Command{
-		Op:  OpGet,
 		Key: key,
 	}
 
@@ -326,7 +316,7 @@ func (nm *NodeManager) Get(key []byte) ([]byte, error) {
 		// 处理结果
 		value, ok := result.([]byte)
 		if !ok {
-			return nil, errors.New("无效的查询结果类型")
+			return nil, errors.New("invalid type")
 		}
 
 		return value, nil
@@ -338,16 +328,17 @@ func (nm *NodeManager) Get(key []byte) ([]byte, error) {
 		}
 
 		// 等待ReadIndex操作完成
-		<-rs.ResultC()
-		if !rs.Completed() {
-			if rs.Timeout() {
+		res := <-rs.ResultC()
+		if !res.Completed() {
+			if res.Timeout() {
 				return nil, ErrTimeout
 			}
-			if rs.Terminated() {
+			if res.Terminated() {
 				return nil, ErrCanceled
 			}
-			return nil, errors.New("ReadIndex操作失败")
+			return nil, errors.New("ReadIndex failed")
 		}
+		rs.Release()
 
 		// 执行本地读取
 		result, err := nm.nodeHost.ReadLocalNode(rs, data)
@@ -358,7 +349,7 @@ func (nm *NodeManager) Get(key []byte) ([]byte, error) {
 		// 处理结果
 		value, ok := result.([]byte)
 		if !ok {
-			return nil, errors.New("无效的查询结果类型")
+			return nil, errors.New("invalid type")
 		}
 
 		return value, nil
@@ -398,19 +389,20 @@ func (nm *NodeManager) BatchWrite(commands []Command, batchID uint64) error {
 		}
 
 		// 等待操作完成
-		<-rs.ResultC()
-		if rs.Completed() {
+		res := <-rs.ResultC()
+		if res.Completed() {
 			return nil
 		}
 
 		// 处理错误
-		if rs.Timeout() {
+		if res.Timeout() {
 			return ErrTimeout
 		}
-		if rs.Terminated() {
+		if res.Terminated() {
 			return ErrCanceled
 		}
-		return errors.New("批量写入操作失败")
+		rs.Release()
+		return errors.New("batch write failed")
 	}
 }
 
@@ -443,19 +435,18 @@ func (nm *NodeManager) GetClusterMembership() (map[uint64]string, error) {
 		}
 
 		// 等待ReadIndex操作完成
-		<-rs.ResultC()
-		if !rs.Completed() {
-			if rs.Timeout() {
+		res := <-rs.ResultC()
+		if !res.Completed() {
+			if res.Timeout() {
 				return nil, ErrTimeout
 			}
-			if rs.Terminated() {
+			if res.Terminated() {
 				return nil, ErrCanceled
 			}
-			return nil, errors.New("获取集群成员信息操作失败")
+			return nil, errors.New("get cluster membership failed")
 		}
+		rs.Release()
 
-		// 由于Dragonboat v4中没有直接的异步获取成员信息的方法
-		// 我们仍然使用同步方法，但已经通过ReadIndex确保了线性一致性
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 
@@ -496,19 +487,20 @@ func (nm *NodeManager) AddNode(nodeID uint64, address string) error {
 		}
 
 		// 等待操作完成
-		<-rs.ResultC()
-		if rs.Completed() {
+		res := <-rs.ResultC()
+		if res.Completed() {
 			return nil
 		}
 
 		// 处理错误
-		if rs.Timeout() {
+		if res.Timeout() {
 			return ErrTimeout
 		}
-		if rs.Terminated() {
+		if res.Terminated() {
 			return ErrCanceled
 		}
-		return errors.New("添加节点操作失败")
+		rs.Release()
+		return errors.New("add node failed")
 	}
 }
 
@@ -540,18 +532,19 @@ func (nm *NodeManager) RemoveNode(nodeID uint64) error {
 		}
 
 		// 等待操作完成
-		<-rs.ResultC()
-		if rs.Completed() {
+		res := <-rs.ResultC()
+		if res.Completed() {
 			return nil
 		}
 
 		// 处理错误
-		if rs.Timeout() {
+		if res.Timeout() {
 			return ErrTimeout
 		}
-		if rs.Terminated() {
+		if res.Terminated() {
 			return ErrCanceled
 		}
-		return errors.New("移除节点操作失败")
+		rs.Release()
+		return errors.New("remove node failed")
 	}
 }

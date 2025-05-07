@@ -29,6 +29,8 @@ type Config struct {
 	HeartbeatRTTMs uint64
 	// SnapshotIntervalSeconds 是自动创建快照的间隔，单位为秒
 	SnapshotIntervalSeconds uint64
+	// Sync 指定节点是同步还是异步更新状态
+	Sync bool
 }
 
 // GetNodeHostConfig 返回Dragonboat节点主机配置
@@ -71,34 +73,35 @@ func DefaultConfig(nodeID, clusterID uint64, raftAddress, dataDir string) Config
 		ElectionRTTMs:           10,
 		HeartbeatRTTMs:          1,
 		SnapshotIntervalSeconds: 3600, // 默认每小时创建一次快照
+		Sync:                    false,
 	}
 }
 
 // ValidateConfig 验证配置是否有效
 func ValidateConfig(cfg *Config) error {
 	if cfg.NodeID == 0 {
-		return fmt.Errorf("NodeID不能为0")
+		return fmt.Errorf("NodeID can not be0")
 	}
 	if cfg.ClusterID == 0 {
-		return fmt.Errorf("ClusterID不能为0")
+		return fmt.Errorf("ClusterID can not be 0")
 	}
 	if cfg.RaftAddress == "" {
-		return fmt.Errorf("RaftAddress不能为空")
+		return fmt.Errorf("RaftAddress can not be nil")
 	}
 	if cfg.DataDir == "" {
-		return fmt.Errorf("DataDir不能为空")
+		return fmt.Errorf("DataDir can not be nil")
 	}
 	if !cfg.JoinCluster && len(cfg.InitialMembers) == 0 {
-		return fmt.Errorf("初始集群必须至少有一个成员")
+		return fmt.Errorf("InitialMembers should have at least one member")
 	}
 	if cfg.ElectionRTTMs == 0 {
-		return fmt.Errorf("ElectionRTTMs不能为0")
+		return fmt.Errorf("ElectionRTTMs can not be 0")
 	}
 	if cfg.ElectionRTTMs <= 2*cfg.HeartbeatRTTMs {
-		return fmt.Errorf("ElectionRTTMs必须大于HeartbeatRTTMs的2倍")
+		return fmt.Errorf("ElectionRTTMs must greater than 2*HeartbeatRTTMs")
 	}
 	if cfg.ElectionRTTMs < 10*cfg.HeartbeatRTTMs {
-		fmt.Printf("警告: ElectionRTTMs建议至少是HeartbeatRTTMs的10倍\n")
+		fmt.Printf("warnning: ElectionRTTMs support to greater than 10*HeartbeatRTTMs\n")
 	}
 	return nil
 }
