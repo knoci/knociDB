@@ -5,9 +5,6 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"github.com/dgraph-io/badger/v4/y"
-	"github.com/google/uuid"
-	"golang.org/x/sync/errgroup"
 	"io"
 	"knocidb/diskhash"
 	"knocidb/wal"
@@ -20,6 +17,10 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+
+	"github.com/dgraph-io/badger/v4/y"
+	"github.com/google/uuid"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/gofrs/flock"
 )
@@ -168,7 +169,18 @@ func Open(options Options) (*DB, error) {
 // 将closed标志设置为true。
 // 关闭后不能再使用DB实例。
 func (db *DB) Close() error {
-	close(db.flushChan)
+	select {
+	case _, ok := <-db.flushChan:
+		if !ok {
+			// channel 已经关闭
+		} else {
+			// channel 未关闭，可以安全关闭
+			close(db.flushChan)
+		}
+	default:
+		// channel 未关闭且为空，可以安全关闭
+		close(db.flushChan)
+	}
 	<-db.closeflushChan
 
 	db.mu.Lock()
@@ -255,8 +267,7 @@ func (db *DB) PutWithOptions(key []byte, value []byte, options WriteOptions) err
 		db.batchPool.Put(batch)
 	}()
 	// 这是单个put操作，我们可以将Sync设置为false。
-	// 因为数据将被写入WAL，
-	// 并且WAL文件将根据DB选项同步到磁盘。
+	// 因为数据将被写入WAL，并且WAL文件将根据DB选项同步到磁盘。
 	batch.init(false, false, false, db).withPendingWrites()
 	if err := batch.Put(key, value); err != nil {
 		batch.unlock()
@@ -573,7 +584,7 @@ func (db *DB) listenAutoCompact() {
 		case <-sig:
 			return
 		case <-ticker.C:
-			//nolint:nestif // 需要多层嵌套条件以处理不同阈值和错误判断。
+			// 需要多层嵌套条件以处理不同阈值和错误判断。
 			if thresholdstate == ThresholdState(ArriveForceThreshold) {
 				var err error
 				if firstCompact {
@@ -874,6 +885,10 @@ func (db *DB) rewriteValidRecords(walFile *wal.WAL, validRecords []*ValueLogReco
 	}
 	_, err = db.index.PutBatch(positions, matchKeys...)
 	return err
+}
+
+func (db *DB) GetOptions() Options {
+	return db.options
 }
 
 // 加载废弃条目元数据，如果首次打开则创建元数据文件。
