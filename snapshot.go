@@ -3,6 +3,7 @@ package knocidb
 import (
 	"encoding/binary"
 	"fmt"
+	"github.com/klauspost/compress/zstd"
 	"hash/crc32"
 	"io"
 	"log"
@@ -11,8 +12,6 @@ import (
 	"sort"
 	"strings"
 	"time"
-
-	"github.com/klauspost/compress/zstd"
 )
 
 const (
@@ -22,24 +21,10 @@ const (
 	snapshotExpire = 365 * 24 * time.Hour
 )
 
-// SnapshotManifest 存储快照的元数据信息
-type SnapshotManifest struct {
-	Version      uint32             `json:"version"`       // 快照版本
-	CreatedAt    time.Time          `json:"created_at"`    // 创建时间
-	AppliedIndex uint64             `json:"applied_index"` // Raft已应用的索引
-	FileInfos    []SnapshotFileInfo `json:"file_infos"`    // 文件信息列表
-	Checksum     uint32             `json:"checksum"`      // 校验和
-}
-
-// SnapshotFileInfo 存储快照中单个文件的信息
-type SnapshotFileInfo struct {
-	Name string `json:"name"` // 文件名
-	Size int64  `json:"size"` // 文件大小
-}
-
 // ExportSnapshot 导出快照，压缩并清理过期快照，返回错误信息。
-// 如果提供了appliedIndex参数，则将其保存在快照元数据中，用于Raft状态机恢复。
 func (db *DB) ExportSnapshot() error {
+	db.flushLock.Lock()
+	defer db.flushLock.Unlock()
 	if db.closed {
 		return fmt.Errorf("Export snapshot failed: database is closed")
 	}
@@ -156,12 +141,13 @@ func (db *DB) ExportSnapshot() error {
 		if err != nil {
 			return fmt.Errorf("Failed to calculate CRC for file: %v", err)
 		}
-
-		if err := in.Close(); err != nil {
+		in.Close()
+		if err != nil {
 			os.RemoveAll(tmpCopyDir)
 			return fmt.Errorf("Failed to copy file to snapshot: %v", err)
 		}
 	}
+
 	// 计算CRC校验位
 	crcValue := crc.Sum32()
 
@@ -221,7 +207,6 @@ func (db *DB) cleanupSnapshots(snapDir string) {
 }
 
 // ImportSnapshot 导入快照并恢复数据库，保证跨平台兼容性和原子性操作
-// 如果需要获取快照中的appliedIndex，可以通过outAppliedIndex参数获取
 func (db *DB) ImportSnapshot(snapPath string) error {
 	if db.closed {
 		return fmt.Errorf("Import snapshot failed: database is closed")
@@ -263,7 +248,6 @@ func (db *DB) ImportSnapshot(snapPath string) error {
 	crc := crc32.NewIEEE()
 
 	// 读取并解压文件
-	var expectedCRC uint32
 	for {
 		// 读取文件名长度
 		nameLen, err := readInt32(decoder)
@@ -272,10 +256,6 @@ func (db *DB) ImportSnapshot(snapPath string) error {
 				break // 正常结束
 			}
 			return fmt.Errorf("Failed to read file name length: %v", err)
-		}
-		if nameLen > 255 {
-			expectedCRC = uint32(nameLen)
-			break
 		}
 
 		// 读取文件名
@@ -300,20 +280,30 @@ func (db *DB) ImportSnapshot(snapPath string) error {
 
 		// 复制文件内容
 		_, err = io.CopyN(out, decoder, fileSize)
+		out.Close()
 		if err != nil {
 			return fmt.Errorf("Failed to copy file content: %v", err)
 		}
+
 		// 更新CRC计算对象
 		crc.Write(nameBytes)
 		crc.Write([]byte(fmt.Sprintf("%d", fileSize)))
-		defer out.Close()
-		_, err = io.Copy(crc, out)
+		in, err := os.Open(filePath)
+		if err != nil {
+			return fmt.Errorf("Failed to open file for CRC calculation: %v", err)
+		}
+		defer in.Close()
+		_, err = io.Copy(crc, in)
 		if err != nil {
 			return fmt.Errorf("Failed to calculate CRC for file: %v", err)
 		}
 	}
 
 	// 读取并验证CRC校验位
+	var expectedCRC uint32
+	if err := binary.Read(decoder, binary.LittleEndian, &expectedCRC); err != nil {
+		return fmt.Errorf("Failed to read CRC value: %v", err)
+	}
 	actualCRC := crc.Sum32()
 	if actualCRC != expectedCRC {
 		return fmt.Errorf("CRC check failed: expected %v, got %v", expectedCRC, actualCRC)
