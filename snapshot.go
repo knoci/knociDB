@@ -23,8 +23,6 @@ const (
 
 // ExportSnapshot 导出快照，压缩并清理过期快照，返回错误信息。
 func (db *DB) ExportSnapshot() error {
-	db.flushLock.Lock()
-	defer db.flushLock.Unlock()
 	if db.closed {
 		return fmt.Errorf("Export snapshot failed: database is closed")
 	}
@@ -246,6 +244,7 @@ func (db *DB) ImportSnapshot(snapPath string) error {
 
 	// 创建CRC计算对象
 	crc := crc32.NewIEEE()
+	var expectedCRC uint32
 
 	// 读取并解压文件
 	for {
@@ -256,6 +255,10 @@ func (db *DB) ImportSnapshot(snapPath string) error {
 				break // 正常结束
 			}
 			return fmt.Errorf("Failed to read file name length: %v", err)
+		}
+		if nameLen > 255 {
+			expectedCRC = uint32(nameLen)
+			break
 		}
 
 		// 读取文件名
@@ -280,7 +283,6 @@ func (db *DB) ImportSnapshot(snapPath string) error {
 
 		// 复制文件内容
 		_, err = io.CopyN(out, decoder, fileSize)
-		out.Close()
 		if err != nil {
 			return fmt.Errorf("Failed to copy file content: %v", err)
 		}
@@ -288,22 +290,14 @@ func (db *DB) ImportSnapshot(snapPath string) error {
 		// 更新CRC计算对象
 		crc.Write(nameBytes)
 		crc.Write([]byte(fmt.Sprintf("%d", fileSize)))
-		in, err := os.Open(filePath)
-		if err != nil {
-			return fmt.Errorf("Failed to open file for CRC calculation: %v", err)
-		}
-		defer in.Close()
-		_, err = io.Copy(crc, in)
+		defer out.Close()
+		_, err = io.Copy(crc, out)
 		if err != nil {
 			return fmt.Errorf("Failed to calculate CRC for file: %v", err)
 		}
 	}
 
 	// 读取并验证CRC校验位
-	var expectedCRC uint32
-	if err := binary.Read(decoder, binary.LittleEndian, &expectedCRC); err != nil {
-		return fmt.Errorf("Failed to read CRC value: %v", err)
-	}
 	actualCRC := crc.Sum32()
 	if actualCRC != expectedCRC {
 		return fmt.Errorf("CRC check failed: expected %v, got %v", expectedCRC, actualCRC)
