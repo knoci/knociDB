@@ -32,4 +32,7 @@ $ go build -o knocidb-cli
 👍️ The design and implementation of this project cannot be separated from the inspiration of the following excellent projects
 - https://github.com/lni/dragonboat A Multi-Group Raft library in Go.
 - https://github.com/skyzh/mini-lsm A course of building an LSM-Tree storage engine (database) in a week.
-- 
+- https://github.com/hypermodeinc/badger Fast key-value DB in Go.
+- https://github.com/rosedblabs/rosedb Lightweight, fast and reliable key/value storage engine based on Bitcask.
+- https://github.com/lotusdblabs/lotusdb Most advanced key-value database written in Go, extremely fast, compatible with LSM tree and B+ tree.
+- https://github.com/etcd-io/bbolt An embedded key/value database for Go.
