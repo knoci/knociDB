@@ -21,8 +21,6 @@ var (
 	ErrTimeout = errors.New("operation timeout")
 	// ErrCanceled 表示操作被取消
 	ErrCanceled = errors.New("operation canceled")
-	// ErrInvalidCommand 表示无效的命令
-	ErrInvalidCommand = errors.New("invalid command")
 	// ErrDBNotOpen 表示数据库为空
 	ErrDBEmpty = errors.New("database not open")
 	// ErrRaftNotStartted 表示节点未开启
@@ -78,7 +76,7 @@ func (nm *NodeManager) Start() error {
 	factory := func(clusterID uint64, nodeID uint64) statemachine.IStateMachine {
 		sm := NewKVStateMachine(clusterID, nodeID, nm.db)
 		nm.stateMachine = sm
-		return nil
+		return sm
 	}
 
 	// 获取Raft配置
@@ -88,7 +86,6 @@ func (nm *NodeManager) Start() error {
 	if nm.config.JoinCluster {
 		// 加入现有集群
 		log.Printf("joining raft group, NodeID: %d, ClusterID: %d\n", nm.config.NodeID, nm.config.ClusterID)
-		// 在Dragonboat v4中，StartCluster方法的参数顺序有变化
 		if err := nm.nodeHost.StartReplica(
 			nm.config.InitialMembers,
 			true,
@@ -338,7 +335,6 @@ func (nm *NodeManager) Get(key []byte) ([]byte, error) {
 			}
 			return nil, errors.New("ReadIndex failed")
 		}
-		rs.Release()
 
 		// 执行本地读取
 		result, err := nm.nodeHost.ReadLocalNode(rs, data)
@@ -351,7 +347,7 @@ func (nm *NodeManager) Get(key []byte) ([]byte, error) {
 		if !ok {
 			return nil, errors.New("invalid type")
 		}
-
+		rs.Release()
 		return value, nil
 	}
 }

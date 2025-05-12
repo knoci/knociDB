@@ -52,11 +52,12 @@ func (c *Config) GetRaftConfig() config.Config {
 		ElectionRTT:             c.ElectionRTTMs,
 		HeartbeatRTT:            c.HeartbeatRTTMs,
 		CheckQuorum:             true,
-		SnapshotEntries:         c.SnapshotIntervalSeconds * 10,
+		SnapshotEntries:         c.SnapshotIntervalSeconds,
 		CompactionOverhead:      5,
 		SnapshotCompressionType: config.Snappy,
 		EntryCompressionType:    config.Snappy,
 		DisableAutoCompactions:  false,
+		PreVote:                 true,
 	}
 }
 
@@ -73,7 +74,7 @@ func DefaultConfig(nodeID, clusterID uint64, raftAddress, dataDir string) Config
 		ElectionRTTMs:           10,
 		HeartbeatRTTMs:          1,
 		SnapshotIntervalSeconds: 3600, // 默认每小时创建一次快照
-		Sync:                    false,
+		Sync:                    true,
 	}
 }
 

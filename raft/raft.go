@@ -26,7 +26,7 @@ func OpenRaftDB(db *knocidb.DB, config Config) (*RaftDB, error) {
 	// 确保Raft数据目录存在
 	raftDir := db.GetOptions().RaftPath
 	if err := os.MkdirAll(raftDir, os.ModePerm); err != nil {
-		return nil, fmt.Errorf("创建Raft数据目录失败: %w", err)
+		return nil, fmt.Errorf("create Raft data dir failed: %w", err)
 	}
 
 	// 创建适配器
