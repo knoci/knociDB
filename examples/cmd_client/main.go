@@ -5,7 +5,6 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"knocidb/raft"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -28,7 +27,7 @@ var (
 
 type Client struct {
 	db           *knocidb.DB
-	distributeDB *raft.RaftDB
+	distributeDB *knocidb.RaftDB
 	isDistribute bool
 	batch        *BatchClient // 批处理客户端
 }
@@ -66,7 +65,7 @@ func NewClient(isDistribute bool) (*Client, error) {
 		}
 
 		// 创建Raft配置
-		cfg := raft.Config{
+		cfg := knocidb.RaftOptions{
 			NodeID:                  *nodeID,
 			ClusterID:               1, // 使用固定的集群ID
 			RaftAddress:             *listenAddr,
@@ -86,20 +85,13 @@ func NewClient(isDistribute bool) (*Client, error) {
 		dbOpts.PartitionNum = *partitionNum
 		dbOpts.RaftPath = raftDir
 
-		// 打开数据库
-		db, err := knocidb.Open(dbOpts)
-		if err != nil {
-			return nil, fmt.Errorf("open database failed: %v", err)
-		}
-
 		// 创建分布式数据库
-		distributeDB, err := raft.OpenRaftDB(db, cfg)
+		distributeDB, err := knocidb.OpenRaft(cfg, dbOpts)
 		if err != nil {
-			db.Close()
 			return nil, fmt.Errorf("open raft database failed: %v", err)
 		}
 
-		client := &Client{db: db, distributeDB: distributeDB, isDistribute: true}
+		client := &Client{distributeDB: distributeDB, isDistribute: true}
 		client.batch = NewBatchClient(client)
 		return client, nil
 	} else {
