@@ -2,6 +2,7 @@
 [![Release](https://img.shields.io/github/v/release/knoci/knociDB)](https://github.com/knoci/knociDB/releases)
 [![License](https://img.shields.io/github/license/knoci/knociDB)](https://github.com/knoci/knociDB/main/LICENSE)
 [![Go Report Card](https://goreportcard.com/badge/github.com/knoci/knociDB)](https://goreportcard.com/report/github.com/knoci/knociDB)
+[![Go](https://github.com/knoci/knociDB/actions/workflows/go.yml/badge.svg)](https://github.com/knoci/knociDB/actions/workflows/go.yml)
 [![OpenIssue](https://img.shields.io/github/issues/knoci/knociDB)](https://github.com/knoci/knociDB/issues)
 [![ClosedIssue](https://img.shields.io/github/issues-closed/knoci/knociDB)](https://github.com/knoci/knociDB/issues?q=is%3Aissue+is%3Aclosed)
 ![Stars](https://img.shields.io/github/stars/knoci/knociDB)
