@@ -63,14 +63,23 @@ func (db *DB) ExportSnapshot() error {
 		}
 		out, err := os.Create(toPath)
 		if err != nil {
-			in.Close()
+			inner_err := in.Close()
+			if inner_err != nil {
+				return fmt.Errorf("Unexpected error occur: %v", inner_err)
+			}
 			return fmt.Errorf("Failed to create file in temp copy: %v", err)
 		}
 		_, err = io.Copy(out, in)
-		in.Close()
-		out.Close()
 		if err != nil {
 			return fmt.Errorf("Failed to copy file to temp dir: %v", err)
+		}
+		err = in.Close()
+		if err != nil {
+			return fmt.Errorf("Unexpected error occur: %v", err)
+		}
+		err = out.Close()
+		if err != nil {
+			return fmt.Errorf("Unexpected error occur: %v", err)
 		}
 	}
 
@@ -78,14 +87,20 @@ func (db *DB) ExportSnapshot() error {
 	tmpFile := snapFile + ".tmp"
 	f, err := os.Create(tmpFile)
 	if err != nil {
-		os.RemoveAll(tmpCopyDir)
+		inner_err := os.RemoveAll(tmpCopyDir)
+		if inner_err != nil {
+			return fmt.Errorf("Unexpected error occur: %v", inner_err)
+		}
 		return fmt.Errorf("Failed to create snapshot file: %v", err)
 	}
 	defer f.Close()
 
 	encoder, err := zstd.NewWriter(f)
 	if err != nil {
-		os.RemoveAll(tmpCopyDir)
+		inner_err := os.RemoveAll(tmpCopyDir)
+		if inner_err != nil {
+			return fmt.Errorf("Unexpected error occur: %v", inner_err)
+		}
 		return fmt.Errorf("Failed to create zstd encoder: %v", err)
 	}
 	defer encoder.Close()
@@ -96,7 +111,10 @@ func (db *DB) ExportSnapshot() error {
 	// 写入CRC校验位前的数据
 	copyFiles, err := os.ReadDir(tmpCopyDir)
 	if err != nil {
-		os.RemoveAll(tmpCopyDir)
+		inner_err := os.RemoveAll(tmpCopyDir)
+		if inner_err != nil {
+			return fmt.Errorf("Unexpected error occur: %v", inner_err)
+		}
 		return fmt.Errorf("Failed to read temp copy dir: %v", err)
 	}
 	for _, file := range copyFiles {
@@ -104,44 +122,80 @@ func (db *DB) ExportSnapshot() error {
 		path := filepath.Join(tmpCopyDir, name)
 		in, err := os.Open(path)
 		if err != nil {
-			os.RemoveAll(tmpCopyDir)
+			inner_err := os.RemoveAll(tmpCopyDir)
+			if inner_err != nil {
+				return fmt.Errorf("Unexpected error occur: %v", inner_err)
+			}
 			return fmt.Errorf("Failed to open file for snapshot: %v", err)
 		}
 		nameBytes := []byte(name)
 		nameLen := int32(len(nameBytes))
 		if err := writeInt32(encoder, nameLen); err != nil {
-			in.Close()
-			os.RemoveAll(tmpCopyDir)
+			inner_err := in.Close()
+			if inner_err != nil {
+				return fmt.Errorf("Unexpected error occur: %v", inner_err)
+			}
+			inner_err = os.RemoveAll(tmpCopyDir)
+			if inner_err != nil {
+				return fmt.Errorf("Unexpected error occur: %v", inner_err)
+			}
 			return fmt.Errorf("Failed to write file name length: %v", err)
 		}
 		if _, err := encoder.Write(nameBytes); err != nil {
-			in.Close()
-			os.RemoveAll(tmpCopyDir)
+			inner_err := in.Close()
+			if inner_err != nil {
+				return fmt.Errorf("Unexpected error occur: %v", inner_err)
+			}
+			inner_err = os.RemoveAll(tmpCopyDir)
+			if inner_err != nil {
+				return fmt.Errorf("Unexpected error occur: %v", inner_err)
+			}
 			return fmt.Errorf("Failed to write file name: %v", err)
 		}
 		stat, err := in.Stat()
 		if err != nil {
-			in.Close()
-			os.RemoveAll(tmpCopyDir)
+			inner_err := in.Close()
+			if inner_err != nil {
+				return fmt.Errorf("Unexpected error occur: %v", inner_err)
+			}
+			inner_err = os.RemoveAll(tmpCopyDir)
+			if inner_err != nil {
+				return fmt.Errorf("Unexpected error occur: %v", inner_err)
+			}
 			return fmt.Errorf("Failed to stat file: %v", err)
 		}
 		fileSize := stat.Size()
 		if err := writeInt64(encoder, fileSize); err != nil {
-			in.Close()
-			os.RemoveAll(tmpCopyDir)
+			inner_err := in.Close()
+			if inner_err != nil {
+				return fmt.Errorf("Unexpected error occur: %v", inner_err)
+			}
+			inner_err = os.RemoveAll(tmpCopyDir)
+			if inner_err != nil {
+				return fmt.Errorf("Unexpected error occur: %v", inner_err)
+			}
 			return fmt.Errorf("Failed to write file size: %v", err)
 		}
 		_, err = io.Copy(encoder, in)
 		// 更新CRC计算对象
-		crc.Write(nameBytes)
-		crc.Write([]byte(fmt.Sprintf("%d", fileSize)))
+		_, err = crc.Write(nameBytes)
+		if err != nil {
+			return fmt.Errorf("Failed to calculate CRC for file: %v", err)
+		}
+		_, err = crc.Write([]byte(fmt.Sprintf("%d", fileSize)))
+		if err != nil {
+			return fmt.Errorf("Failed to calculate CRC for file: %v", err)
+		}
 		_, err = io.Copy(crc, in)
 		if err != nil {
 			return fmt.Errorf("Failed to calculate CRC for file: %v", err)
 		}
-		in.Close()
+		err = in.Close()
 		if err != nil {
-			os.RemoveAll(tmpCopyDir)
+			inner_err := os.RemoveAll(tmpCopyDir)
+			if inner_err != nil {
+				return fmt.Errorf("Unexpected error occur: %v", inner_err)
+			}
 			return fmt.Errorf("Failed to copy file to snapshot: %v", err)
 		}
 	}
@@ -151,13 +205,19 @@ func (db *DB) ExportSnapshot() error {
 
 	// 写入CRC校验位
 	if err := binary.Write(encoder, binary.LittleEndian, crcValue); err != nil {
-		os.RemoveAll(tmpCopyDir)
+		inner_err := os.RemoveAll(tmpCopyDir)
+		if inner_err != nil {
+			return fmt.Errorf("Unexpected error occur: %v", inner_err)
+		}
 		return fmt.Errorf("Failed to write CRC value: %v", err)
 	}
 
-	encoder.Close()
-	f.Close()
-	os.RemoveAll(tmpCopyDir)
+	err = encoder.Close()
+	err = f.Close()
+	err = os.RemoveAll(tmpCopyDir)
+	if err != nil {
+		return fmt.Errorf("Unexpected error occur: %v", err)
+	}
 	if err := os.Rename(tmpFile, snapFile); err != nil {
 		return fmt.Errorf("Failed to rename snapshot file: %v", err)
 	}
@@ -277,6 +337,7 @@ func (db *DB) ImportSnapshot(snapPath string) error {
 		// 创建目标文件
 		filePath := filepath.Join(tmpDir, fileName)
 		out, err := os.Create(filePath)
+		defer out.Close()
 		if err != nil {
 			return fmt.Errorf("Failed to create file: %v", err)
 		}
@@ -288,9 +349,14 @@ func (db *DB) ImportSnapshot(snapPath string) error {
 		}
 
 		// 更新CRC计算对象
-		crc.Write(nameBytes)
-		crc.Write([]byte(fmt.Sprintf("%d", fileSize)))
-		defer out.Close()
+		_, err = crc.Write(nameBytes)
+		if err != nil {
+			return fmt.Errorf("Failed to calculate CRC for file: %v", err)
+		}
+		_, err = crc.Write([]byte(fmt.Sprintf("%d", fileSize)))
+		if err != nil {
+			return fmt.Errorf("Failed to calculate CRC for file: %v", err)
+		}
 		_, err = io.Copy(crc, out)
 		if err != nil {
 			return fmt.Errorf("Failed to calculate CRC for file: %v", err)
@@ -354,14 +420,17 @@ func (db *DB) ImportSnapshot(snapPath string) error {
 		}
 		out, err := os.Create(toPath)
 		if err != nil {
-			in.Close()
+			inner_err := in.Close()
+			if inner_err != nil {
+				return fmt.Errorf("Unexpected error occur: %v", inner_err)
+			}
 			// 尝试回滚
 			restoreFiles(tmpReplaceDir, dir)
 			return fmt.Errorf("Failed to create file in database dir: %v", err)
 		}
 		_, err = io.Copy(out, in)
-		in.Close()
-		out.Close()
+		err = in.Close()
+		err = out.Close()
 		if err != nil {
 			// 尝试回滚
 			restoreFiles(tmpReplaceDir, dir)
@@ -370,9 +439,11 @@ func (db *DB) ImportSnapshot(snapPath string) error {
 	}
 
 	// 导入成功，清理临时替换目录
-	os.RemoveAll(tmpReplaceDir)
+	err = os.RemoveAll(tmpReplaceDir)
+	if err != nil {
+		return fmt.Errorf("Unexpected error occur: %v", err)
+	}
 	log.Printf("Snapshot imported successfully: %s", snapPath)
-
 	return nil
 }
 
