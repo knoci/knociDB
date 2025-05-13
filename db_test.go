@@ -834,7 +834,6 @@ func TestDBMultiClients(t *testing.T) {
 	})
 }
 
-//nolint:gocognit
 //func TestDBIterator(t *testing.T) {
 //	options := DefaultOptions
 //	options.AutoCompactSupport = false

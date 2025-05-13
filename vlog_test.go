@@ -1,13 +1,13 @@
 package knocidb
 
 import (
+	"knocidb/util"
+	"knocidb/wal"
 	"os"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"knocidb/util"
-	"knocidb/wal"
 )
 
 func TestOpenValueLog(t *testing.T) {
@@ -21,9 +21,10 @@ func TestOpenValueLog(t *testing.T) {
 	}()
 
 	opts := valueLogOptions{
-		dirPath:      path,
-		segmentSize:  GB,
-		partitionNum: uint32(DefaultOptions.PartitionNum),
+		dirPath:         path,
+		segmentSize:     GB,
+		partitionNum:    uint32(DefaultOptions.PartitionNum),
+		hashKeyFunction: DefaultOptions.KeyHashFunction,
 	}
 	t.Run("open vlog files", func(t *testing.T) {
 		vlog, errOpen := openValueLog(opts)
@@ -37,9 +38,10 @@ func TestValueLogWriteAllKindsEntries(t *testing.T) {
 	path, err := os.MkdirTemp("", "vlog-test-write-entries")
 	require.NoError(t, err)
 	opts := valueLogOptions{
-		dirPath:      path,
-		segmentSize:  GB,
-		partitionNum: uint32(DefaultOptions.PartitionNum),
+		dirPath:         path,
+		segmentSize:     GB,
+		partitionNum:    uint32(DefaultOptions.PartitionNum),
+		hashKeyFunction: DefaultOptions.KeyHashFunction,
 	}
 
 	vlog, err := openValueLog(opts)
@@ -97,9 +99,10 @@ func TestValueLogWriteBatch(t *testing.T) {
 	}()
 
 	opts := valueLogOptions{
-		dirPath:      path,
-		segmentSize:  GB,
-		partitionNum: uint32(DefaultOptions.PartitionNum),
+		dirPath:         path,
+		segmentSize:     GB,
+		partitionNum:    uint32(DefaultOptions.PartitionNum),
+		hashKeyFunction: DefaultOptions.KeyHashFunction,
 	}
 
 	numRWList := []int{50000, 100000, 200000}
@@ -135,9 +138,10 @@ func TestValueLogWriteBatchReopen(t *testing.T) {
 	}()
 
 	opts := valueLogOptions{
-		dirPath:      path,
-		segmentSize:  GB,
-		partitionNum: uint32(DefaultOptions.PartitionNum),
+		dirPath:         path,
+		segmentSize:     GB,
+		partitionNum:    uint32(DefaultOptions.PartitionNum),
+		hashKeyFunction: DefaultOptions.KeyHashFunction,
 	}
 
 	numRW := 50000
@@ -177,9 +181,10 @@ func TestValueLogRead(t *testing.T) {
 	path, err := os.MkdirTemp("", "vlog-test-read")
 	require.NoError(t, err)
 	opts := valueLogOptions{
-		dirPath:      path,
-		segmentSize:  GB,
-		partitionNum: uint32(DefaultOptions.PartitionNum),
+		dirPath:         path,
+		segmentSize:     GB,
+		partitionNum:    uint32(DefaultOptions.PartitionNum),
+		hashKeyFunction: DefaultOptions.KeyHashFunction,
 	}
 
 	vlog, err := openValueLog(opts)
@@ -240,9 +245,10 @@ func TestValueLogReadReopen(t *testing.T) {
 	path, err := os.MkdirTemp("", "vlog-test-read-reopen")
 	require.NoError(t, err)
 	opts := valueLogOptions{
-		dirPath:      path,
-		segmentSize:  GB,
-		partitionNum: uint32(DefaultOptions.PartitionNum),
+		dirPath:         path,
+		segmentSize:     GB,
+		partitionNum:    uint32(DefaultOptions.PartitionNum),
+		hashKeyFunction: DefaultOptions.KeyHashFunction,
 	}
 
 	vlog, err := openValueLog(opts)
@@ -285,9 +291,10 @@ func TestValueLogSync(t *testing.T) {
 	path, err := os.MkdirTemp("", "vlog-test-sync")
 	require.NoError(t, err)
 	opts := valueLogOptions{
-		dirPath:      path,
-		segmentSize:  GB,
-		partitionNum: uint32(DefaultOptions.PartitionNum),
+		dirPath:         path,
+		segmentSize:     GB,
+		partitionNum:    uint32(DefaultOptions.PartitionNum),
+		hashKeyFunction: DefaultOptions.KeyHashFunction,
 	}
 
 	defer func() {
@@ -312,9 +319,10 @@ func TestValueLogClose(t *testing.T) {
 	path, err := os.MkdirTemp("", "vlog-test-close")
 	require.NoError(t, err)
 	opts := valueLogOptions{
-		dirPath:      path,
-		segmentSize:  GB,
-		partitionNum: uint32(DefaultOptions.PartitionNum),
+		dirPath:         path,
+		segmentSize:     GB,
+		partitionNum:    uint32(DefaultOptions.PartitionNum),
+		hashKeyFunction: DefaultOptions.KeyHashFunction,
 	}
 
 	vlog, err := openValueLog(opts)
@@ -334,9 +342,10 @@ func TestValueLogMultiSegmentFiles(t *testing.T) {
 	path, err := os.MkdirTemp("", "vlog-test-multi-segment")
 	require.NoError(t, err)
 	opts := valueLogOptions{
-		dirPath:      path,
-		segmentSize:  100 * MB,
-		partitionNum: 1,
+		dirPath:         path,
+		segmentSize:     100 * MB,
+		partitionNum:    1,
+		hashKeyFunction: DefaultOptions.KeyHashFunction,
 	}
 
 	tests := []struct {

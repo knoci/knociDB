@@ -172,6 +172,11 @@ func (mi *Iterator) Key() []byte {
 
 // Value 获取当前值
 func (mi *Iterator) Value() []byte {
+	defer func() {
+		if r := recover(); r != nil {
+			mi.db.mu.Unlock()
+		}
+	}()
 	topIter := mi.h[0]
 	switch topIter.iType {
 	// 磁盘B+树迭代器

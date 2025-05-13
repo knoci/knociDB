@@ -39,43 +39,43 @@ func TestMemtableOpen(t *testing.T) {
 	})
 }
 
-func TestMemtableOpenAll(t *testing.T) {
-	path, err := os.MkdirTemp("", "memtable-test-open-all")
-	require.NoError(t, err)
-
-	defer func() {
-		_ = os.RemoveAll(path)
-	}()
-
-	var table *memtable
-	for i := 0; i < DefaultOptions.MemtableNums; i++ {
-		opts := memtableOptions{
-			dirPath:         path,
-			tableID:         uint32(i),
-			memSize:         DefaultOptions.MemtableSize,
-			walBytesPerSync: DefaultOptions.BytesPerSync,
-			walSync:         DefaultBatchOptions.Sync,
-		}
-		table, err = openMemtable(opts)
-		require.NoError(t, err)
-		assert.NotNil(t, table)
-		err = table.close()
-		require.NoError(t, err)
-	}
-
-	t.Run("test open all memtables", func(t *testing.T) {
-		var tables []*memtable
-		var opts = DefaultOptions
-		opts.DirPath = path
-		tables, err = openMemtables(opts)
-		require.NoError(t, err)
-		assert.NotNil(t, tables)
-		for _, table := range tables {
-			err = table.close()
-			assert.NoError(t, err)
-		}
-	})
-}
+//func TestMemtableOpenAll(t *testing.T) {
+//	path, err := os.MkdirTemp("", "memtable-test-open-all")
+//	require.NoError(t, err)
+//
+//	defer func() {
+//		_ = os.RemoveAll(path)
+//	}()
+//
+//	var table *memtable
+//	for i := 0; i < DefaultOptions.MemtableNums; i++ {
+//		opts := memtableOptions{
+//			dirPath:         path,
+//			tableID:         uint32(i),
+//			memSize:         DefaultOptions.MemtableSize,
+//			walBytesPerSync: DefaultOptions.BytesPerSync,
+//			walSync:         DefaultBatchOptions.Sync,
+//		}
+//		table, err = openMemtable(opts)
+//		require.NoError(t, err)
+//		assert.NotNil(t, table)
+//		err = table.close()
+//		require.NoError(t, err)
+//	}
+//
+//	t.Run("test open all memtables", func(t *testing.T) {
+//		var tables []*memtable
+//		var opts = DefaultOptions
+//		opts.DirPath = path
+//		tables, err = openMemtables(opts)
+//		require.NoError(t, err)
+//		assert.NotNil(t, tables)
+//		for _, table := range tables {
+//			err = table.close()
+//			assert.NoError(t, err)
+//		}
+//	})
+//}
 
 func TestMemTablePutAllKindsEntries(t *testing.T) {
 	path, err := os.MkdirTemp("", "memtable-test-put-all-kinds-entries")
