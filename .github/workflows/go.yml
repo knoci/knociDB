@@ -1,0 +1,24 @@
+name: Go # 使用语言
+
+on:     # 监听动作
+  push: # 监听 push 动作
+    branches: [ master ] # 监听哪个分支 branch
+  pull_request:
+    branches: [ master ]
+
+jobs: # 工作 job
+  build: # 构建动作
+    runs-on: ubuntu-latest # 基于 ubuntu 系统
+    steps: 
+    - uses: actions/checkout@v2
+
+    - name: Set up Go 
+      uses: actions/setup-go@v2
+      with:
+        go-version: 1.23.3
+
+    - name: Build # 构建项目
+      run: go build -v ./...
+
+    - name: Test # 运行用例
+      run: go test -v .
