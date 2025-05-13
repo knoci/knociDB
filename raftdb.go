@@ -1,11 +1,10 @@
-package raft
+package knocidb
 
 import (
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"knocidb"
 	"log"
 	"sync"
 	"time"
@@ -21,17 +20,17 @@ var (
 	ErrTimeout = errors.New("operation timeout")
 	// ErrCanceled 表示操作被取消
 	ErrCanceled = errors.New("operation canceled")
-	// ErrDBNotOpen 表示数据库为空
-	ErrDBEmpty = errors.New("database not open")
 	// ErrRaftNotStartted 表示节点未开启
 	ErrNodeNotStarted = errors.New("raft not started")
+	// ErrRaftIsClosed 表示节点已关闭
+	ErrRaftIsClosed = errors.New("raft is closed")
 )
 
-// NodeManager 管理Raft节点和处理共识操作
-type NodeManager struct {
+// RaftDB 管理Raft节点和处理共识操作
+type RaftDB struct {
 	nodeHost     *dragonboat.NodeHost
-	config       Config
-	db           *knocidb.DB
+	config       RaftOptions
+	dbOptions    Options
 	mu           sync.RWMutex
 	leaderID     uint64
 	stateMachine *KVStateMachine
@@ -39,14 +38,10 @@ type NodeManager struct {
 	Sync         bool // 是否使用同步模式进行操作
 }
 
-// NewNodeManager 创建一个新的节点管理器
-func NewNodeManager(config Config, db *knocidb.DB) (*NodeManager, error) {
-	if db == nil {
-		return nil, ErrDBEmpty
-	}
-
+// NewRaftDB 创建一个新的节点管理器
+func OpenRaft(config RaftOptions, dboption Options) (*RaftDB, error) {
 	// 创建NodeHost配置
-	nhc := config.GetNodeHostConfig()
+	nhc := config.GetNodeHostOptions()
 
 	// 创建NodeHost
 	nodeHost, err := dragonboat.NewNodeHost(nhc)
@@ -55,39 +50,46 @@ func NewNodeManager(config Config, db *knocidb.DB) (*NodeManager, error) {
 	}
 
 	// 创建节点管理器
-	nm := &NodeManager{
-		nodeHost: nodeHost,
-		config:   config,
-		db:       db,
-		leaderID: 0,
-		state:    false,
-		Sync:     config.Sync,
+	rdb := &RaftDB{
+		nodeHost:  nodeHost,
+		config:    config,
+		dbOptions: dboption,
+		leaderID:  0,
+		state:     false,
+		Sync:      config.Sync,
 	}
 
-	return nm, nil
+	err = rdb.start()
+	if err != nil {
+		return nil, err
+	}
+	return rdb, nil
 }
 
 // Start 启动Raft节点
-func (nm *NodeManager) Start() error {
-	nm.mu.Lock()
-	defer nm.mu.Unlock()
-
+func (rdb *RaftDB) start() error {
+	rdb.mu.Lock()
+	defer rdb.mu.Unlock()
 	// 创建状态机工厂函数
+	db, err := Open(rdb.dbOptions)
+	if err != nil {
+		return fmt.Errorf("open database failed: %w", err)
+	}
 	factory := func(clusterID uint64, nodeID uint64) statemachine.IStateMachine {
-		sm := NewKVStateMachine(clusterID, nodeID, nm.db)
-		nm.stateMachine = sm
+		sm := NewKVStateMachine(clusterID, nodeID, db)
+		rdb.stateMachine = sm
 		return sm
 	}
 
 	// 获取Raft配置
-	rc := nm.config.GetRaftConfig()
+	rc := rdb.config.GetRaftOptions()
 
 	// 检查是否需要加入现有集群
-	if nm.config.JoinCluster {
+	if rdb.config.JoinCluster {
 		// 加入现有集群
-		log.Printf("joining raft group, NodeID: %d, ClusterID: %d\n", nm.config.NodeID, nm.config.ClusterID)
-		if err := nm.nodeHost.StartReplica(
-			nm.config.InitialMembers,
+		log.Printf("joining raft group, NodeID: %d, ClusterID: %d\n", rdb.config.NodeID, rdb.config.ClusterID)
+		if err := rdb.nodeHost.StartReplica(
+			rdb.config.InitialMembers,
 			true,
 			factory,
 			rc,
@@ -96,9 +98,9 @@ func (nm *NodeManager) Start() error {
 		}
 	} else {
 		// 启动新集群
-		log.Printf("create new raft group, NodeID: %d, ClusterID: %d\n", nm.config.NodeID, nm.config.ClusterID)
-		if err := nm.nodeHost.StartReplica(
-			nm.config.InitialMembers,
+		log.Printf("create new raft group, NodeID: %d, ClusterID: %d\n", rdb.config.NodeID, rdb.config.ClusterID)
+		if err := rdb.nodeHost.StartReplica(
+			rdb.config.InitialMembers,
 			false,
 			factory,
 			rc,
@@ -108,46 +110,53 @@ func (nm *NodeManager) Start() error {
 	}
 
 	// 启动Leader检测
-	go nm.leaderMonitor()
-	nm.state = true
+	go rdb.leaderMonitor()
+	rdb.state = true
 	return nil
 }
 
-// Stop 停止Raft节点
-func (nm *NodeManager) Stop() error {
-	nm.mu.Lock()
-	defer nm.mu.Unlock()
-
-	if nm.nodeHost != nil {
-		nm.nodeHost.Close()
-		nm.nodeHost = nil
+func (rdb *RaftDB) Close() error {
+	if !rdb.state {
+		return ErrRaftIsClosed
 	}
-	nm.state = false
+	return rdb.stop()
+}
+
+// Stop 停止Raft节点
+func (rdb *RaftDB) stop() error {
+	rdb.mu.Lock()
+	defer rdb.mu.Unlock()
+
+	if rdb.nodeHost != nil {
+		rdb.nodeHost.Close()
+		rdb.nodeHost = nil
+	}
+	rdb.state = false
 	return nil
 }
 
 // leaderMonitor 监控Leader变化
-func (nm *NodeManager) leaderMonitor() {
+func (rdb *RaftDB) leaderMonitor() {
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ticker.C:
-			if nm.nodeHost == nil {
+			if rdb.nodeHost == nil {
 				return
 			}
 
 			// 获取Leader信息
-			leaderID, _, valid, err := nm.nodeHost.GetLeaderID(nm.config.ClusterID)
+			leaderID, _, valid, err := rdb.nodeHost.GetLeaderID(rdb.config.ClusterID)
 			if err != nil || !valid {
 				continue
 			}
 
-			nm.mu.Lock()
-			oldLeaderID := nm.leaderID
-			nm.leaderID = leaderID
-			nm.mu.Unlock()
+			rdb.mu.Lock()
+			oldLeaderID := rdb.leaderID
+			rdb.leaderID = leaderID
+			rdb.mu.Unlock()
 
 			// 如果Leader发生变化，记录日志
 			if oldLeaderID != leaderID {
@@ -158,23 +167,23 @@ func (nm *NodeManager) leaderMonitor() {
 }
 
 // IsLeader 检查当前节点是否是Leader
-func (nm *NodeManager) IsLeader() bool {
-	nm.mu.RLock()
-	defer nm.mu.RUnlock()
+func (rdb *RaftDB) IsLeader() bool {
+	rdb.mu.RLock()
+	defer rdb.mu.RUnlock()
 
-	return nm.leaderID == nm.config.NodeID
+	return rdb.leaderID == rdb.config.NodeID
 }
 
 // GetLeaderID 获取当前Leader的NodeID
-func (nm *NodeManager) GetLeaderID() (uint64, error) {
-	nm.mu.RLock()
-	defer nm.mu.RUnlock()
+func (rdb *RaftDB) GetLeaderID() (uint64, error) {
+	rdb.mu.RLock()
+	defer rdb.mu.RUnlock()
 
-	if nm.nodeHost == nil || !nm.state {
+	if rdb.nodeHost == nil || !rdb.state {
 		return 0, ErrNodeNotStarted
 	}
 
-	leaderID, _, valid, err := nm.nodeHost.GetLeaderID(nm.config.ClusterID)
+	leaderID, _, valid, err := rdb.nodeHost.GetLeaderID(rdb.config.ClusterID)
 	if err != nil {
 		return 0, err
 	}
@@ -186,8 +195,8 @@ func (nm *NodeManager) GetLeaderID() (uint64, error) {
 }
 
 // Put 通过Raft共识写入键值对
-func (nm *NodeManager) Put(key, value []byte) error {
-	if nm.nodeHost == nil || !nm.state {
+func (rdb *RaftDB) Put(key, value []byte) error {
+	if rdb.nodeHost == nil || !rdb.state {
 		return ErrNodeNotStarted
 	}
 	// 创建命令
@@ -204,15 +213,15 @@ func (nm *NodeManager) Put(key, value []byte) error {
 	}
 
 	// 根据Sync字段决定使用同步还是异步模式
-	if nm.Sync {
+	if rdb.Sync {
 		// 使用同步Propose方法
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		_, err := nm.nodeHost.SyncPropose(ctx, nm.nodeHost.GetNoOPSession(nm.config.ClusterID), data)
+		_, err := rdb.nodeHost.SyncPropose(ctx, rdb.nodeHost.GetNoOPSession(rdb.config.ClusterID), data)
 		return err
 	} else {
 		// 使用异步Propose方法
-		rs, err := nm.nodeHost.Propose(nm.nodeHost.GetNoOPSession(nm.config.ClusterID), data, 5*time.Second)
+		rs, err := rdb.nodeHost.Propose(rdb.nodeHost.GetNoOPSession(rdb.config.ClusterID), data, 5*time.Second)
 		if err != nil {
 			return err
 		}
@@ -236,8 +245,8 @@ func (nm *NodeManager) Put(key, value []byte) error {
 }
 
 // Delete 通过Raft共识删除键
-func (nm *NodeManager) Delete(key []byte) error {
-	if nm.nodeHost == nil || !nm.state {
+func (rdb *RaftDB) Delete(key []byte) error {
+	if rdb.nodeHost == nil || !rdb.state {
 		return ErrNodeNotStarted
 	}
 	// 创建命令
@@ -253,15 +262,15 @@ func (nm *NodeManager) Delete(key []byte) error {
 	}
 
 	// 根据Sync字段决定使用同步还是异步模式
-	if nm.Sync {
+	if rdb.Sync {
 		// 使用同步Propose方法
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		_, err := nm.nodeHost.SyncPropose(ctx, nm.nodeHost.GetNoOPSession(nm.config.ClusterID), data)
+		_, err := rdb.nodeHost.SyncPropose(ctx, rdb.nodeHost.GetNoOPSession(rdb.config.ClusterID), data)
 		return err
 	} else {
 		// 使用异步Propose方法
-		rs, err := nm.nodeHost.Propose(nm.nodeHost.GetNoOPSession(nm.config.ClusterID), data, 5*time.Second)
+		rs, err := rdb.nodeHost.Propose(rdb.nodeHost.GetNoOPSession(rdb.config.ClusterID), data, 5*time.Second)
 		if err != nil {
 			return err
 		}
@@ -285,8 +294,8 @@ func (nm *NodeManager) Delete(key []byte) error {
 }
 
 // Get 通过Raft共识读取键值
-func (nm *NodeManager) Get(key []byte) ([]byte, error) {
-	if nm.nodeHost == nil || !nm.state {
+func (rdb *RaftDB) Get(key []byte) ([]byte, error) {
+	if rdb.nodeHost == nil || !rdb.state {
 		return nil, ErrNodeNotStarted
 	}
 	// 创建查询命令
@@ -301,11 +310,11 @@ func (nm *NodeManager) Get(key []byte) ([]byte, error) {
 	}
 
 	// 根据Sync字段决定使用同步还是异步模式
-	if nm.Sync {
+	if rdb.Sync {
 		// 使用同步ReadIndex方法
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		result, err := nm.nodeHost.SyncRead(ctx, nm.config.ClusterID, data)
+		result, err := rdb.nodeHost.SyncRead(ctx, rdb.config.ClusterID, data)
 		if err != nil {
 			return nil, err
 		}
@@ -319,7 +328,7 @@ func (nm *NodeManager) Get(key []byte) ([]byte, error) {
 		return value, nil
 	} else {
 		// 使用异步ReadIndex方法
-		rs, err := nm.nodeHost.ReadIndex(nm.config.ClusterID, 5*time.Second)
+		rs, err := rdb.nodeHost.ReadIndex(rdb.config.ClusterID, 5*time.Second)
 		if err != nil {
 			return nil, err
 		}
@@ -337,7 +346,7 @@ func (nm *NodeManager) Get(key []byte) ([]byte, error) {
 		}
 
 		// 执行本地读取
-		result, err := nm.nodeHost.ReadLocalNode(rs, data)
+		result, err := rdb.nodeHost.ReadLocalNode(rs, data)
 		if err != nil {
 			return nil, err
 		}
@@ -353,8 +362,8 @@ func (nm *NodeManager) Get(key []byte) ([]byte, error) {
 }
 
 // BatchWrite 通过Raft共识批量写入
-func (nm *NodeManager) BatchWrite(commands []Command, batchID uint64) error {
-	if nm.nodeHost == nil || !nm.state {
+func (rdb *RaftDB) BatchWrite(commands []Command, batchID uint64) error {
+	if rdb.nodeHost == nil || !rdb.state {
 		return ErrNodeNotStarted
 	}
 	// 创建批处理命令
@@ -371,15 +380,15 @@ func (nm *NodeManager) BatchWrite(commands []Command, batchID uint64) error {
 	}
 
 	// 根据Sync字段决定使用同步还是异步模式
-	if nm.Sync {
+	if rdb.Sync {
 		// 使用同步Propose方法
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		_, err := nm.nodeHost.SyncPropose(ctx, nm.nodeHost.GetNoOPSession(nm.config.ClusterID), data)
+		_, err := rdb.nodeHost.SyncPropose(ctx, rdb.nodeHost.GetNoOPSession(rdb.config.ClusterID), data)
 		return err
 	} else {
 		// 使用异步Propose方法
-		rs, err := nm.nodeHost.Propose(nm.nodeHost.GetNoOPSession(nm.config.ClusterID), data, 10*time.Second)
+		rs, err := rdb.nodeHost.Propose(rdb.nodeHost.GetNoOPSession(rdb.config.ClusterID), data, 10*time.Second)
 		if err != nil {
 			return err
 		}
@@ -403,21 +412,21 @@ func (nm *NodeManager) BatchWrite(commands []Command, batchID uint64) error {
 }
 
 // GetClusterMembership 获取集群成员信息
-func (nm *NodeManager) GetClusterMembership() (map[uint64]string, error) {
-	nm.mu.RLock()
-	defer nm.mu.RUnlock()
+func (rdb *RaftDB) GetClusterMembership() (map[uint64]string, error) {
+	rdb.mu.RLock()
+	defer rdb.mu.RUnlock()
 
-	if nm.nodeHost == nil || !nm.state {
+	if rdb.nodeHost == nil || !rdb.state {
 		return nil, ErrNodeNotStarted
 	}
 
 	// 根据Sync字段决定使用同步还是异步模式
-	if nm.Sync {
+	if rdb.Sync {
 		// 直接使用同步方法获取成员信息
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 
-		membership, err := nm.nodeHost.SyncGetShardMembership(ctx, nm.config.ClusterID)
+		membership, err := rdb.nodeHost.SyncGetShardMembership(ctx, rdb.config.ClusterID)
 		if err != nil {
 			return nil, err
 		}
@@ -425,7 +434,7 @@ func (nm *NodeManager) GetClusterMembership() (map[uint64]string, error) {
 		return membership.Nodes, nil
 	} else {
 		// 使用异步ReadIndex方法确保线性一致性，然后获取成员信息
-		rs, err := nm.nodeHost.ReadIndex(nm.config.ClusterID, 5*time.Second)
+		rs, err := rdb.nodeHost.ReadIndex(rdb.config.ClusterID, 5*time.Second)
 		if err != nil {
 			return nil, err
 		}
@@ -446,7 +455,7 @@ func (nm *NodeManager) GetClusterMembership() (map[uint64]string, error) {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 
-		membership, err := nm.nodeHost.SyncGetShardMembership(ctx, nm.config.ClusterID)
+		membership, err := rdb.nodeHost.SyncGetShardMembership(ctx, rdb.config.ClusterID)
 		if err != nil {
 			return nil, err
 		}
@@ -456,28 +465,28 @@ func (nm *NodeManager) GetClusterMembership() (map[uint64]string, error) {
 }
 
 // AddNode 向集群添加新节点
-func (nm *NodeManager) AddNode(nodeID uint64, address string) error {
-	nm.mu.Lock()
-	defer nm.mu.Unlock()
+func (rdb *RaftDB) AddNode(nodeID uint64, address string) error {
+	rdb.mu.Lock()
+	defer rdb.mu.Unlock()
 
-	if nm.nodeHost == nil || !nm.state {
+	if rdb.nodeHost == nil || !rdb.state {
 		return ErrNodeNotStarted
 	}
 
 	// 检查是否是Leader
-	if !nm.IsLeader() {
+	if !rdb.IsLeader() {
 		return ErrNotLeader
 	}
 
 	// 根据Sync字段决定使用同步还是异步模式
-	if nm.Sync {
+	if rdb.Sync {
 		// 使用同步方法添加节点
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		return nm.nodeHost.SyncRequestAddReplica(ctx, nm.config.ClusterID, nodeID, address, 0)
+		return rdb.nodeHost.SyncRequestAddReplica(ctx, rdb.config.ClusterID, nodeID, address, 0)
 	} else {
 		// 使用异步方法添加节点
-		rs, err := nm.nodeHost.RequestAddReplica(nm.config.ClusterID, nodeID, address, 0, 30*time.Second)
+		rs, err := rdb.nodeHost.RequestAddReplica(rdb.config.ClusterID, nodeID, address, 0, 30*time.Second)
 		if err != nil {
 			return err
 		}
@@ -501,28 +510,28 @@ func (nm *NodeManager) AddNode(nodeID uint64, address string) error {
 }
 
 // RemoveNode 从集群移除节点
-func (nm *NodeManager) RemoveNode(nodeID uint64) error {
-	nm.mu.Lock()
-	defer nm.mu.Unlock()
+func (rdb *RaftDB) RemoveNode(nodeID uint64) error {
+	rdb.mu.Lock()
+	defer rdb.mu.Unlock()
 
-	if nm.nodeHost == nil || !nm.state {
+	if rdb.nodeHost == nil || !rdb.state {
 		return ErrNodeNotStarted
 	}
 
 	// 检查是否是Leader
-	if !nm.IsLeader() {
+	if !rdb.IsLeader() {
 		return ErrNotLeader
 	}
 
 	// 根据Sync字段决定使用同步还是异步模式
-	if nm.Sync {
+	if rdb.Sync {
 		// 使用同步方法移除节点
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		return nm.nodeHost.SyncRequestDeleteReplica(ctx, nm.config.ClusterID, nodeID, 0)
+		return rdb.nodeHost.SyncRequestDeleteReplica(ctx, rdb.config.ClusterID, nodeID, 0)
 	} else {
 		// 使用异步方法移除节点
-		rs, err := nm.nodeHost.RequestDeleteReplica(nm.config.ClusterID, nodeID, 0, 30*time.Second)
+		rs, err := rdb.nodeHost.RequestDeleteReplica(rdb.config.ClusterID, nodeID, 0, 30*time.Second)
 		if err != nil {
 			return err
 		}

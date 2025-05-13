@@ -1,9 +1,8 @@
-package raft
+package knocidb
 
 import (
 	"encoding/json"
 	"fmt"
-	"knocidb"
 	"os"
 	"path/filepath"
 	"testing"
@@ -24,8 +23,24 @@ func setupTestEnvironment(t *testing.T) (string, func()) {
 	return tempDir, cleanup
 }
 
-func createTestDB(t *testing.T, dirPath string) *knocidb.DB {
-	options := knocidb.DefaultOptions
+func createTestDB(t *testing.T, dirPath string) *DB {
+	options := DefaultOptions
+	options.DirPath = dirPath
+	options.RaftPath = filepath.Join(dirPath, "raft")
+	options.SnapshotPath = filepath.Join(dirPath, "snapshot")
+
+	err := os.MkdirAll(options.DirPath, os.ModePerm)
+	require.NoError(t, err)
+	err = os.MkdirAll(options.RaftPath, os.ModePerm)
+	require.NoError(t, err)
+	err = os.MkdirAll(options.SnapshotPath, os.ModePerm)
+	require.NoError(t, err)
+	db, err := Open(options)
+	return db
+}
+
+func createTestDBOptions(t *testing.T, dirPath string) Options {
+	options := DefaultOptions
 	options.DirPath = dirPath
 	options.RaftPath = filepath.Join(dirPath, "raft")
 	options.SnapshotPath = filepath.Join(dirPath, "snapshot")
@@ -37,14 +52,11 @@ func createTestDB(t *testing.T, dirPath string) *knocidb.DB {
 	err = os.MkdirAll(options.SnapshotPath, os.ModePerm)
 	require.NoError(t, err)
 
-	db, err := knocidb.Open(options)
-	require.NoError(t, err)
-
-	return db
+	return options
 }
 
-func createTestRaftConfig(nodeID, clusterID uint64, raftAddress, dataDir string) Config {
-	config := DefaultConfig(nodeID, clusterID, raftAddress, dataDir)
+func createTestRaftConfig(nodeID, clusterID uint64, raftAddress, dataDir string) RaftOptions {
+	config := DefaultRaftOptions(nodeID, clusterID, raftAddress, dataDir)
 	config.TickMs = 50
 	config.ElectionRTTMs = 5
 	config.HeartbeatRTTMs = 1
@@ -57,42 +69,41 @@ func createTestRaftConfig(nodeID, clusterID uint64, raftAddress, dataDir string)
 	return config
 }
 
-func TestValidateConfig(t *testing.T) {
+func TestValidateRaftOptions(t *testing.T) {
 	t.Run("Valid config", func(t *testing.T) {
-		config := DefaultConfig(1, 1, "localhost:10000", "/tmp/raft")
-		err := ValidateConfig(&config)
+		config := DefaultRaftOptions(1, 1, "localhost:10000", "/tmp/raft")
+		err := ValidateRaftOptions(&config)
 		assert.NoError(t, err)
 	})
 
 	t.Run("Invalid NodeID", func(t *testing.T) {
-		config := DefaultConfig(0, 1, "localhost:10000", "/tmp/raft")
-		err := ValidateConfig(&config)
+		config := DefaultRaftOptions(0, 1, "localhost:10000", "/tmp/raft")
+		err := ValidateRaftOptions(&config)
 		assert.Error(t, err)
 	})
 
 	t.Run("Invalid ClusterID", func(t *testing.T) {
-		config := DefaultConfig(1, 0, "localhost:10000", "/tmp/raft")
-		err := ValidateConfig(&config)
+		config := DefaultRaftOptions(1, 0, "localhost:10000", "/tmp/raft")
+		err := ValidateRaftOptions(&config)
 		assert.Error(t, err)
 	})
 
 	t.Run("Empty RaftAddress", func(t *testing.T) {
-		config := DefaultConfig(1, 1, "", "/tmp/raft")
-		err := ValidateConfig(&config)
+		config := DefaultRaftOptions(1, 1, "", "/tmp/raft")
+		err := ValidateRaftOptions(&config)
 		assert.Error(t, err)
 	})
 
 	t.Run("Empty DataDir", func(t *testing.T) {
-		config := DefaultConfig(1, 1, "localhost:10000", "")
-		err := ValidateConfig(&config)
+		config := DefaultRaftOptions(1, 1, "localhost:10000", "")
+		err := ValidateRaftOptions(&config)
 		assert.Error(t, err)
 	})
 
 	t.Run("No InitialMembers", func(t *testing.T) {
-		config := DefaultConfig(1, 1, "localhost:10000", "/tmp/raft")
+		config := DefaultRaftOptions(1, 1, "localhost:10000", "/tmp/raft")
 		config.InitialMembers = map[uint64]string{}
-		config.JoinCluster = true
-		err := ValidateConfig(&config)
+		err := ValidateRaftOptions(&config)
 		assert.Error(t, err)
 	})
 }
@@ -194,18 +205,14 @@ func TestCommandSerialization(t *testing.T) {
 	})
 }
 
-func TestNodeManager(t *testing.T) {
+func TestRaftDB(t *testing.T) {
 	tempDir, cleanup := setupTestEnvironment(t)
-
-	db := createTestDB(t, tempDir)
 	defer cleanup()
 
 	config := createTestRaftConfig(1, 100, "localhost:10000", tempDir)
+	option := createTestDBOptions(t, tempDir)
 
-	nm, err := NewNodeManager(config, db)
-	require.NoError(t, err)
-
-	err = nm.Start()
+	nm, err := OpenRaft(config, option)
 	require.NoError(t, err)
 
 	time.Sleep(2 * time.Second)
@@ -249,56 +256,13 @@ func TestNodeManager(t *testing.T) {
 		assert.Equal(t, "localhost:10000", members[1])
 	})
 
-	err = nm.Stop()
-	require.NoError(t, err)
-}
-
-func TestRaftDB(t *testing.T) {
-	tempDir, cleanup := setupTestEnvironment(t)
-	db := createTestDB(t, tempDir)
-	defer cleanup()
-
-	config := createTestRaftConfig(1, 200, "localhost:10001", tempDir)
-
-	raftDB, err := OpenRaftDB(db, config)
-	require.NoError(t, err)
-
-	time.Sleep(2 * time.Second)
-
-	t.Run("IsLeader", func(t *testing.T) {
-		isLeader := raftDB.IsLeader()
-		// 单节点集群应该成为Leader
-		assert.True(t, isLeader)
-	})
-
-	t.Run("PutAndGet", func(t *testing.T) {
-		err := raftDB.Put([]byte("raftdb-key"), []byte("raftdb-value"))
-		require.NoError(t, err)
-
-		value, err := raftDB.Get([]byte("raftdb-key"))
-		require.NoError(t, err)
-		assert.Equal(t, []byte("raftdb-value"), value)
-	})
-
-	t.Run("Delete", func(t *testing.T) {
-		err := raftDB.Put([]byte("raftdb-delete-key"), []byte("raftdb-delete-value"))
-		require.NoError(t, err)
-
-		err = raftDB.Delete([]byte("raftdb-delete-key"))
-		require.NoError(t, err)
-
-		_, err = raftDB.Get([]byte("raftdb-delete-key"))
-		assert.Error(t, err)
-	})
-
-	err = raftDB.Close()
+	err = nm.Close()
 	require.NoError(t, err)
 }
 
 func TestMultiNodeRaftCluster(t *testing.T) {
 	nodeCount := 3
 	nodes := make([]*RaftDB, nodeCount)
-	dbs := make([]*knocidb.DB, nodeCount)
 	tempDirs := make([]string, nodeCount)
 	cleanups := make([]func(), nodeCount)
 
@@ -315,16 +279,14 @@ func TestMultiNodeRaftCluster(t *testing.T) {
 		tempDirs[i] = tempDir
 		cleanups[i] = cleanup
 
-		db := createTestDB(t, tempDir)
-		dbs[i] = db
-
 		nodeID := uint64(i + 1)
 		port := 10100 + i
 		address := fmt.Sprintf("localhost:%d", port)
 		config := createTestRaftConfig(nodeID, 300, address, tempDir)
 		config.InitialMembers = initialMembers
+		option := createTestDBOptions(t, tempDir)
 
-		raftDB, err := OpenRaftDB(db, config)
+		raftDB, err := OpenRaft(config, option)
 		require.NoError(t, err)
 		nodes[i] = raftDB
 	}

@@ -1,4 +1,4 @@
-package raft
+package knocidb
 
 import (
 	"encoding/binary"
@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
-	"knocidb"
 	"os"
 	"path/filepath"
 	"sort"
@@ -23,9 +22,6 @@ const (
 	OpPut    uint32 = 1
 	OpDelete uint32 = 2
 	OpBatch  uint32 = 3
-
-	// 快照文件扩展名，与knocidb包中的定义保持一致
-	snapshotExt = ".ZST"
 )
 
 // Command 表示要通过Raft共识执行的命令
@@ -48,13 +44,13 @@ type BatchCommand struct {
 type KVStateMachine struct {
 	clusterID    uint64
 	nodeID       uint64
-	db           *knocidb.DB // 数据库
+	db           *DB // 数据库
 	appliedIndex uint64
 	mu           sync.RWMutex
 }
 
 // NewKVStateMachine 创建一个新的KV状态机实例
-func NewKVStateMachine(clusterID, nodeID uint64, db *knocidb.DB) *KVStateMachine {
+func NewKVStateMachine(clusterID, nodeID uint64, db *DB) *KVStateMachine {
 	return &KVStateMachine{
 		clusterID:    clusterID,
 		nodeID:       nodeID,
@@ -104,7 +100,7 @@ func (s *KVStateMachine) Update(entry statemachine.Entry) (statemachine.Result, 
 			return statemachine.Result{}, fmt.Errorf("failed to unmarshal command: %v", err)
 		}
 
-		batch := s.db.NewBatch(knocidb.DefaultBatchOptions)
+		batch := s.db.NewBatch(DefaultBatchOptions)
 		for _, command := range batchCmd.Commands {
 			switch command.Op {
 			case OpPut:
@@ -156,7 +152,7 @@ func (s *KVStateMachine) SaveSnapshot(w io.Writer, fc statemachine.ISnapshotFile
 	// ExportSnapshot会自动关闭数据库
 	if err := s.db.ExportSnapshot(); err != nil {
 		// 导出失败，尝试重新打开数据库
-		db, openErr := knocidb.Open(options)
+		db, openErr := Open(options)
 		if openErr != nil {
 			return fmt.Errorf("reopen database failed : %v, export error: %w", openErr, err)
 		}
@@ -165,7 +161,7 @@ func (s *KVStateMachine) SaveSnapshot(w io.Writer, fc statemachine.ISnapshotFile
 	}
 
 	// 导出成功后重新打开数据库
-	db, err := knocidb.Open(options)
+	db, err := Open(options)
 	if err != nil {
 		return fmt.Errorf("reopen database failed after export snapshot : %w", err)
 	}
@@ -281,7 +277,7 @@ func (s *KVStateMachine) RecoverFromSnapshot(r io.Reader, files []statemachine.S
 	// 使用KnociDB的导入功能恢复数据库状态 ImportSnapshot会自动关闭数据库
 	if err := s.db.ImportSnapshot(latestSnapshot); err != nil {
 		// 导入失败，尝试重新打开数据库
-		db, openErr := knocidb.Open(options)
+		db, openErr := Open(options)
 		if openErr != nil {
 			return fmt.Errorf("reopen database failed: %v, import snapshot failed: %w", openErr, err)
 		}
@@ -290,7 +286,7 @@ func (s *KVStateMachine) RecoverFromSnapshot(r io.Reader, files []statemachine.S
 	}
 
 	// 导入成功后重新打开数据库
-	db, err := knocidb.Open(options)
+	db, err := Open(options)
 	if err != nil {
 		return fmt.Errorf("reopen database failed after import snapshot: %w", err)
 	}
