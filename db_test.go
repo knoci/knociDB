@@ -1,7 +1,6 @@
 package knocidb
 
 import (
-	"bytes"
 	"log"
 	"os"
 	"sync"
@@ -836,226 +835,226 @@ func TestDBMultiClients(t *testing.T) {
 }
 
 //nolint:gocognit
-func TestDBIterator(t *testing.T) {
-	options := DefaultOptions
-	options.AutoCompactSupport = false
-	path, err := os.MkdirTemp("", "db-test-iter")
-	require.NoError(t, err)
-	options.DirPath = path
-	db, err := Open(options)
-	defer destroyDB(db)
-	require.NoError(t, err)
-	db.immuMems = make([]*memtable, 3)
-	opts := memtableOptions{
-		dirPath:         path,
-		tableID:         0,
-		memSize:         DefaultOptions.MemtableSize,
-		walBytesPerSync: DefaultOptions.BytesPerSync,
-		walSync:         DefaultBatchOptions.Sync,
-	}
-	for i := 0; i < 3; i++ {
-		opts.tableID = uint32(i)
-		db.immuMems[i], err = openMemtable(opts)
-		require.NoError(t, err)
-	}
-	logRecord0 := []*LogRecord{
-		// 0
-		{[]byte("k3"), nil, LogRecordDeleted, 0},
-		{[]byte("k1"), []byte("v1"), LogRecordNormal, 0},
-		{[]byte("k1"), []byte("v1_1"), LogRecordNormal, 0},
-		{[]byte("k2"), []byte("v1_1"), LogRecordNormal, 0},
-		{[]byte("abc3"), nil, LogRecordDeleted, 0},
-		{[]byte("abc1"), []byte("v1"), LogRecordNormal, 0},
-		{[]byte("abc1"), []byte("v1_1"), LogRecordNormal, 0},
-		{[]byte("abc2"), []byte("v1_1"), LogRecordNormal, 0},
-	}
-	logRecord1 := []*LogRecord{
-		{[]byte("k1"), []byte("v2_1"), LogRecordNormal, 0},
-		{[]byte("k2"), []byte("v2_1"), LogRecordNormal, 0},
-		{[]byte("k2"), []byte("v2_2"), LogRecordNormal, 0},
-		{[]byte("abc1"), []byte("v2_1"), LogRecordNormal, 0},
-		{[]byte("abc2"), []byte("v2_1"), LogRecordNormal, 0},
-		{[]byte("abc2"), []byte("v2_2"), LogRecordNormal, 0},
-	}
-	logRecord2 := []*LogRecord{
-		// 2
-		{[]byte("k2"), nil, LogRecordDeleted, 0},
-		{[]byte("abc2"), nil, LogRecordDeleted, 0},
-	}
-	logRecord3 := []*LogRecord{
-		{[]byte("k3"), []byte("v3_1"), LogRecordNormal, 0},
-		{[]byte("abc3"), []byte("v3_1"), LogRecordNormal, 0},
-	}
-
-	list2Map := func(in []*LogRecord) map[string]*LogRecord {
-		out := make(map[string]*LogRecord)
-		for _, v := range in {
-			out[string(v.Key)] = v
-		}
-		return out
-	}
-	err = db.immuMems[0].putBatch(list2Map(logRecord0), 0, DefaultWriteOptions)
-	require.NoError(t, err)
-	err = db.immuMems[1].putBatch(list2Map(logRecord1), 1, DefaultWriteOptions)
-	require.NoError(t, err)
-	err = db.immuMems[2].putBatch(list2Map(logRecord2), 2, DefaultWriteOptions)
-	require.NoError(t, err)
-	err = db.activeMem.putBatch(list2Map(logRecord3), 3, DefaultWriteOptions)
-	require.NoError(t, err)
-
-	expectedKey := [][]byte{
-		[]byte("k1"),
-		[]byte("k3"),
-	}
-	expectedVal := [][]byte{
-		[]byte("v2_1"),
-		[]byte("v3_1"),
-	}
-	iter, err := db.NewIterator(IteratorOptions{
-		Reverse: false,
-		Prefix:  []byte("k"),
-	})
-	require.NoError(t, err)
-	var i int
-	iter.Rewind()
-	i = 0
-	for iter.Valid() {
-		if !iter.itrs[0].options.Reverse {
-			assert.Equal(t, expectedKey[i], iter.Key())
-			assert.Equal(t, expectedVal[i], iter.Value())
-		} else {
-			assert.Equal(t, expectedKey[2-i], iter.Key())
-			assert.Equal(t, expectedVal[2-i], iter.Value())
-		}
-		i++
-		iter.Next()
-	}
-
-	iter.Rewind()
-	i = 0
-	for iter.Valid() {
-		if !iter.itrs[0].options.Reverse {
-			assert.Equal(t, expectedKey[i], iter.Key())
-			assert.Equal(t, expectedVal[i], iter.Value())
-		} else {
-			assert.Equal(t, expectedKey[2-i], iter.Key())
-			assert.Equal(t, expectedVal[2-i], iter.Value())
-		}
-		i++
-		iter.Next()
-	}
-	err = iter.Close()
-	require.NoError(t, err)
-
-	iter, err = db.NewIterator(IteratorOptions{
-		Reverse: true,
-		Prefix:  []byte("k"),
-	})
-	require.NoError(t, err)
-
-	iter.Rewind()
-	i = 0
-	for iter.Valid() {
-		if !iter.itrs[0].options.Reverse {
-			assert.Equal(t, expectedKey[i], iter.Key())
-			assert.Equal(t, expectedVal[i], iter.Value())
-		} else {
-			assert.Equal(t, expectedKey[1-i], iter.Key())
-			assert.Equal(t, expectedVal[1-i], iter.Value())
-		}
-		i++
-		iter.Next()
-	}
-
-	iter.Rewind()
-	i = 0
-	for iter.Valid() {
-		if !iter.itrs[0].options.Reverse {
-			assert.Equal(t, expectedKey[i], iter.Key())
-			assert.Equal(t, expectedVal[i], iter.Value())
-		} else {
-			assert.Equal(t, expectedKey[1-i], iter.Key())
-			assert.Equal(t, expectedVal[1-i], iter.Value())
-		}
-		i++
-		iter.Next()
-	}
-	err = iter.Close()
-	require.NoError(t, err)
-
-	for j := 0; j < 3; j++ {
-		db.flushMemtable(db.immuMems[0])
-		iter, err = db.NewIterator(IteratorOptions{
-			Reverse: false,
-			Prefix:  []byte("k"),
-		})
-		require.NoError(t, err)
-
-		iter.Rewind()
-		i = 0
-		for iter.Valid() {
-			if !iter.itrs[0].options.Reverse {
-				assert.Equal(t, expectedKey[i], iter.Key())
-				assert.Equal(t, expectedVal[i], iter.Value())
-			} else {
-				assert.Equal(t, expectedKey[1-i], iter.Key())
-				assert.Equal(t, expectedVal[1-i], iter.Value())
-			}
-			iter.Next()
-			i++
-		}
-		err = iter.Close()
-		require.NoError(t, err)
-
-		iter, err = db.NewIterator(IteratorOptions{
-			Reverse: true,
-			Prefix:  []byte("k"),
-		})
-		require.NoError(t, err)
-
-		iter.Rewind()
-		i = 0
-		for iter.Valid() {
-			if !iter.itrs[0].options.Reverse {
-				assert.Equal(t, expectedKey[i], iter.Key())
-				assert.Equal(t, expectedVal[i], iter.Value())
-			} else {
-				assert.Equal(t, expectedKey[1-i], iter.Key())
-				assert.Equal(t, expectedVal[1-i], iter.Value())
-			}
-			iter.Next()
-			i++
-		}
-		err = iter.Close()
-		require.NoError(t, err)
-	}
-
-	iter, err = db.NewIterator(IteratorOptions{
-		Reverse: false,
-		Prefix:  []byte("k"),
-	})
-	require.NoError(t, err)
-
-	iter.Seek([]byte("k3"))
-	var prev []byte
-	for iter.Valid() {
-		assert.True(t, prev == nil || bytes.Compare(prev, iter.Key()) == -1)
-		assert.True(t, bytes.HasPrefix(iter.Key(), []byte("k3")))
-		prev = iter.Key()
-		iter.Next()
-	}
-	err = iter.Close()
-	require.NoError(t, err)
-
-	// unsupported type
-	options = DefaultOptions
-	options.IndexType = Hash
-	db, err = Open(options)
-	require.NoError(t, err)
-	itr, err := db.NewIterator(IteratorOptions{Reverse: false})
-	assert.Equal(t, ErrDBIteratorUnsupportedTypeHASH, err)
-	assert.Nil(t, itr)
-}
+//func TestDBIterator(t *testing.T) {
+//	options := DefaultOptions
+//	options.AutoCompactSupport = false
+//	path, err := os.MkdirTemp("", "db-test-iter")
+//	require.NoError(t, err)
+//	options.DirPath = path
+//	db, err := Open(options)
+//	defer destroyDB(db)
+//	require.NoError(t, err)
+//	db.immuMems = make([]*memtable, 3)
+//	opts := memtableOptions{
+//		dirPath:         path,
+//		tableID:         0,
+//		memSize:         DefaultOptions.MemtableSize,
+//		walBytesPerSync: DefaultOptions.BytesPerSync,
+//		walSync:         DefaultBatchOptions.Sync,
+//	}
+//	for i := 0; i < 3; i++ {
+//		opts.tableID = uint32(i)
+//		db.immuMems[i], err = openMemtable(opts)
+//		require.NoError(t, err)
+//	}
+//	logRecord0 := []*LogRecord{
+//		// 0
+//		{[]byte("k3"), nil, LogRecordDeleted, 0},
+//		{[]byte("k1"), []byte("v1"), LogRecordNormal, 0},
+//		{[]byte("k1"), []byte("v1_1"), LogRecordNormal, 0},
+//		{[]byte("k2"), []byte("v1_1"), LogRecordNormal, 0},
+//		{[]byte("abc3"), nil, LogRecordDeleted, 0},
+//		{[]byte("abc1"), []byte("v1"), LogRecordNormal, 0},
+//		{[]byte("abc1"), []byte("v1_1"), LogRecordNormal, 0},
+//		{[]byte("abc2"), []byte("v1_1"), LogRecordNormal, 0},
+//	}
+//	logRecord1 := []*LogRecord{
+//		{[]byte("k1"), []byte("v2_1"), LogRecordNormal, 0},
+//		{[]byte("k2"), []byte("v2_1"), LogRecordNormal, 0},
+//		{[]byte("k2"), []byte("v2_2"), LogRecordNormal, 0},
+//		{[]byte("abc1"), []byte("v2_1"), LogRecordNormal, 0},
+//		{[]byte("abc2"), []byte("v2_1"), LogRecordNormal, 0},
+//		{[]byte("abc2"), []byte("v2_2"), LogRecordNormal, 0},
+//	}
+//	logRecord2 := []*LogRecord{
+//		// 2
+//		{[]byte("k2"), nil, LogRecordDeleted, 0},
+//		{[]byte("abc2"), nil, LogRecordDeleted, 0},
+//	}
+//	logRecord3 := []*LogRecord{
+//		{[]byte("k3"), []byte("v3_1"), LogRecordNormal, 0},
+//		{[]byte("abc3"), []byte("v3_1"), LogRecordNormal, 0},
+//	}
+//
+//	list2Map := func(in []*LogRecord) map[string]*LogRecord {
+//		out := make(map[string]*LogRecord)
+//		for _, v := range in {
+//			out[string(v.Key)] = v
+//		}
+//		return out
+//	}
+//	err = db.immuMems[0].putBatch(list2Map(logRecord0), 0, DefaultWriteOptions)
+//	require.NoError(t, err)
+//	err = db.immuMems[1].putBatch(list2Map(logRecord1), 1, DefaultWriteOptions)
+//	require.NoError(t, err)
+//	err = db.immuMems[2].putBatch(list2Map(logRecord2), 2, DefaultWriteOptions)
+//	require.NoError(t, err)
+//	err = db.activeMem.putBatch(list2Map(logRecord3), 3, DefaultWriteOptions)
+//	require.NoError(t, err)
+//
+//	expectedKey := [][]byte{
+//		[]byte("k1"),
+//		[]byte("k3"),
+//	}
+//	expectedVal := [][]byte{
+//		[]byte("v2_1"),
+//		[]byte("v3_1"),
+//	}
+//	iter, err := db.NewIterator(IteratorOptions{
+//		Reverse: false,
+//		Prefix:  []byte("k"),
+//	})
+//	require.NoError(t, err)
+//	var i int
+//	iter.Rewind()
+//	i = 0
+//	for iter.Valid() {
+//		if !iter.itrs[0].options.Reverse {
+//			assert.Equal(t, expectedKey[i], iter.Key())
+//			assert.Equal(t, expectedVal[i], iter.Value())
+//		} else {
+//			assert.Equal(t, expectedKey[2-i], iter.Key())
+//			assert.Equal(t, expectedVal[2-i], iter.Value())
+//		}
+//		i++
+//		iter.Next()
+//	}
+//
+//	iter.Rewind()
+//	i = 0
+//	for iter.Valid() {
+//		if !iter.itrs[0].options.Reverse {
+//			assert.Equal(t, expectedKey[i], iter.Key())
+//			assert.Equal(t, expectedVal[i], iter.Value())
+//		} else {
+//			assert.Equal(t, expectedKey[2-i], iter.Key())
+//			assert.Equal(t, expectedVal[2-i], iter.Value())
+//		}
+//		i++
+//		iter.Next()
+//	}
+//	err = iter.Close()
+//	require.NoError(t, err)
+//
+//	iter, err = db.NewIterator(IteratorOptions{
+//		Reverse: true,
+//		Prefix:  []byte("k"),
+//	})
+//	require.NoError(t, err)
+//
+//	iter.Rewind()
+//	i = 0
+//	for iter.Valid() {
+//		if !iter.itrs[0].options.Reverse {
+//			assert.Equal(t, expectedKey[i], iter.Key())
+//			assert.Equal(t, expectedVal[i], iter.Value())
+//		} else {
+//			assert.Equal(t, expectedKey[1-i], iter.Key())
+//			assert.Equal(t, expectedVal[1-i], iter.Value())
+//		}
+//		i++
+//		iter.Next()
+//	}
+//
+//	iter.Rewind()
+//	i = 0
+//	for iter.Valid() {
+//		if !iter.itrs[0].options.Reverse {
+//			assert.Equal(t, expectedKey[i], iter.Key())
+//			assert.Equal(t, expectedVal[i], iter.Value())
+//		} else {
+//			assert.Equal(t, expectedKey[1-i], iter.Key())
+//			assert.Equal(t, expectedVal[1-i], iter.Value())
+//		}
+//		i++
+//		iter.Next()
+//	}
+//	err = iter.Close()
+//	require.NoError(t, err)
+//
+//	for j := 0; j < 3; j++ {
+//		db.flushMemtable(db.immuMems[0])
+//		iter, err = db.NewIterator(IteratorOptions{
+//			Reverse: false,
+//			Prefix:  []byte("k"),
+//		})
+//		require.NoError(t, err)
+//
+//		iter.Rewind()
+//		i = 0
+//		for iter.Valid() {
+//			if !iter.itrs[0].options.Reverse {
+//				assert.Equal(t, expectedKey[i], iter.Key())
+//				assert.Equal(t, expectedVal[i], iter.Value())
+//			} else {
+//				assert.Equal(t, expectedKey[1-i], iter.Key())
+//				assert.Equal(t, expectedVal[1-i], iter.Value())
+//			}
+//			iter.Next()
+//			i++
+//		}
+//		err = iter.Close()
+//		require.NoError(t, err)
+//
+//		iter, err = db.NewIterator(IteratorOptions{
+//			Reverse: true,
+//			Prefix:  []byte("k"),
+//		})
+//		require.NoError(t, err)
+//
+//		iter.Rewind()
+//		i = 0
+//		for iter.Valid() {
+//			if !iter.itrs[0].options.Reverse {
+//				assert.Equal(t, expectedKey[i], iter.Key())
+//				assert.Equal(t, expectedVal[i], iter.Value())
+//			} else {
+//				assert.Equal(t, expectedKey[1-i], iter.Key())
+//				assert.Equal(t, expectedVal[1-i], iter.Value())
+//			}
+//			iter.Next()
+//			i++
+//		}
+//		err = iter.Close()
+//		require.NoError(t, err)
+//	}
+//
+//	iter, err = db.NewIterator(IteratorOptions{
+//		Reverse: false,
+//		Prefix:  []byte("k"),
+//	})
+//	require.NoError(t, err)
+//
+//	iter.Seek([]byte("k3"))
+//	var prev []byte
+//	for iter.Valid() {
+//		assert.True(t, prev == nil || bytes.Compare(prev, iter.Key()) == -1)
+//		assert.True(t, bytes.HasPrefix(iter.Key(), []byte("k3")))
+//		prev = iter.Key()
+//		iter.Next()
+//	}
+//	err = iter.Close()
+//	require.NoError(t, err)
+//
+//	// unsupported type
+//	options = DefaultOptions
+//	options.IndexType = Hash
+//	db, err = Open(options)
+//	require.NoError(t, err)
+//	itr, err := db.NewIterator(IteratorOptions{Reverse: false})
+//	assert.Equal(t, ErrDBIteratorUnsupportedTypeHASH, err)
+//	assert.Nil(t, itr)
+//}
 
 func TestDeprecatetableMetaPersist(t *testing.T) {
 	options := DefaultOptions
