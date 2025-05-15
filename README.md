@@ -15,9 +15,6 @@
 - 🌲 **B+Tree** and **Hash index** support
 - 🌐 **Distributed deployment** with Raft protocol
 
-## Info
-📚 See the `docs/` directory for detailed documentation.
-
 ## Quick Start
 ```go
 package main
@@ -72,6 +69,9 @@ $ go run main.go
 $ cd examples/cmd_client
 $ go build -o knocidb-cli
 ```
+
+## Info
+📚 See the `docs/` directory for detailed documentation.
 
 ## Acknowledgments
 👍️ The design and implementation of this project cannot be separated from the inspiration of the following excellent projects
