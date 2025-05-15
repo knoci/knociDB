@@ -8,6 +8,8 @@
 ![Stars](https://img.shields.io/github/stars/knoci/knociDB)
 ![Forks](https://img.shields.io/github/forks/knoci/knociDB)
 ![KnociDB Logo](docs/logo.png)
+### English | [中文](README_CN.md)
+
 ## Features
 - ⚡ **High-performance** key-value storage
 - 🔄 **Batch operations** with ACD guarantees
@@ -16,6 +18,49 @@
 
 ## Info
 📚 See the `docs/` directory for detailed documentation.
+
+## Quick Start
+```go
+package main
+
+import (
+	"knocidb"
+)
+
+// this file shows how to use the basic operations of LotusDB
+func main() {
+	options := knocidb.DefaultOptions
+	options.DirPath = "/tmp/knocidb_basic"
+
+	// open database
+	db, err := knocidb.Open(options)
+	if err != nil {
+		panic(err)
+	}
+	defer func() {
+		_ = db.Close()
+	}()
+
+	// put a key
+	err = db.Put([]byte("name"), []byte("knocidb"))
+	if err != nil {
+		panic(err)
+	}
+
+	// get a key
+	val, err := db.Get([]byte("name"))
+	if err != nil {
+		panic(err)
+	}
+	println(string(val))
+
+	// delete a key
+	err = db.Delete([]byte("name"))
+	if err != nil {
+		panic(err)
+	}
+}
+```
 
 ## Examples
 💡 For Basic usage ,please check out usage examples in the `examples/` directory:
