@@ -23,7 +23,7 @@ import (
 	"github.com/knoci/knocidb"
 )
 
-// 此文件展示了如何使用LotusDB的基本操作
+// 此文件展示了如何使用knociDB的基本操作
 func main() {
 	options := knocidb.DefaultOptions
 	options.DirPath = "/tmp/knocidb_basic"
