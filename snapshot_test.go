@@ -26,7 +26,6 @@ func TestExportAndImportSnapshot(t *testing.T) {
 		t.Fatalf("open db failed: %v", err)
 	}
 
-	// 写入测试数据
 	key1 := []byte("test_key1")
 	value1 := []byte("test_value1")
 	key2 := []byte("test_key2")
@@ -54,12 +53,10 @@ func TestExportAndImportSnapshot(t *testing.T) {
 		t.Fatalf("put failed: %v", err)
 	}
 
-	// 导出快照
 	if err := db.ExportSnapshot(); err != nil {
 		t.Fatalf("export snapshot failed: %v", err)
 	}
 
-	// 获取最新快照文件
 	snaps, err := os.ReadDir(snapDir)
 	if err != nil {
 		t.Fatalf("read snapshot dir failed: %v", err)
@@ -75,11 +72,10 @@ func TestExportAndImportSnapshot(t *testing.T) {
 		t.Fatal("no snapshot file found")
 	}
 
-	// 清空数据目录并确保锁文件被删除
 	if err := os.RemoveAll(dir); err != nil {
 		t.Fatalf("remove db dir failed: %v", err)
 	}
-	// 检查并删除可能残留的锁文件
+
 	lockFile := filepath.Join(dir, fileLockName)
 	if _, err := os.Stat(lockFile); err == nil {
 		if err := os.Remove(lockFile); err != nil {
@@ -88,10 +84,8 @@ func TestExportAndImportSnapshot(t *testing.T) {
 	}
 	os.MkdirAll(dir, 0755)
 
-	// 添加短暂延迟确保资源完全释放
 	time.Sleep(100 * time.Millisecond)
 
-	// 重新打开数据库
 	log.Println("Reopening database...")
 	db, err = Open(Options{
 		DirPath:      dir,
@@ -101,17 +95,13 @@ func TestExportAndImportSnapshot(t *testing.T) {
 		t.Fatalf("reopen db failed: %v", err)
 	}
 
-	// 导入快照
 	log.Println("Importing snapshot...")
 	if err := db.ImportSnapshot(snapFile); err != nil {
 		t.Fatalf("import snapshot failed: %v", err)
 	}
 
-	// ImportSnapshot已经关闭了数据库，所以不需要再次关闭
-	// 设置为nil以避免defer db.Close()被调用
 	db = nil
 
-	// 重新打开数据库
 	db, err = Open(Options{
 		DirPath:      dir,
 		SnapshotPath: snapDir,
@@ -122,7 +112,6 @@ func TestExportAndImportSnapshot(t *testing.T) {
 	defer db.Close()
 	log.Println("Database reopened successfully after import")
 
-	// 验证数据
 	gotValue1, err := db.Get(key1)
 	if err != nil {
 		t.Fatalf("get failed: %v", err)
