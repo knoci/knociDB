@@ -23,7 +23,7 @@ import (
 	"github.com/knoci/knocidb"
 )
 
-// this file shows how to use the basic operations of LotusDB
+// this file shows how to use the basic operations of knociDB
 func main() {
 	options := knocidb.DefaultOptions
 	options.DirPath = "/tmp/knocidb_basic"
