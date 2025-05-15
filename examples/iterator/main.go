@@ -3,7 +3,7 @@ package main
 import (
 	"bytes"
 	"fmt"
-	"knocidb"
+	"github.com/knoci/knocidb"
 )
 
 func main() {

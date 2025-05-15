@@ -5,9 +5,9 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"github.com/knoci/knocidb/diskhash"
+	"github.com/knoci/knocidb/wal"
 	"io"
-	"knocidb/diskhash"
-	"knocidb/wal"
 	"log"
 	"os"
 	"os/signal"
@@ -674,8 +674,7 @@ func (db *DB) Compact() error {
 		g.Go(func() error {
 			newVlogFile := openVlogFile(part, tempValueLogFileExt)
 			validRecords := make([]*ValueLogRecord, 0)
-			reader := db.vlog.walFiles[part].NewReader()
-			// 遍历wal中的所有记录，找到有效记录
+			reader := db.vlog.walFiles[part].NewReader() // 遍历wal中的所有记录，找到有效记录
 			for {
 				chunk, pos, err := reader.Next()
 				atomic.AddInt64(&capacity, int64(len(chunk)))

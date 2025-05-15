@@ -5,11 +5,11 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
-	"knocidb/wal"
+	"github.com/knoci/knocidb/wal"
 	"path/filepath"
 
+	"github.com/knoci/knocidb/diskhash"
 	"golang.org/x/sync/errgroup"
-	"knocidb/diskhash"
 )
 
 // diskhash需要固定大小的值

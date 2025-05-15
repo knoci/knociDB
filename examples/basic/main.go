@@ -1,7 +1,7 @@
 package main
 
 import (
-	"knocidb"
+	"github.com/knoci/knocidb"
 )
 
 // this file shows how to use the basic operations of LotusDB

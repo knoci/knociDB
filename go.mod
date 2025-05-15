@@ -1,4 +1,4 @@
-module knocidb
+module github.com/knoci/knocidb
 
 go 1.23.3
 

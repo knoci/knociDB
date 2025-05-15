@@ -148,10 +148,10 @@ func (s *KVStateMachine) SaveSnapshot(w io.Writer, fc statemachine.ISnapshotFile
 	defer s.mu.Unlock()
 	options := s.db.GetOptions()
 
-	// 使用KnociDB的快照功能导出数据库状态
-	// ExportSnapshot会自动关闭数据库
+	// Use KnociDB's snapshot feature to export database state
+	// ExportSnapshot will automatically close the database
 	if err := s.db.ExportSnapshot(); err != nil {
-		// 导出失败，尝试重新打开数据库
+		// Export failed, try to reopen the database
 		db, openErr := Open(options)
 		if openErr != nil {
 			return fmt.Errorf("reopen database failed : %v, export error: %w", openErr, err)
@@ -160,14 +160,14 @@ func (s *KVStateMachine) SaveSnapshot(w io.Writer, fc statemachine.ISnapshotFile
 		return fmt.Errorf("database export snashot failed: %w", err)
 	}
 
-	// 导出成功后重新打开数据库
+	// Reopen the database after successful export
 	db, err := Open(options)
 	if err != nil {
 		return fmt.Errorf("reopen database failed after export snapshot : %w", err)
 	}
 	s.db = db
 
-	// 将appliedIndex和其他元数据写入快照
+	// Write appliedIndex and other metadata to snapshot
 	metadata := map[string]uint64{
 		"applied_index": s.appliedIndex,
 		"cluster_id":    s.clusterID,
@@ -175,28 +175,28 @@ func (s *KVStateMachine) SaveSnapshot(w io.Writer, fc statemachine.ISnapshotFile
 		"timestamp":     uint64(time.Now().Unix()),
 	}
 
-	// 序列化元数据
+	// Serialize metadata
 	data, err := json.Marshal(metadata)
 	if err != nil {
-		return fmt.Errorf("序列化快照元数据失败: %w", err)
+		return fmt.Errorf("failed to serialize snapshot metadata: %w", err)
 	}
 
-	// 计算校验和
+	// Calculate checksum
 	checksum := crc32.ChecksumIEEE(data)
 
-	// 写入元数据长度
+	// Write metadata length
 	lenBuf := make([]byte, 4)
 	binary.LittleEndian.PutUint32(lenBuf, uint32(len(data)))
 	if _, err := w.Write(lenBuf); err != nil {
 		return fmt.Errorf("write matadata length failed: %w", err)
 	}
 
-	// 写入元数据
+	// Write metadata
 	if _, err := w.Write(data); err != nil {
 		return fmt.Errorf("write matadate failed: %w", err)
 	}
 
-	// 写入校验和
+	// Write checksum
 	checksumBuf := make([]byte, 4)
 	binary.LittleEndian.PutUint32(checksumBuf, checksum)
 	if _, err := w.Write(checksumBuf); err != nil {

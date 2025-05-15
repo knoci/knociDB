@@ -1,6 +1,6 @@
 package knocidb
 
-import "knocidb/diskhash"
+import "github.com/knoci/knocidb/diskhash"
 
 const (
 	// indexFileExt 是索引文件的扩展名

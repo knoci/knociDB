@@ -1,8 +1,8 @@
 package knocidb
 
 import (
-	"knocidb/diskhash"
-	"knocidb/wal"
+	"github.com/knoci/knocidb/diskhash"
+	"github.com/knoci/knocidb/wal"
 	"os"
 	"testing"
 )

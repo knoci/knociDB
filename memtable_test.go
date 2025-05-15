@@ -2,8 +2,8 @@ package knocidb
 
 import (
 	"bytes"
+	"github.com/knoci/knocidb/util"
 	"io/fs"
-	"knocidb/util"
 	"os"
 	"testing"
 

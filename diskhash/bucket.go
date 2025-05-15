@@ -2,8 +2,8 @@ package diskhash
 
 import (
 	"encoding/binary"
+	"github.com/knoci/knocidb/diskhash/fs"
 	"io"
-	"knocidb/diskhash/fs"
 )
 
 // bucket是diskhash中文件的基本单位，每个文件最多包含31个槽位。

@@ -9,10 +9,10 @@ import (
 	"path/filepath"
 
 	"github.com/google/uuid"
+	"github.com/knoci/knocidb/diskhash"
+	"github.com/knoci/knocidb/wal"
 	"go.etcd.io/bbolt"
 	"golang.org/x/sync/errgroup"
-	"knocidb/diskhash"
-	"knocidb/wal"
 )
 
 const (

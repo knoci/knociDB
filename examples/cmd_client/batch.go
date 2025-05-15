@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"strings"
 
-	"knocidb"
+	"github.com/knoci/knocidb"
 )
 
 // BatchClient 封装了批处理操作的功能

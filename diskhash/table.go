@@ -3,9 +3,9 @@ package diskhash
 import (
 	"encoding/json"
 	"errors"
+	"github.com/knoci/knocidb/diskhash/fs"
 	"github.com/spaolacci/murmur3"
 	"io"
-	"knocidb/diskhash/fs"
 	"os"
 	"path/filepath"
 	"sync"

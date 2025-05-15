@@ -20,7 +20,7 @@
 package main
 
 import (
-	"knocidb"
+	"github.com/knoci/knocidb"
 )
 
 // 此文件展示了如何使用LotusDB的基本操作

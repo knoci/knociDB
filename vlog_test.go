@@ -1,8 +1,8 @@
 package knocidb
 
 import (
-	"knocidb/util"
-	"knocidb/wal"
+	"github.com/knoci/knocidb/util"
+	"github.com/knoci/knocidb/wal"
 	"os"
 	"testing"
 

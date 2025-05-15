@@ -3,7 +3,7 @@ package main
 import (
 	"flag"
 	"fmt"
-	"knocidb"
+	"github.com/knoci/knocidb"
 	"log"
 	"os"
 	"os/signal"

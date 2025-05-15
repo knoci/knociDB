@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"container/heap"
 	"github.com/dgraph-io/badger/v4/y"
-	"knocidb/wal"
+	"github.com/knoci/knocidb/wal"
 )
 
 type iterType uint8

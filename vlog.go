@@ -4,8 +4,8 @@ import (
 	"context"
 	"fmt"
 	"github.com/google/uuid"
+	"github.com/knoci/knocidb/wal"
 	"golang.org/x/sync/errgroup"
-	"knocidb/wal"
 )
 
 const (

@@ -3,7 +3,7 @@ package knocidb
 import (
 	"encoding/binary"
 	"github.com/google/uuid"
-	"knocidb/wal"
+	"github.com/knoci/knocidb/wal"
 )
 
 // LogRecordType 是日志记录的类型

@@ -3,7 +3,7 @@ package knocidb
 import (
 	"fmt"
 	"github.com/bwmarrin/snowflake"
-	"knocidb/diskhash"
+	"github.com/knoci/knocidb/diskhash"
 	"sync"
 )
 

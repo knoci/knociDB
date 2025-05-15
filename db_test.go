@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"knocidb/diskhash"
-	"knocidb/util"
+	"github.com/knoci/knocidb/diskhash"
+	"github.com/knoci/knocidb/util"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"

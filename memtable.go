@@ -13,7 +13,7 @@ import (
 	"github.com/bwmarrin/snowflake"
 	arenaskl "github.com/dgraph-io/badger/v4/skl"
 	"github.com/dgraph-io/badger/v4/y"
-	"knocidb/wal"
+	"github.com/knoci/knocidb/wal"
 )
 
 const (

@@ -12,7 +12,7 @@ import (
 	"strings"
 	"syscall"
 
-	"knocidb"
+	"github.com/knoci/knocidb"
 )
 
 var (

@@ -2,9 +2,9 @@ package benchmark
 
 import (
 	"errors"
+	"github.com/knoci/knocidb"
+	"github.com/knoci/knocidb/util"
 	"github.com/stretchr/testify/assert"
-	"knocidb"
-	"knocidb/util"
 	"os"
 	"testing"
 )
