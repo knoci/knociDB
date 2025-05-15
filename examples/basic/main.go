@@ -9,7 +9,7 @@ func main() {
 	options := knocidb.DefaultOptions
 	options.DirPath = "/tmp/knocidb_basic"
 
-	// 打开数据库
+	// open database
 	db, err := knocidb.Open(options)
 	if err != nil {
 		panic(err)
