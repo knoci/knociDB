@@ -59,10 +59,10 @@ func main() {
 ```
 
 ## Examples
-💡 For Basic usage ,please check out usage examples in the `examples/basic` directory:
+💡 For Raft usage ,please check out usage examples in the `examples/raft` directory, and you can get specific method of using raft through the README document.
 ```bash
-$ cd examples/basic
-$ go run main.go
+$ cd examples/raft
+$ go build -o raft-example main.go
 ```
 🔆 If you want to  experience more features of knociDB, there is a cmd implementation client in the  `examples/cmd_client`, you can obtain the specific method of using cmd_client through the README document in the file.
 ```bash
