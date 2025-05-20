@@ -59,7 +59,7 @@ func main() {
 ```
 
 ## Examples
-💡 For Basic usage ,please check out usage examples in the `examples/` directory:
+💡 For Basic usage ,please check out usage examples in the `examples/basic` directory:
 ```bash
 $ cd examples/basic
 $ go run main.go
