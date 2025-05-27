@@ -73,6 +73,9 @@ type Options struct {
 	// 因此写入操作将等待内存表中的空间，超时时间由 WaitMemSpaceTimeout 指定
 	// 如果超过超时时间，写入操作将失败，默认值为 100ms
 	WaitMemSpaceTimeout time.Duration
+
+	// 是否启用对象存储
+	ObjectStorage bool
 }
 
 // BatchOptions 指定创建批处理的选项
@@ -130,6 +133,7 @@ var DefaultOptions = Options{
 	DiskIOBusyRate:         0.5,
 	AutoCompactSupport:     false,
 	WaitMemSpaceTimeout:    100 * time.Millisecond,
+	ObjectStorage:          false,
 }
 
 var DefaultBatchOptions = BatchOptions{

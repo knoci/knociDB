@@ -5,8 +5,6 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"github.com/knoci/knocidb/diskhash"
-	"github.com/knoci/knocidb/wal"
 	"io"
 	"log"
 	"os"
@@ -17,6 +15,9 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+
+	"github.com/knoci/knocidb/diskhash"
+	"github.com/knoci/knocidb/wal"
 
 	"github.com/dgraph-io/badger/v4/y"
 	"github.com/google/uuid"
@@ -112,6 +113,7 @@ func Open(options Options) (*DB, error) {
 		compactBatchCapacity: options.CompactBatchCapacity,
 		discardtableNumber:   discardNumber,
 		totalNumber:          totalEntryNumber,
+		objectStorage:        options.ObjectStorage,
 	})
 	if err != nil {
 		return nil, err

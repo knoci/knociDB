@@ -3,6 +3,7 @@ package knocidb
 import (
 	"context"
 	"fmt"
+
 	"github.com/google/uuid"
 	"github.com/knoci/knocidb/wal"
 	"golang.org/x/sync/errgroup"
@@ -44,6 +45,9 @@ type valueLogOptions struct {
 
 	// 总数量
 	totalNumber uint32
+
+	// 对象存储
+	objectStorage bool
 }
 
 // 为值日志打开 WAL 文件，将打开多个 WAL 文件用于并发读写
@@ -58,6 +62,7 @@ func openValueLog(options valueLogOptions) (*valueLog, error) {
 			SegmentFileExt: fmt.Sprintf(valueLogFileExt, i),
 			Sync:           false, // 手动同步
 			BytesPerSync:   0,     // 与 Sync 相同
+			ObjectStorage:  options.objectStorage,
 		})
 		if err != nil {
 			return nil, err

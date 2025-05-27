@@ -148,7 +148,7 @@ func TestWAL_Reader(t *testing.T) {
 	var size = 100000
 	val := strings.Repeat("wal", 512)
 	for i := 0; i < size; i++ {
-		_, err := wal.Write([]byte(val))
+		_, err = wal.Write([]byte(val))
 		assert.Nil(t, err)
 	}
 

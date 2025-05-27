@@ -176,7 +176,7 @@ func (s *S3Storage) Download(objectKey, localPath string) error {
 		return fmt.Errorf("failed to download file from S3: %w", err)
 	}
 	defer func(Body io.ReadCloser) {
-		err := Body.Close()
+		err = Body.Close()
 		if err != nil {
 
 		}

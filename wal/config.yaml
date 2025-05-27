@@ -1,7 +1,8 @@
 object_storage:
   type: r2
   bucket: test-bucket
-  accesskey: your accesskey
-  secretkey: your sevretkey
+  accesskey: your-accesskey
+  secretkey: your-secretkey
   region: us-east-1
   endpoint: ENDPOINT
+  # endpoint should not with bucket name
