@@ -14,6 +14,7 @@
 - 🔄 **Batch operations** with ACD guarantees
 - 🌲 **B+Tree** and **Hash index** support
 - 🌐 **Distributed deployment** with Raft protocol
+- 💾 **S3 Object Storage** read and load wal
 
 ## Quick Start
 ```go
