@@ -42,6 +42,8 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/ssooidc v1.30.1 // indirect
 	github.com/aws/aws-sdk-go-v2/service/sts v1.33.19 // indirect
 	github.com/aws/smithy-go v1.22.2 // indirect
+	github.com/bits-and-blooms/bitset v1.10.0 // indirect
+	github.com/bits-and-blooms/bloom/v3 v3.7.0 // indirect
 	github.com/cockroachdb/errors v1.9.0 // indirect
 	github.com/cockroachdb/logtags v0.0.0-20211118104740-dabe8e521a4f // indirect
 	github.com/cockroachdb/pebble v0.0.0-20221207173255-0f086d933dac // indirect

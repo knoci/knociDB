@@ -32,15 +32,16 @@ const (
 )
 
 type DB struct {
-	activeMem        *memtable         // 用于写入的活跃内存表
-	immuMems         []*memtable       // 不可变内存表，等待刷新到磁盘
-	index            Index             // 多分区索引，用于存储键和块位置
-	vlog             *valueLog         // 值日志
-	fileLock         *flock.Flock      // 文件锁，防止多个进程使用相同的数据库目录
-	flushChan        chan *memtable    // 用于通知刷新协程将内存表刷新到磁盘
-	flushLock        sync.Mutex        // 刷新锁，防止在压缩未发生时进行刷新
-	diskIO           *DiskIO           // 监控磁盘的 IO 状态并在适当时允许自动压缩
-	compactChan      chan discardState // 用于通知需要压缩的分片
+	activeMem        *memtable           // 用于写入的活跃内存表
+	immuMems         []*memtable         // 不可变内存表，等待刷新到磁盘
+	index            Index               // 多分区索引，用于存储键和块位置
+	vlog             *valueLog           // 值日志
+	bloomManager     *BloomFilterManager // 布隆过滤器管理器
+	fileLock         *flock.Flock        // 文件锁，防止多个进程使用相同的数据库目录
+	flushChan        chan *memtable      // 用于通知刷新协程将内存表刷新到磁盘
+	flushLock        sync.Mutex          // 刷新锁，防止在压缩未发生时进行刷新
+	diskIO           *DiskIO             // 监控磁盘的 IO 状态并在适当时允许自动压缩
+	compactChan      chan discardState   // 用于通知需要压缩的分片
 	mu               sync.RWMutex
 	closed           bool
 	closeflushChan   chan struct{} // 用于优雅地关闭刷新监听协程
@@ -127,11 +128,23 @@ func Open(options Options) (*DB, error) {
 	diskIO.busyRate = options.DiskIOBusyRate
 	diskIO.Init()
 
+	// 初始化布隆过滤器管理器
+	var bloomManager *BloomFilterManager
+	if options.EnableBloomFilter {
+		bloomOptions := BloomFilterOptions{
+			ExpectedElements:  options.BloomFilterExpectedElements,
+			FalsePositiveRate: options.BloomFilterFalsePositiveRate,
+			DirPath:           options.DirPath,
+		}
+		bloomManager = NewBloomFilterManager(bloomOptions)
+	}
+
 	db := &DB{
 		activeMem:        memtables[len(memtables)-1],
 		immuMems:         memtables[:len(memtables)-1],
 		index:            index,
 		vlog:             vlog,
+		bloomManager:     bloomManager,
 		fileLock:         fileLock,
 		flushChan:        make(chan *memtable, options.MemtableNums-1),
 		closeflushChan:   make(chan struct{}),
@@ -210,6 +223,13 @@ func (db *DB) Close() error {
 		return err
 	}
 	defer db.flushLock.Unlock()
+
+	// 保存布隆过滤器
+	if db.bloomManager != nil {
+		if err := db.bloomManager.SaveAll(); err != nil {
+			return err
+		}
+	}
 
 	// 关闭值日志
 	if err = db.vlog.close(); err != nil {
@@ -464,6 +484,14 @@ func (db *DB) flushMemtable(table *memtable) {
 	if err != nil {
 		log.Println("index PutBatch failed:", err)
 		return
+	}
+
+	// 将键添加到布隆过滤器
+	if db.bloomManager != nil {
+		for _, kp := range keyPos {
+			partitionID := int(db.options.KeyHashFunction(kp.key) % uint64(db.options.PartitionNum))
+			db.bloomManager.AddKey(partitionID, kp.key)
+		}
 	}
 
 	// 将旧键uuid添加到废弃表中

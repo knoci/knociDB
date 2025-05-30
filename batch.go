@@ -2,9 +2,11 @@ package knocidb
 
 import (
 	"fmt"
+
+	"sync"
+
 	"github.com/bwmarrin/snowflake"
 	"github.com/knoci/knocidb/diskhash"
-	"sync"
 )
 
 // Batch 是数据库的批量操作。
@@ -148,6 +150,15 @@ func (b *Batch) Get(key []byte) ([]byte, error) {
 		}
 		if len(value) != 0 {
 			return value, nil
+		}
+	}
+
+	// 使用布隆过滤器快速检查键是否可能存在
+	if b.db.bloomManager != nil {
+		partitionID := int(b.db.options.KeyHashFunction(key) % uint64(b.db.options.PartitionNum))
+		if !b.db.bloomManager.TestKey(partitionID, key) {
+			// 布隆过滤器表明键绝对不存在
+			return nil, ErrKeyNotFound
 		}
 	}
 

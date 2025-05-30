@@ -76,6 +76,15 @@ type Options struct {
 
 	// 是否启用对象存储
 	ObjectStorage bool
+
+	// 是否启用布隆过滤器 默认值为 true
+	EnableBloomFilter bool
+
+	// 布隆过滤器预期元素数量 默认值为 100000
+	BloomFilterExpectedElements uint
+
+	// 布隆过滤器假阳性率 默认值为 0.01 (1%)
+	BloomFilterFalsePositiveRate float64
 }
 
 // BatchOptions 指定创建批处理的选项
@@ -113,27 +122,30 @@ const (
 
 // 默认选项
 var DefaultOptions = Options{
-	DirPath:                tempDBDir(),
-	SnapshotPath:           tempSnapDir(),
-	RaftPath:               tempRaftDir(),
-	MemtableSize:           64 * MB,
-	MemtableNums:           15,
-	Sync:                   false,
-	BytesPerSync:           0,
-	PartitionNum:           3,
-	KeyHashFunction:        xxhash.Sum64,
-	ValueLogFileSize:       1 * GB,
-	IndexType:              BTree,
-	CompactBatchCapacity:   1 << 30,
-	AdvisedCompactionRate:  0.3,
-	ForceCompactionRate:    0.5,
-	EnableDiskIO:           false,
-	DiskIOSamplingInterval: 100,
-	DiskIOSamplingWindow:   10,
-	DiskIOBusyRate:         0.5,
-	AutoCompactSupport:     false,
-	WaitMemSpaceTimeout:    100 * time.Millisecond,
-	ObjectStorage:          false,
+	DirPath:                      tempDBDir(),
+	SnapshotPath:                 tempSnapDir(),
+	RaftPath:                     tempRaftDir(),
+	MemtableSize:                 64 * MB,
+	MemtableNums:                 15,
+	Sync:                         false,
+	BytesPerSync:                 0,
+	PartitionNum:                 3,
+	KeyHashFunction:              xxhash.Sum64,
+	ValueLogFileSize:             1 * GB,
+	IndexType:                    BTree,
+	CompactBatchCapacity:         1 << 30,
+	AdvisedCompactionRate:        0.3,
+	ForceCompactionRate:          0.5,
+	EnableDiskIO:                 false,
+	DiskIOSamplingInterval:       100,
+	DiskIOSamplingWindow:         10,
+	DiskIOBusyRate:               0.5,
+	AutoCompactSupport:           false,
+	WaitMemSpaceTimeout:          100 * time.Millisecond,
+	ObjectStorage:                false,
+	EnableBloomFilter:            true,
+	BloomFilterExpectedElements:  100000,
+	BloomFilterFalsePositiveRate: 0.01,
 }
 
 var DefaultBatchOptions = BatchOptions{
