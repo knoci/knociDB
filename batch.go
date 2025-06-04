@@ -155,8 +155,7 @@ func (b *Batch) Get(key []byte) ([]byte, error) {
 
 	// 使用布隆过滤器快速检查键是否可能存在
 	if b.db.bloomManager != nil {
-		partitionID := int(b.db.options.KeyHashFunction(key) % uint64(b.db.options.PartitionNum))
-		if !b.db.bloomManager.TestKey(partitionID, key) {
+		if !b.db.bloomManager.TestKey(key) {
 			// 布隆过滤器表明键绝对不存在
 			return nil, ErrKeyNotFound
 		}
@@ -240,6 +239,14 @@ func (b *Batch) Exist(key []byte) (bool, error) {
 		}
 		if len(value) != 0 {
 			return true, nil
+		}
+	}
+
+	// 使用布隆过滤器快速检查键是否可能存在
+	if b.db.bloomManager != nil {
+		if !b.db.bloomManager.TestKey(key) {
+			// 布隆过滤器表明键绝对不存在
+			return false, nil
 		}
 	}
 

@@ -135,6 +135,8 @@ func Open(options Options) (*DB, error) {
 			ExpectedElements:  options.BloomFilterExpectedElements,
 			FalsePositiveRate: options.BloomFilterFalsePositiveRate,
 			DirPath:           options.DirPath,
+			PartitionNum:      options.PartitionNum,
+			keyHashFunction:   options.KeyHashFunction,
 		}
 		bloomManager = NewBloomFilterManager(bloomOptions)
 	}
@@ -489,8 +491,7 @@ func (db *DB) flushMemtable(table *memtable) {
 	// 将键添加到布隆过滤器
 	if db.bloomManager != nil {
 		for _, kp := range keyPos {
-			partitionID := int(db.options.KeyHashFunction(kp.key) % uint64(db.options.PartitionNum))
-			db.bloomManager.AddKey(partitionID, kp.key)
+			db.bloomManager.AddKey(kp.key)
 		}
 	}
 
