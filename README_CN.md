@@ -7,7 +7,7 @@
 [![OpenIssue](https://img.shields.io/github/issues/knoci/knociDB)](https://github.com/knoci/knociDB/issues)
 ![Stars](https://img.shields.io/github/stars/knoci/knociDB)
 ![KnociDB Logo](docs/logo.png)
-### [English](README.md) | 中文
+### [English](README.md) | 中文 | [日本語](README_JP.md)
 
 ## 特性
 - ⚡ **高性能**键值存储

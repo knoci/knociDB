@@ -7,7 +7,7 @@
 [![OpenIssue](https://img.shields.io/github/issues/knoci/knociDB)](https://github.com/knoci/knociDB/issues)
 ![Stars](https://img.shields.io/github/stars/knoci/knociDB)
 ![KnociDB Logo](docs/logo.png)
-### English | [中文](README_CN.md)
+### English | [中文](README_CN.md) | [日本語](README_JP.md)
 
 ## Features
 - ⚡ **High-performance** key-value storage
