@@ -3,7 +3,6 @@ package knocidb
 import (
 	"encoding/binary"
 	"fmt"
-	"github.com/klauspost/compress/zstd"
 	"hash/crc32"
 	"io"
 	"log"
@@ -12,6 +11,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/klauspost/compress/zstd"
 )
 
 const (
@@ -141,7 +142,7 @@ func (db *DB) ExportSnapshot() error {
 			}
 			return fmt.Errorf("Failed to write file name length: %v", err)
 		}
-		if _, err := encoder.Write(nameBytes); err != nil {
+		if _, err = encoder.Write(nameBytes); err != nil {
 			inner_err := in.Close()
 			if inner_err != nil {
 				return fmt.Errorf("Unexpected error occur: %v", inner_err)
@@ -165,7 +166,7 @@ func (db *DB) ExportSnapshot() error {
 			return fmt.Errorf("Failed to stat file: %v", err)
 		}
 		fileSize := stat.Size()
-		if err := writeInt64(encoder, fileSize); err != nil {
+		if err = writeInt64(encoder, fileSize); err != nil {
 			inner_err := in.Close()
 			if inner_err != nil {
 				return fmt.Errorf("Unexpected error occur: %v", inner_err)
@@ -204,7 +205,7 @@ func (db *DB) ExportSnapshot() error {
 	crcValue := crc.Sum32()
 
 	// 写入CRC校验位
-	if err := binary.Write(encoder, binary.LittleEndian, crcValue); err != nil {
+	if err = binary.Write(encoder, binary.LittleEndian, crcValue); err != nil {
 		inner_err := os.RemoveAll(tmpCopyDir)
 		if inner_err != nil {
 			return fmt.Errorf("Unexpected error occur: %v", inner_err)
@@ -323,7 +324,7 @@ func (db *DB) ImportSnapshot(snapPath string) error {
 
 		// 读取文件名
 		nameBytes := make([]byte, nameLen)
-		if _, err := io.ReadFull(decoder, nameBytes); err != nil {
+		if _, err = io.ReadFull(decoder, nameBytes); err != nil {
 			return fmt.Errorf("Failed to read file name: %v", err)
 		}
 		fileName := string(nameBytes)
@@ -376,7 +377,7 @@ func (db *DB) ImportSnapshot(snapPath string) error {
 
 	// 创建临时目录用于原子替换
 	tmpReplaceDir := filepath.Join(os.TempDir(), "knocidb_replace_"+timestamp)
-	if err := os.MkdirAll(tmpReplaceDir, os.ModePerm); err != nil {
+	if err = os.MkdirAll(tmpReplaceDir, os.ModePerm); err != nil {
 		return fmt.Errorf("Failed to create temp replace directory: %v", err)
 	}
 	defer os.RemoveAll(tmpReplaceDir)
@@ -393,7 +394,7 @@ func (db *DB) ImportSnapshot(snapPath string) error {
 		}
 		oldPath := filepath.Join(dir, name)
 		newPath := filepath.Join(tmpReplaceDir, name)
-		if err := os.Rename(oldPath, newPath); err != nil {
+		if err = os.Rename(oldPath, newPath); err != nil {
 			// 尝试回滚已移动的文件
 			restoreFiles(tmpReplaceDir, dir)
 			return fmt.Errorf("Failed to move existing file: %v", err)

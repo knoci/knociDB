@@ -275,7 +275,7 @@ func (s *KVStateMachine) RecoverFromSnapshot(r io.Reader, files []statemachine.S
 	latestSnapshot := snapFiles[len(snapFiles)-1]
 
 	// 使用KnociDB的导入功能恢复数据库状态 ImportSnapshot会自动关闭数据库
-	if err := s.db.ImportSnapshot(latestSnapshot); err != nil {
+	if err = s.db.ImportSnapshot(latestSnapshot); err != nil {
 		// 导入失败，尝试重新打开数据库
 		db, openErr := Open(options)
 		if openErr != nil {
