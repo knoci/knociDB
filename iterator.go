@@ -3,6 +3,7 @@ package knocidb
 import (
 	"bytes"
 	"container/heap"
+
 	"github.com/dgraph-io/badger/v4/y"
 	"github.com/knoci/knocidb/wal"
 )
@@ -85,6 +86,7 @@ type Iterator struct {
 	itrs       []*singleIter       // 用于重建堆
 	versionMap map[int]*singleIter // 映射 version->singleIter
 	db         *DB
+	locked     bool
 }
 
 // Rewind 将迭代器定位到第一个键
@@ -118,7 +120,10 @@ func (mi *Iterator) Seek(key []byte) {
 func (mi *Iterator) cleanKey(oldKey []byte, version int) {
 	defer func() {
 		if r := recover(); r != nil {
-			mi.db.mu.Unlock()
+			if mi.locked {
+				mi.locked = false
+				mi.db.mu.Unlock()
+			}
 		}
 	}()
 	for i := 0; i < len(mi.itrs); i++ {
@@ -174,7 +179,10 @@ func (mi *Iterator) Key() []byte {
 func (mi *Iterator) Value() []byte {
 	defer func() {
 		if r := recover(); r != nil {
-			mi.db.mu.Unlock()
+			if mi.locked {
+				mi.locked = false
+				mi.db.mu.Unlock()
+			}
 		}
 	}()
 	topIter := mi.h[0]
@@ -227,6 +235,10 @@ func (mi *Iterator) Close() error {
 		if err != nil {
 			return err
 		}
+	}
+	if mi.locked {
+		mi.locked = false
+		mi.db.mu.Unlock()
 	}
 	return nil
 }
@@ -308,5 +320,6 @@ func (db *DB) NewIterator(options IteratorOptions) (*Iterator, error) {
 		itrs:       itrs,
 		versionMap: itrsM,
 		db:         db,
+		locked:     true,
 	}, nil
 }
