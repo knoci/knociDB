@@ -23,6 +23,10 @@ const (
 	S3ObjectStorage ObjectStorageType = "s3"
 	// R2ObjectStorage 表示使用Cloudflare R2对象存储
 	R2ObjectStorage ObjectStorageType = "r2"
+	// TCOSObjectStorage 表示使用腾讯云COS
+	COSObjectStorage ObjectStorageType = "cos"
+	// OSSObjectStorage 表示使用阿里云OSS
+	OSSObjectStorage ObjectStorageType = "oss"
 )
 
 // ObjectStorageConfig 表示对象存储的配置
@@ -80,8 +84,13 @@ func NewObjectStorage() (ObjectStorage, error) {
 		SecretKey: viper.GetString("object_storage.secretkey"),
 	}
 	switch config.Type {
-	case S3ObjectStorage, R2ObjectStorage:
+	case S3ObjectStorage, R2ObjectStorage, COSObjectStorage:
 		storage, err = newS3Storage(config)
+		if err != nil {
+			return nil, err
+		}
+	case OSSObjectStorage:
+		storage, err = newOSSStorage(config)
 		if err != nil {
 			return nil, err
 		}
@@ -95,16 +104,7 @@ func NewObjectStorage() (ObjectStorage, error) {
 // newS3Storage 创建一个新的S3对象存储
 func newS3Storage(config ObjectStorageConfig) (*S3Storage, error) {
 	ctx := context.Background()
-	customResolver := aws.EndpointResolverWithOptionsFunc(func(service, region string, options ...interface{}) (aws.Endpoint, error) {
-		return aws.Endpoint{
-			URL:               config.Endpoint,
-			SigningRegion:     config.Region,
-			HostnameImmutable: true,
-		}, nil
-	})
-
 	configOptions := []func(*awsconfig.LoadOptions) error{
-		awsconfig.WithEndpointResolverWithOptions(customResolver),
 		awsconfig.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(config.AccessKey, config.SecretKey, "")),
 	}
 
@@ -113,12 +113,29 @@ func newS3Storage(config ObjectStorageConfig) (*S3Storage, error) {
 		configOptions = append(configOptions, awsconfig.WithRegion(config.Region))
 	}
 
+	// 仅当提供了自定义 Endpoint 时才设置 Endpoint 解析
+	if config.Endpoint != "" {
+		customResolver := aws.EndpointResolverWithOptionsFunc(func(service, region string, options ...interface{}) (aws.Endpoint, error) {
+			return aws.Endpoint{
+				URL:               config.Endpoint,
+				SigningRegion:     config.Region,
+				HostnameImmutable: true,
+			}, nil
+		})
+		configOptions = append(configOptions, awsconfig.WithEndpointResolverWithOptions(customResolver))
+	}
+
 	cfg, err := awsconfig.LoadDefaultConfig(ctx, configOptions...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load AWS config: %w", err)
 	}
 
-	client := s3.NewFromConfig(cfg)
+	usePathStyle := config.Endpoint != ""
+	client := s3.NewFromConfig(cfg, func(o *s3.Options) {
+		if usePathStyle {
+			o.UsePathStyle = true
+		}
+	})
 
 	return &S3Storage{
 		client: client,
