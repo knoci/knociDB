@@ -85,6 +85,12 @@ type Options struct {
 
 	// 布隆过滤器假阳性率 默认值为 0.01 (1%)
 	BloomFilterFalsePositiveRate float64
+
+	// 布隆过滤器自动保存间隔（秒），0 表示禁用自动保存
+	BloomFilterSaveIntervalSeconds int
+
+	// 布隆过滤器变更阈值，达到该新增/变更次数立即保存，0 表示禁用
+	BloomFilterSaveChangeThreshold int
 }
 
 // BatchOptions 指定创建批处理的选项
@@ -122,30 +128,32 @@ const (
 
 // 默认选项
 var DefaultOptions = Options{
-	DirPath:                      tempDBDir(),
-	SnapshotPath:                 tempSnapDir(),
-	RaftPath:                     tempRaftDir(),
-	MemtableSize:                 64 * MB,
-	MemtableNums:                 15,
-	Sync:                         false,
-	BytesPerSync:                 0,
-	PartitionNum:                 3,
-	KeyHashFunction:              xxhash.Sum64,
-	ValueLogFileSize:             1 * GB,
-	IndexType:                    BTree,
-	CompactBatchCapacity:         1 << 30,
-	AdvisedCompactionRate:        0.3,
-	ForceCompactionRate:          0.5,
-	EnableDiskIO:                 false,
-	DiskIOSamplingInterval:       100,
-	DiskIOSamplingWindow:         10,
-	DiskIOBusyRate:               0.5,
-	AutoCompactSupport:           false,
-	WaitMemSpaceTimeout:          100 * time.Millisecond,
-	ObjectStorage:                false,
-	EnableBloomFilter:            true,
-	BloomFilterExpectedElements:  100000,
-	BloomFilterFalsePositiveRate: 0.01,
+	DirPath:                        tempDBDir(),
+	SnapshotPath:                   tempSnapDir(),
+	RaftPath:                       tempRaftDir(),
+	MemtableSize:                   64 * MB,
+	MemtableNums:                   15,
+	Sync:                           false,
+	BytesPerSync:                   0,
+	PartitionNum:                   3,
+	KeyHashFunction:                xxhash.Sum64,
+	ValueLogFileSize:               1 * GB,
+	IndexType:                      BTree,
+	CompactBatchCapacity:           1 << 30,
+	AdvisedCompactionRate:          0.3,
+	ForceCompactionRate:            0.5,
+	EnableDiskIO:                   false,
+	DiskIOSamplingInterval:         100,
+	DiskIOSamplingWindow:           10,
+	DiskIOBusyRate:                 0.5,
+	AutoCompactSupport:             false,
+	WaitMemSpaceTimeout:            100 * time.Millisecond,
+	ObjectStorage:                  false,
+	EnableBloomFilter:              true,
+	BloomFilterExpectedElements:    100000,
+	BloomFilterFalsePositiveRate:   0.01,
+	BloomFilterSaveIntervalSeconds: 30,
+	BloomFilterSaveChangeThreshold: 1000,
 }
 
 var DefaultBatchOptions = BatchOptions{

@@ -102,8 +102,7 @@ func (vlog *valueLog) writeBatch(records []*ValueLogRecord) ([]*KeyPosition, err
 		partitionRecords[p] = append(partitionRecords[p], record)
 	}
 
-	// 用于接收写入值日志后，记录位置的通道
-	pChan := make(chan []*KeyPosition, vlog.options.partitionNum)
+    pChan := make(chan []*KeyPosition, vlog.options.partitionNum)
 	g, ctx := errgroup.WithContext(context.Background())
 	// 遍历处理每个分区
 	for i := 0; i < int(vlog.options.partitionNum); i++ {
@@ -152,19 +151,17 @@ func (vlog *valueLog) writeBatch(records []*ValueLogRecord) ([]*KeyPosition, err
 		})
 	}
 
-	if err := g.Wait(); err != nil {
-		return nil, err
-	}
-	close(pChan)
+    if err := g.Wait(); err != nil {
+        return nil, err
+    }
+    close(pChan)
 
-	// 获得记录的位置
-	var keyPositions []*KeyPosition
-	for i := 0; i < int(vlog.options.partitionNum); i++ {
-		pos := <-pChan
-		keyPositions = append(keyPositions, pos...)
-	}
+    var keyPositions []*KeyPosition
+    for pos := range pChan {
+        keyPositions = append(keyPositions, pos...)
+    }
 
-	return keyPositions, nil
+    return keyPositions, nil
 }
 
 // 将值日志同步到磁盘

@@ -338,10 +338,10 @@ func (db *DB) ImportSnapshot(snapPath string) error {
 		// 创建目标文件
 		filePath := filepath.Join(tmpDir, fileName)
 		out, err := os.Create(filePath)
-		defer out.Close()
 		if err != nil {
 			return fmt.Errorf("Failed to create file: %v", err)
 		}
+		defer out.Close()
 
 		// 复制文件内容
 		_, err = io.CopyN(out, decoder, fileSize)

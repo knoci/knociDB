@@ -24,12 +24,15 @@ const (
 // BloomFilter 包装了第三方布隆过滤器库，提供键存在性的快速检查
 // 用于在查找索引之前快速过滤不存在的键，减少磁盘I/O
 type BloomFilter struct {
-	mu        sync.RWMutex
-	filter    *bloom.BloomFilter
-	path      string
-	size      uint32    // 当前过滤器中的元素数量
-	createdAt time.Time // 创建时间
-	updatedAt time.Time // 最后更新时间
+	mu          sync.RWMutex
+	filter      *bloom.BloomFilter
+	path        string
+	size        uint32    // 当前过滤器中的元素数量
+	createdAt   time.Time // 创建时间
+	updatedAt   time.Time // 最后更新时间
+	dirty       bool
+	dirtyCount  uint32
+	lastSavedAt time.Time
 }
 
 // BloomFilterOptions 布隆过滤器配置选项
@@ -44,6 +47,10 @@ type BloomFilterOptions struct {
 	PartitionNum int
 	// 哈希分片函数
 	keyHashFunction func([]byte) uint64
+	// 自动保存间隔（秒），0 表示禁用自动保存
+	SaveIntervalSeconds int
+	// 变更阈值（达到则立即保存），0 表示禁用
+	SaveChangeThreshold int
 }
 
 // NewBloomFilter 创建一个新的布隆过滤器
@@ -60,11 +67,14 @@ func NewBloomFilter(options BloomFilterOptions, partitionID int) *BloomFilter {
 
 	now := time.Now()
 	return &BloomFilter{
-		filter:    filter,
-		path:      path,
-		size:      0,
-		createdAt: now,
-		updatedAt: now,
+		filter:      filter,
+		path:        path,
+		size:        0,
+		createdAt:   now,
+		updatedAt:   now,
+		dirty:       false,
+		dirtyCount:  0,
+		lastSavedAt: now,
 	}
 }
 
@@ -112,6 +122,8 @@ func (bf *BloomFilter) Add(key []byte) {
 	bf.filter.Add(key)
 	bf.size++
 	bf.updatedAt = time.Now()
+	bf.dirty = true
+	bf.dirtyCount++
 }
 
 // Test 检查键是否可能存在于集合中
@@ -137,11 +149,11 @@ func (bf *BloomFilter) Size() uint32 {
 
 // Save 将布隆过滤器保存到磁盘
 func (bf *BloomFilter) Save() error {
-	bf.mu.RLock()
-	defer bf.mu.RUnlock()
+	bf.mu.Lock()
+	defer bf.mu.Unlock()
 
 	if bf.filter == nil {
-		return nil // 没有过滤器需要保存
+		return nil
 	}
 
 	// 创建临时文件
@@ -183,7 +195,20 @@ func (bf *BloomFilter) Save() error {
 		return fmt.Errorf("failed to rename bloom filter file: %w", err)
 	}
 
+	bf.dirty = false
+	bf.dirtyCount = 0
+	bf.lastSavedAt = time.Now()
 	return nil
+}
+
+func (bf *BloomFilter) SaveIfDirty() error {
+	bf.mu.RLock()
+	dirty := bf.dirty
+	bf.mu.RUnlock()
+	if !dirty {
+		return nil
+	}
+	return bf.Save()
 }
 
 // Clear 清空布隆过滤器
@@ -196,6 +221,8 @@ func (bf *BloomFilter) Clear() {
 	}
 	bf.size = 0
 	bf.updatedAt = time.Now()
+	bf.dirty = true
+	bf.dirtyCount++
 }
 
 // EstimateFalsePositiveRate 估算当前的假阳性率
@@ -226,6 +253,8 @@ func (bf *BloomFilter) Merge(other *BloomFilter) error {
 	}
 
 	bf.size += other.size
+	bf.dirty = true
+	bf.dirtyCount += other.size
 	return nil
 }
 
@@ -309,6 +338,8 @@ func (bf *BloomFilter) AddMultiple(keys [][]byte) {
 		bf.size++
 	}
 	bf.updatedAt = time.Now()
+	bf.dirty = true
+	bf.dirtyCount += uint32(len(keys))
 }
 
 // TestMultiple 批量测试键
@@ -356,9 +387,13 @@ func (bf *BloomFilter) GetStats() map[string]interface{} {
 
 // BloomFilterManager 管理多个分区的布隆过滤器
 type BloomFilterManager struct {
-	mu      sync.RWMutex
-	filters map[int]*BloomFilter
-	options BloomFilterOptions
+	mu            sync.RWMutex
+	filters       map[int]*BloomFilter
+	options       BloomFilterOptions
+	saveInterval  time.Duration
+	saveThreshold int
+	stopCh        chan struct{}
+	started       bool
 }
 
 // NewBloomFilterManager 创建布隆过滤器管理器
@@ -370,6 +405,14 @@ func NewBloomFilterManager(options BloomFilterOptions) *BloomFilterManager {
 	for i := 0; i < options.PartitionNum; i++ {
 		filter := NewBloomFilter(options, i)
 		bf.filters[i] = filter
+	}
+	if options.SaveIntervalSeconds > 0 {
+		bf.saveInterval = time.Duration(options.SaveIntervalSeconds) * time.Second
+		bf.stopCh = make(chan struct{})
+		bf.StartAutoSave()
+	}
+	if options.SaveChangeThreshold > 0 {
+		bf.saveThreshold = options.SaveChangeThreshold
 	}
 	return &bf
 }
@@ -408,6 +451,14 @@ func (bfm *BloomFilterManager) AddKey(key []byte) {
 	partitionID := int(bfm.options.keyHashFunction(key) % uint64(bfm.options.PartitionNum))
 	filter := bfm.GetFilter(partitionID)
 	filter.Add(key)
+	if bfm.saveThreshold > 0 {
+		filter.mu.RLock()
+		shouldSave := filter.dirty && int(filter.dirtyCount) >= bfm.saveThreshold
+		filter.mu.RUnlock()
+		if shouldSave {
+			_ = filter.Save()
+		}
+	}
 }
 
 // TestKey 检查键是否可能存在于指定分区
@@ -420,14 +471,52 @@ func (bfm *BloomFilterManager) TestKey(key []byte) bool {
 // SaveAll 保存所有布隆过滤器
 func (bfm *BloomFilterManager) SaveAll() error {
 	bfm.mu.RLock()
-	defer bfm.mu.RUnlock()
-
-	for _, filter := range bfm.filters {
-		if err := filter.Save(); err != nil {
+	filters := make([]*BloomFilter, 0, len(bfm.filters))
+	for _, f := range bfm.filters {
+		filters = append(filters, f)
+	}
+	bfm.mu.RUnlock()
+	for _, filter := range filters {
+		if err := filter.SaveIfDirty(); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+func (bfm *BloomFilterManager) StartAutoSave() {
+	bfm.mu.Lock()
+	if bfm.started || bfm.saveInterval <= 0 {
+		bfm.mu.Unlock()
+		return
+	}
+	bfm.started = true
+	stopCh := bfm.stopCh
+	interval := bfm.saveInterval
+	bfm.mu.Unlock()
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				_ = bfm.SaveAll()
+			case <-stopCh:
+				return
+			}
+		}
+	}()
+}
+
+func (bfm *BloomFilterManager) StopAutoSave() {
+	bfm.mu.Lock()
+	if !bfm.started {
+		bfm.mu.Unlock()
+		return
+	}
+	bfm.started = false
+	close(bfm.stopCh)
+	bfm.mu.Unlock()
 }
 
 // ClearAll 清空所有布隆过滤器

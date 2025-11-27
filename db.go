@@ -132,11 +132,13 @@ func Open(options Options) (*DB, error) {
 	var bloomManager *BloomFilterManager
 	if options.EnableBloomFilter {
 		bloomOptions := BloomFilterOptions{
-			ExpectedElements:  options.BloomFilterExpectedElements,
-			FalsePositiveRate: options.BloomFilterFalsePositiveRate,
-			DirPath:           options.DirPath,
-			PartitionNum:      options.PartitionNum,
-			keyHashFunction:   options.KeyHashFunction,
+			ExpectedElements:    options.BloomFilterExpectedElements,
+			FalsePositiveRate:   options.BloomFilterFalsePositiveRate,
+			DirPath:             options.DirPath,
+			PartitionNum:        options.PartitionNum,
+			keyHashFunction:     options.KeyHashFunction,
+			SaveIntervalSeconds: options.BloomFilterSaveIntervalSeconds,
+			SaveChangeThreshold: options.BloomFilterSaveChangeThreshold,
 		}
 		bloomManager = NewBloomFilterManager(bloomOptions)
 	}
@@ -228,6 +230,7 @@ func (db *DB) Close() error {
 
 	// 保存布隆过滤器
 	if db.bloomManager != nil {
+		db.bloomManager.StopAutoSave()
 		if err := db.bloomManager.SaveAll(); err != nil {
 			return err
 		}
@@ -603,6 +606,9 @@ func (db *DB) listenAutoCompact() {
 	thresholdstate := ThresholdState(UnarriveThreshold)
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
+	retryDelay := 1 * time.Second
+	maxRetryDelay := 60 * time.Second
+	var nextRetryAt time.Time
 	for {
 		select {
 		case state, ok := <-db.compactChan:
@@ -615,7 +621,9 @@ func (db *DB) listenAutoCompact() {
 		case <-sig:
 			return
 		case <-ticker.C:
-			// 需要多层嵌套条件以处理不同阈值和错误判断。
+			if !nextRetryAt.IsZero() && time.Now().Before(nextRetryAt) {
+				continue
+			}
 			if thresholdstate == ThresholdState(ArriveForceThreshold) {
 				var err error
 				if firstCompact {
@@ -625,17 +633,28 @@ func (db *DB) listenAutoCompact() {
 					err = db.CompactWithDiscardtable()
 				}
 				if err != nil {
-					panic(err)
+					log.Println("compact error:", err)
+					nextRetryAt = time.Now().Add(retryDelay)
+					if retryDelay < maxRetryDelay {
+						retryDelay *= 2
+					}
+					continue
 				}
 				thresholdstate = ThresholdState(UnarriveThreshold)
+				nextRetryAt = time.Time{}
+				retryDelay = 1 * time.Second
 			} else if thresholdstate == ThresholdState(ArriveAdvisedThreshold) {
-				// 根据当前IO状态判断是否进行压缩
 				free := true
-				var err error = nil
+				var err error
 				if db.options.EnableDiskIO {
 					free, err = db.diskIO.IsFree()
 					if err != nil {
-						panic(err)
+						log.Println("disk io state error:", err)
+						nextRetryAt = time.Now().Add(retryDelay)
+						if retryDelay < maxRetryDelay {
+							retryDelay *= 2
+						}
+						continue
 					}
 				}
 				if free {
@@ -646,9 +665,16 @@ func (db *DB) listenAutoCompact() {
 						err = db.CompactWithDiscardtable()
 					}
 					if err != nil {
-						panic(err)
+						log.Println("compact error:", err)
+						nextRetryAt = time.Now().Add(retryDelay)
+						if retryDelay < maxRetryDelay {
+							retryDelay *= 2
+						}
+						continue
 					}
 					thresholdstate = ThresholdState(UnarriveThreshold)
+					nextRetryAt = time.Time{}
+					retryDelay = 1 * time.Second
 				} else {
 					log.Println("IO 当前繁忙")
 				}
