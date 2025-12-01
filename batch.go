@@ -21,12 +21,13 @@ import (
 //
 // 必须调用 Commit 方法来提交批处理，否则数据库将被锁定。
 type Batch struct {
-	db            *DB
-	pendingWrites map[string]*LogRecord
-	options       BatchOptions
-	mu            sync.RWMutex
-	committed     bool
-	batchID       *snowflake.Node
+    db            *DB
+    pendingWrites map[string]*LogRecord
+    options       BatchOptions
+    mu            sync.RWMutex
+    committed     bool
+    batchID       *snowflake.Node
+    locked        bool
 }
 
 // NewBatch 创建一个新的 Batch 实例。
@@ -79,20 +80,28 @@ func (b *Batch) reset() {
 }
 
 func (b *Batch) lock() {
-	if b.options.ReadOnly {
-		b.db.mu.RLock()
-	} else {
-		b.db.mu.Lock()
-	}
+    if b.options.ReadOnly {
+        b.db.mu.RLock()
+    } else {
+        b.db.mu.Lock()
+    }
+    b.locked = true
 }
 
 func (b *Batch) unlock() {
-	if b.options.ReadOnly {
-		b.db.mu.RUnlock()
-	} else {
-		b.db.mu.Unlock()
-	}
+    if !b.locked {
+        return
+    }
+    b.locked = false
+    if b.options.ReadOnly {
+        b.db.mu.RUnlock()
+    } else {
+        b.db.mu.Unlock()
+    }
 }
+
+// Close 释放 Batch 持有的数据库锁
+func (b *Batch) Close() { b.unlock() }
 
 // Put 向批处理添加一个键值对以进行写入。
 func (b *Batch) Put(key []byte, value []byte) error {

@@ -114,8 +114,9 @@ const (
 
 // Batch 客户端流：接收多条操作并批量提交
 func (s *Server) Batch(stream KVService_BatchServer) error {
-	batch := s.db.NewBatch(knocidb.DefaultBatchOptions)
-	for {
+    batch := s.db.NewBatch(knocidb.DefaultBatchOptions)
+    defer batch.Close()
+    for {
 		msg, err := stream.Recv()
 		if err == io.EOF {
 			break
