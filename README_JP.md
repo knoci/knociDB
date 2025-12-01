@@ -15,6 +15,7 @@
 - 🌲 **B+Tree**と**ハッシュインデックス**のサポート
 - 🌐 Raftプロトコルによる**分散デプロイメント**
 - 💾 **S3オブジェクトストレージ**の読み取りとwalのロード
+- 🔌 **gRPC対応** クライアントストリームBatch、サーバーストリームScan、認証/TLSオプション
 
 ## クイックスタート
 ```go
@@ -68,6 +69,15 @@ $ go build -o raft-example main.go
 ```bash
 $ cd examples/cmd_client
 $ go build -o knocidb-cli
+```
+
+🔌 gRPCの使用方法については `examples/gRPC` を参照してください。対話型クライアントと設定可能なサーバーを含みます。
+```bash
+$ cd examples/gRPC/server
+$ go run main.go --dir ./grpc_data --addr 127.0.0.1:50051
+
+$ cd ../client
+$ go run main.go --addr 127.0.0.1:50051
 ```
 
 ## 情報

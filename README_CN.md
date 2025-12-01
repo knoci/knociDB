@@ -15,6 +15,7 @@
 - 🌲 **B+树**和**哈希索引**支持
 - 🌐 基于Raft的**分布式部署**
 - 💾 **S3 对象存储**读取和加载 wal
+- 🔌 **gRPC 支持** 客户端流式批量、服务端流式扫描、可选鉴权与 TLS
 
 ## 快速开始
 ```go
@@ -69,6 +70,15 @@ $ go build -o raft-example main.go
 ```bash
 $ cd examples/cmd_client
 $ go build -o knocidb-cli
+```
+
+🔌 关于 gRPC 的使用，请查看 `examples/gRPC`，其中包含交互式客户端与可配置服务端。
+```bash
+$ cd examples/gRPC/server
+$ go run main.go --dir ./grpc_data --addr 127.0.0.1:50051
+
+$ cd ../client
+$ go run main.go --addr 127.0.0.1:50051
 ```
 
 ## 信息
