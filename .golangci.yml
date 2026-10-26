@@ -1,0 +1,9 @@
+# golangci-lint v2 configuration.
+# Start with govet only so the existing codebase has a green, enforceable gate.
+# Enable more linters (errcheck, staticcheck, unused, ...) incrementally.
+version: "2"
+
+linters:
+  default: none
+  enable:
+    - govet
