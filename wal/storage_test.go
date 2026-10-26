@@ -68,6 +68,9 @@ func ensureTestBucket(s *S3Storage) error {
 }
 
 func TestS3StorageOperations(t *testing.T) {
+	if os.Getenv("KNOCIDB_S3_TEST") != "1" {
+		t.Skip("set KNOCIDB_S3_TEST=1 and provide wal/config.yaml credentials to run S3 integration test")
+	}
 	if err := setupTestFile(); err != nil {
 		t.Fatalf("Failed to setup test file: %v", err)
 	}

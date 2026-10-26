@@ -16,6 +16,8 @@ const (
 	LogRecordDeleted
 	// LogRecordBatchFinished 是批处理完成的日志记录类型
 	LogRecordBatchFinished
+	// LogRecordNormalEmpty 是 value 为空但键存在的普通记录
+	LogRecordNormalEmpty
 )
 
 // 类型 批次ID 键大小 值大小
@@ -64,20 +66,36 @@ func encodeLogRecord(logRecord *LogRecord) []byte {
 
 // decodeLogRecord 从给定的字节切片解码日志记录
 func decodeLogRecord(buf []byte) *LogRecord {
+	if len(buf) == 0 {
+		return nil
+	}
 	recordType := buf[0]
 
 	var index uint32 = 1
 	// 批次ID
 	batchID, n := binary.Uvarint(buf[index:])
+	if n <= 0 {
+		return nil
+	}
 	index += uint32(n)
 
 	// 键大小
 	keySize, n := binary.Varint(buf[index:])
+	if n <= 0 || keySize < 0 {
+		return nil
+	}
 	index += uint32(n)
 
 	// 值大小
 	valueSize, n := binary.Varint(buf[index:])
+	if n <= 0 || valueSize < 0 {
+		return nil
+	}
 	index += uint32(n)
+
+	if index+uint32(keySize)+uint32(valueSize) < index || index+uint32(keySize)+uint32(valueSize) > uint32(len(buf)) {
+		return nil
+	}
 
 	// 复制键
 	key := make([]byte, keySize)
@@ -131,24 +149,29 @@ func encodeValueLogRecord(record *ValueLogRecord) []byte {
 }
 
 func decodeValueLogRecord(buf []byte) *ValueLogRecord {
-	keySize := 4
-	index := 0
-	var uid uuid.UUID
-	uidBytes := buf[:len(uid)]
-	err := uid.UnmarshalBinary(uidBytes)
-	if err != nil {
+	const uidLen = 16
+	const keySize = 4
+	if len(buf) < uidLen+keySize {
 		return nil
 	}
-	index += len(uid)
+	index := 0
+	var uid uuid.UUID
+	if err := uid.UnmarshalBinary(buf[:uidLen]); err != nil {
+		return nil
+	}
+	index += uidLen
 
-	keyLen := (int)(binary.LittleEndian.Uint32(buf[index : index+keySize]))
+	keyLen := int(binary.LittleEndian.Uint32(buf[index : index+keySize]))
 	index += keySize
+	if index+keyLen > len(buf) {
+		return nil
+	}
 
 	key := make([]byte, keyLen)
 	copy(key, buf[index:index+keyLen])
 	index += keyLen
 
-	value := make([]byte, len(buf)-len(uid)-keyLen-keySize)
+	value := make([]byte, len(buf)-index)
 	copy(value, buf[index:])
 
 	return &ValueLogRecord{uid: uid, key: key, value: value}

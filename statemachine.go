@@ -8,9 +8,6 @@ import (
 	"hash/crc32"
 	"io"
 	"os"
-	"path/filepath"
-	"sort"
-	"strings"
 	"sync"
 	"time"
 
@@ -92,15 +89,40 @@ func (s *KVStateMachine) Update(entry statemachine.Entry) (statemachine.Result, 
 		return statemachine.Result{Value: processedCount}, nil
 	}
 
-	var cmd Command
-	if err := json.Unmarshal(entry.Cmd, &cmd); err != nil {
-		// 尝试解析为批处理命令
-		var batchCmd BatchCommand
-		if err := json.Unmarshal(entry.Cmd, &batchCmd); err != nil {
+	// 先解析公共的 op 字段，再决定反序列化成 Command 还是 BatchCommand。
+	var envelope struct {
+		Op uint32 `json:"op"`
+	}
+	if err := json.Unmarshal(entry.Cmd, &envelope); err != nil {
+		return statemachine.Result{}, fmt.Errorf("failed to unmarshal operation: %v", err)
+	}
+
+	switch envelope.Op {
+	case OpPut, OpDelete:
+		var cmd Command
+		if err := json.Unmarshal(entry.Cmd, &cmd); err != nil {
 			return statemachine.Result{}, fmt.Errorf("failed to unmarshal command: %v", err)
 		}
+		switch cmd.Op {
+		case OpPut:
+			if err := s.db.Put(cmd.Key, cmd.Value); err != nil {
+				return statemachine.Result{}, fmt.Errorf("put failed: %v", err)
+			}
+		case OpDelete:
+			if err := s.db.Delete(cmd.Key); err != nil {
+				return statemachine.Result{}, fmt.Errorf("delete failed: %v", err)
+			}
+		}
+		processedCount++
 
+	case OpBatch:
+		var batchCmd BatchCommand
+		if err := json.Unmarshal(entry.Cmd, &batchCmd); err != nil {
+			return statemachine.Result{}, fmt.Errorf("failed to unmarshal batch command: %v", err)
+		}
 		batch := s.db.NewBatch(DefaultBatchOptions)
+		// Commit 成功会解锁；失败/提前 return 时由 Close 兜底释放 db.mu
+		defer batch.Close()
 		for _, command := range batchCmd.Commands {
 			switch command.Op {
 			case OpPut:
@@ -119,21 +141,9 @@ func (s *KVStateMachine) Update(entry statemachine.Entry) (statemachine.Result, 
 		if err := batch.Commit(); err != nil {
 			return statemachine.Result{}, fmt.Errorf("batch commit failed: %v", err)
 		}
-	} else {
-		// 处理单个命令
-		switch cmd.Op {
-		case OpPut:
-			if err := s.db.Put(cmd.Key, cmd.Value); err != nil {
-				return statemachine.Result{}, fmt.Errorf("put failed: %v", err)
-			}
-		case OpDelete:
-			if err := s.db.Delete(cmd.Key); err != nil {
-				return statemachine.Result{}, fmt.Errorf("delete failed: %v", err)
-			}
-		default:
-			return statemachine.Result{}, fmt.Errorf("unknown operation: %v", cmd.Op)
-		}
-		processedCount++
+
+	default:
+		return statemachine.Result{}, fmt.Errorf("unknown operation: %v", envelope.Op)
 	}
 
 	// 更新已应用的索引
@@ -203,6 +213,29 @@ func (s *KVStateMachine) SaveSnapshot(w io.Writer, fc statemachine.ISnapshotFile
 		return fmt.Errorf("write checksum faied: %w", err)
 	}
 
+	// 把导出的 .ZST 文件内容也写入快照流，使快照自包含、可跨节点传输。
+	snapPath, err := latestSnapshotFile(options.SnapshotPath)
+	if err != nil {
+		return fmt.Errorf("find exported snapshot failed: %w", err)
+	}
+	file, err := os.Open(snapPath)
+	if err != nil {
+		return fmt.Errorf("open exported snapshot failed: %w", err)
+	}
+	defer file.Close()
+	stat, err := file.Stat()
+	if err != nil {
+		return fmt.Errorf("stat exported snapshot failed: %w", err)
+	}
+	sizeBuf := make([]byte, 8)
+	binary.LittleEndian.PutUint64(sizeBuf, uint64(stat.Size()))
+	if _, err := w.Write(sizeBuf); err != nil {
+		return fmt.Errorf("write snapshot data size failed: %w", err)
+	}
+	if _, err := io.Copy(w, file); err != nil {
+		return fmt.Errorf("write snapshot data failed: %w", err)
+	}
+
 	return nil
 }
 
@@ -247,35 +280,52 @@ func (s *KVStateMachine) RecoverFromSnapshot(r io.Reader, files []statemachine.S
 	// 保存当前数据库选项，用于后续重新打开数据库
 	options := s.db.GetOptions()
 
-	// 获取最新的快照文件路径
 	snapDir := options.SnapshotPath
 	if snapDir == "" {
 		return fmt.Errorf("snapshotpath empty")
 	}
-
-	file, err := os.ReadDir(snapDir)
-	if err != nil {
-		return fmt.Errorf(": %w", err)
+	if err := os.MkdirAll(snapDir, os.ModePerm); err != nil {
+		return fmt.Errorf("create snapshot dir failed: %w", err)
 	}
 
-	var snapFiles []string
-	for _, f := range file {
-		if strings.HasSuffix(f.Name(), snapshotExt) {
-			snapFiles = append(snapFiles, filepath.Join(snapDir, f.Name()))
+	// 新格式：元数据/CRC 之后是 int64 文件大小 + .ZST 文件内容。
+	// 兼容旧格式：没有文件内容时，退回本地最新 .ZST。
+	var err error
+	var importPath string
+	var dataSize int64
+	sizeBuf := make([]byte, 8)
+	if _, err := io.ReadFull(r, sizeBuf); err == nil {
+		dataSize = int64(binary.LittleEndian.Uint64(sizeBuf))
+	} else if err != io.EOF {
+		return fmt.Errorf("read snapshot data size failed: %w", err)
+	}
+
+	if dataSize > 0 {
+		tmp, err := os.CreateTemp(snapDir, "recover-*.ZST")
+		if err != nil {
+			return fmt.Errorf("create recover snapshot failed: %w", err)
+		}
+		tmpPath := tmp.Name()
+		if _, err := io.CopyN(tmp, r, dataSize); err != nil {
+			_ = tmp.Close()
+			_ = os.Remove(tmpPath)
+			return fmt.Errorf("read snapshot data failed: %w", err)
+		}
+		if err := tmp.Close(); err != nil {
+			_ = os.Remove(tmpPath)
+			return fmt.Errorf("close recover snapshot failed: %w", err)
+		}
+		importPath = tmpPath
+		defer os.Remove(importPath)
+	} else {
+		importPath, err = latestSnapshotFile(snapDir)
+		if err != nil {
+			return fmt.Errorf("can not find snapshot file: %w", err)
 		}
 	}
 
-	if len(snapFiles) == 0 {
-		return fmt.Errorf("can not find snapshot file")
-	}
-
-	// 按文件名排序（文件名包含时间戳）
-	sort.Strings(snapFiles)
-	// 获取最新的快照文件
-	latestSnapshot := snapFiles[len(snapFiles)-1]
-
 	// 使用KnociDB的导入功能恢复数据库状态 ImportSnapshot会自动关闭数据库
-	if err = s.db.ImportSnapshot(latestSnapshot); err != nil {
+	if err = s.db.ImportSnapshot(importPath); err != nil {
 		// 导入失败，尝试重新打开数据库
 		db, openErr := Open(options)
 		if openErr != nil {

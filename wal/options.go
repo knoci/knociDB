@@ -10,6 +10,10 @@ type Options struct {
 	// DirPath 指定存储 WAL 段文件的目录路径。
 	DirPath string
 
+	// InitialSegmentID 指定空目录时新建段文件的起始 ID。
+	// 压缩时用它生成与旧段不同的 ID，避免新旧段文件名冲突。
+	InitialSegmentID SegmentID
+
 	// SegmentSize 指定每个段文件的最大字节大小。
 	SegmentSize int64
 
@@ -43,11 +47,12 @@ const (
 )
 
 var DefaultOptions = Options{
-	DirPath:        os.TempDir(),
-	SegmentSize:    GB,
-	SegmentFileExt: ".SEG",
-	Sync:           false,
-	BytesPerSync:   0,
-	SyncInterval:   0,
-	ObjectStorage:  false,
+	DirPath:          os.TempDir(),
+	SegmentSize:      GB,
+	SegmentFileExt:   ".SEG",
+	InitialSegmentID: initialSegmentFileID,
+	Sync:             false,
+	BytesPerSync:     0,
+	SyncInterval:     0,
+	ObjectStorage:    false,
 }

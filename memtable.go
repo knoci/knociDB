@@ -129,6 +129,9 @@ func openMemtable(options memtableOptions) (*memtable, error) {
 			return nil, errNext
 		}
 		record := decodeLogRecord(segment)
+		if record == nil {
+			return nil, fmt.Errorf("invalid log record in wal")
+		}
 		if record.Type == LogRecordBatchFinished {
 			batchID, errParseBytes := snowflake.ParseBytes(record.Key)
 			if errParseBytes != nil {
@@ -151,6 +154,13 @@ func openMemtable(options memtableOptions) (*memtable, error) {
 
 // putBatch 将一批LogRecord写入内存表。
 func (mt *memtable) putBatch(pendingWrites map[string]*LogRecord, batchID snowflake.ID, options WriteOptions) error {
+	// 统一空 value 的表示，无论是否写 WAL 都要生效
+	for _, record := range pendingWrites {
+		if record.Type == LogRecordNormal && record.Value != nil && len(record.Value) == 0 {
+			record.Type = LogRecordNormalEmpty
+		}
+	}
+
 	// 如果WAL未禁用，首先写入WAL以确保持久性和原子性
 	if !options.DisableWal {
 		// 将记录添加到wal.pendingWrites，这相当于wal的一个写缓冲区
@@ -171,8 +181,10 @@ func (mt *memtable) putBatch(pendingWrites map[string]*LogRecord, batchID snowfl
 		if _, err := mt.wal.WriteAll(); err != nil {
 			return err
 		}
-		// 如有必要，刷新WAL
-		if options.Sync && !mt.options.walSync {
+		// 如有必要，刷新WAL：
+		// - 本次写入显式要求 Sync
+		// - 或者数据库全局开启了 Sync（walSync=true）
+		if options.Sync || mt.options.walSync {
 			if err := mt.wal.Sync(); err != nil {
 				return err
 			}
@@ -191,12 +203,25 @@ func (mt *memtable) putBatch(pendingWrites map[string]*LogRecord, batchID snowfl
 
 // 从内存表获取值 如果指定的键被标记为已删除，则返回true
 func (mt *memtable) get(key []byte) (bool, []byte) {
+	deleted, _, value := mt.getWithState(key)
+	return deleted, value
+}
+
+// getWithState 返回 (deleted, empty, value)。
+// empty 用于区分“键存在但 value 为空”和“键不存在”。
+func (mt *memtable) getWithState(key []byte) (bool, bool, []byte) {
 	mt.mu.RLock()
 	defer mt.mu.RUnlock()
 
 	valueStruct := mt.skl.Get(y.KeyWithTs(key, 0))
-	deleted := valueStruct.Meta == LogRecordDeleted
-	return deleted, valueStruct.Value
+	switch valueStruct.Meta {
+	case LogRecordDeleted:
+		return true, false, valueStruct.Value
+	case LogRecordNormalEmpty:
+		return false, true, valueStruct.Value
+	default:
+		return false, false, valueStruct.Value
+	}
 }
 
 func (mt *memtable) isFull() bool {

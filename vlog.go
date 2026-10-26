@@ -3,6 +3,10 @@ package knocidb
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
 
 	"github.com/google/uuid"
 	"github.com/knoci/knocidb/wal"
@@ -22,6 +26,11 @@ type valueLog struct {
 	discardNumber uint32
 	totalNumber   uint32
 	options       valueLogOptions
+
+	// 压缩期间新 ValueLog 还没替换进 walFiles，但索引可能已经指向新位置。
+	// 读路径通过 extraWALs 找到这些“临时可读”的新段（按分区隔离）。
+	mu        sync.RWMutex
+	extraWALs [][]*wal.WAL
 }
 
 type valueLogOptions struct {
@@ -52,10 +61,48 @@ type valueLogOptions struct {
 
 // 为值日志打开 WAL 文件，将打开多个 WAL 文件用于并发读写
 // 为每个 WAL 初始化废弃表，构建 dpTable
+// recoverValueLogTempFiles 处理压缩崩溃留下的 .temp 文件：
+// - 正式文件还在：旧数据仍是权威版本，删除 temp；
+// - 正式文件不在：说明崩溃发生在“删旧文件之后、rename 之前”，把 temp 提升为正式文件。
+func recoverValueLogTempFiles(dirPath string, partition int) error {
+	if err := os.MkdirAll(dirPath, os.ModePerm); err != nil {
+		return err
+	}
+	entries, err := os.ReadDir(dirPath)
+	if err != nil {
+		return err
+	}
+	suffix := fmt.Sprintf(tempValueLogFileExt, partition)
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		if !strings.HasSuffix(name, suffix) {
+			continue
+		}
+		tempPath := filepath.Join(dirPath, name)
+		finalPath := filepath.Join(dirPath, strings.TrimSuffix(name, ".temp"))
+		if _, statErr := os.Stat(finalPath); statErr == nil {
+			if err := os.Remove(tempPath); err != nil {
+				return err
+			}
+			continue
+		}
+		if err := os.Rename(tempPath, finalPath); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func openValueLog(options valueLogOptions) (*valueLog, error) {
 	var walFiles []*wal.WAL
 	var dpTables []*discardtable
 	for i := 0; i < int(options.partitionNum); i++ {
+		if err := recoverValueLogTempFiles(options.dirPath, i); err != nil {
+			return nil, err
+		}
 		vLogWal, err := wal.Open(wal.Options{
 			DirPath:        options.dirPath,
 			SegmentSize:    options.segmentSize,
@@ -81,14 +128,79 @@ func openValueLog(options valueLogOptions) (*valueLog, error) {
 		options:       options}, nil
 }
 
-// 从指定位置读取值日志记录
-func (vlog *valueLog) read(pos *KeyPosition) (*ValueLogRecord, error) {
-	buf, err := vlog.walFiles[pos.partition].Read(pos.position)
-	if err != nil {
-		return nil, err
+// addReadableWAL 注册压缩期间的临时 WAL，使索引更新后立刻可读。
+func (vlog *valueLog) addReadableWAL(partition int, walFile *wal.WAL) {
+	vlog.mu.Lock()
+	for len(vlog.extraWALs) <= partition {
+		vlog.extraWALs = append(vlog.extraWALs, nil)
 	}
-	log := decodeValueLogRecord(buf)
-	return log, nil
+	vlog.extraWALs[partition] = append(vlog.extraWALs[partition], walFile)
+	vlog.mu.Unlock()
+}
+
+func (vlog *valueLog) removeReadableWAL(partition int, walFile *wal.WAL) {
+	vlog.mu.Lock()
+	if partition < len(vlog.extraWALs) {
+		list := vlog.extraWALs[partition]
+		for i, w := range list {
+			if w == walFile {
+				vlog.extraWALs[partition] = append(list[:i], list[i+1:]...)
+				break
+			}
+		}
+	}
+	vlog.mu.Unlock()
+}
+
+// 从指定位置读取值日志记录。
+// 先读正式 WAL，失败时再尝试压缩期间注册的临时 WAL。
+func (vlog *valueLog) read(pos *KeyPosition) (*ValueLogRecord, error) {
+	if pos == nil {
+		return nil, ErrKeyNotFound
+	}
+	vlog.mu.RLock()
+	var main *wal.WAL
+	if int(pos.partition) < len(vlog.walFiles) {
+		main = vlog.walFiles[pos.partition]
+	}
+	var extras []*wal.WAL
+	if int(pos.partition) < len(vlog.extraWALs) {
+		extras = append(extras, vlog.extraWALs[pos.partition]...)
+	}
+	vlog.mu.RUnlock()
+
+	var firstErr error
+	if main != nil {
+		buf, err := main.Read(pos.position)
+		if err == nil {
+			record := decodeValueLogRecord(buf)
+			if record == nil {
+				return nil, fmt.Errorf("invalid value log record at %+v", pos.position)
+			}
+			return record, nil
+		}
+		firstErr = err
+	}
+	for _, w := range extras {
+		if w == nil {
+			continue
+		}
+		buf, err := w.Read(pos.position)
+		if err == nil {
+			record := decodeValueLogRecord(buf)
+			if record == nil {
+				return nil, fmt.Errorf("invalid value log record at %+v", pos.position)
+			}
+			return record, nil
+		}
+		if firstErr == nil {
+			firstErr = err
+		}
+	}
+	if firstErr != nil {
+		return nil, firstErr
+	}
+	return nil, fmt.Errorf("value log partition %d not found", pos.partition)
 }
 
 // 将vlog记录写入，它将被写入相应的分区
@@ -102,7 +214,7 @@ func (vlog *valueLog) writeBatch(records []*ValueLogRecord) ([]*KeyPosition, err
 		partitionRecords[p] = append(partitionRecords[p], record)
 	}
 
-    pChan := make(chan []*KeyPosition, vlog.options.partitionNum)
+	pChan := make(chan []*KeyPosition, vlog.options.partitionNum)
 	g, ctx := errgroup.WithContext(context.Background())
 	// 遍历处理每个分区
 	for i := 0; i < int(vlog.options.partitionNum); i++ {
@@ -151,17 +263,17 @@ func (vlog *valueLog) writeBatch(records []*ValueLogRecord) ([]*KeyPosition, err
 		})
 	}
 
-    if err := g.Wait(); err != nil {
-        return nil, err
-    }
-    close(pChan)
+	if err := g.Wait(); err != nil {
+		return nil, err
+	}
+	close(pChan)
 
-    var keyPositions []*KeyPosition
-    for pos := range pChan {
-        keyPositions = append(keyPositions, pos...)
-    }
+	var keyPositions []*KeyPosition
+	for pos := range pChan {
+		keyPositions = append(keyPositions, pos...)
+	}
 
-    return keyPositions, nil
+	return keyPositions, nil
 }
 
 // 将值日志同步到磁盘

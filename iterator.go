@@ -246,14 +246,21 @@ func (mi *Iterator) Close() error {
 // NewIterator 返回一个新的迭代器
 // 该迭代器将遍历数据库中的所有键
 // 调用者有责任在不再使用迭代器时调用Close，否则会导致资源泄漏
-// 迭代器不是线程安全的，不应该从多个goroutine并发使用同一个迭代器
+// 迭代器不是线程安全的，不可从多个goroutine并发使用同一个迭代器
 func (db *DB) NewIterator(options IteratorOptions) (*Iterator, error) {
 	if db.options.IndexType == Hash {
 		return nil, ErrDBIteratorUnsupportedTypeHASH
 	}
 	db.mu.Lock()
+	success := false
 	defer func() {
 		if r := recover(); r != nil {
+			if !success {
+				db.mu.Unlock()
+			}
+			panic(r)
+		}
+		if !success {
 			db.mu.Unlock()
 		}
 	}()
@@ -315,6 +322,7 @@ func (db *DB) NewIterator(options IteratorOptions) (*Iterator, error) {
 	h := iterHeap(itrs)
 	heap.Init(&h)
 
+	success = true
 	return &Iterator{
 		h:          h,
 		itrs:       itrs,

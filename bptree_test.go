@@ -402,18 +402,14 @@ func testbptreeSync(t *testing.T, partitionNum int) {
 func Test_bptreeIterator(t *testing.T) {
 	options := indexOptions{
 		indexType:       BTree,
-		dirPath:         filepath.Join(os.TempDir(), "bptree-cursorIterator"+strconv.Itoa(1)),
+		dirPath:         t.TempDir(),
 		partitionNum:    1,
 		keyHashFunction: xxhash.Sum64,
 	}
 
-	err := os.MkdirAll(options.dirPath, os.ModePerm)
-	require.NoError(t, err)
-	defer func() {
-		_ = os.RemoveAll(options.dirPath)
-	}()
 	bt, err := openBTreeIndex(options)
 	require.NoError(t, err)
+	defer bt.Close()
 	m := map[string]*wal.ChunkPosition{
 		"key 0": {SegmentId: 0, BlockNumber: 0, ChunkOffset: 0, ChunkSize: 0},
 		"key 1": {SegmentId: 1, BlockNumber: 1, ChunkOffset: 1, ChunkSize: 1},

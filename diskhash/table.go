@@ -145,9 +145,24 @@ func (t *Table) readMeta() error {
 }
 
 // write将元数据信息以JSON格式写入元数据文件。
-func (t *Table) writeMeta() error {
-	encoder := json.NewEncoder(t.metaFile)
-	return encoder.Encode(t.meta)
+// 采用“临时文件 + rename”覆盖，避免在旧文件末尾追加出多个 JSON 对象。
+func (t *Table) writeMeta(syncFile bool) error {
+	if t.metaFile == nil {
+		return errors.New("meta file is not open")
+	}
+	data, err := json.Marshal(t.meta)
+	if err != nil {
+		return err
+	}
+	// 原地覆盖写。JSON 变长时先 WriteAt 再按新长度截断，避免文件尾部残留旧对象。
+	if _, err := t.metaFile.WriteAt(data, 0); err != nil {
+		return err
+	}
+	_ = os.Truncate(filepath.Join(t.options.DirPath, metaFileName), int64(len(data)))
+	if syncFile {
+		return t.metaFile.Sync()
+	}
+	return nil
 }
 
 // Close关闭哈希表的文件。
@@ -155,7 +170,7 @@ func (t *Table) Close() error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	if err := t.writeMeta(); err != nil {
+	if err := t.writeMeta(true); err != nil {
 		return err
 	}
 
@@ -467,7 +482,8 @@ func (t *Table) split() error {
 	}
 
 	t.meta.NumBuckets++
-	return nil
+	// 分裂后立即写元数据（不 fsync，避免每次分裂都等磁盘）；Close 时再 fsync。
+	return t.writeMeta(false)
 }
 
 // 创建溢出bucket。

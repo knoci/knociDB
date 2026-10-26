@@ -21,13 +21,13 @@ import (
 //
 // 必须调用 Commit 方法来提交批处理，否则数据库将被锁定。
 type Batch struct {
-    db            *DB
-    pendingWrites map[string]*LogRecord
-    options       BatchOptions
-    mu            sync.RWMutex
-    committed     bool
-    batchID       *snowflake.Node
-    locked        bool
+	db            *DB
+	pendingWrites map[string]*LogRecord
+	options       BatchOptions
+	mu            sync.RWMutex
+	committed     bool
+	batchID       *snowflake.Node
+	locked        bool
 }
 
 // NewBatch 创建一个新的 Batch 实例。
@@ -80,24 +80,24 @@ func (b *Batch) reset() {
 }
 
 func (b *Batch) lock() {
-    if b.options.ReadOnly {
-        b.db.mu.RLock()
-    } else {
-        b.db.mu.Lock()
-    }
-    b.locked = true
+	if b.options.ReadOnly {
+		b.db.mu.RLock()
+	} else {
+		b.db.mu.Lock()
+	}
+	b.locked = true
 }
 
 func (b *Batch) unlock() {
-    if !b.locked {
-        return
-    }
-    b.locked = false
-    if b.options.ReadOnly {
-        b.db.mu.RUnlock()
-    } else {
-        b.db.mu.Unlock()
-    }
+	if !b.locked {
+		return
+	}
+	b.locked = false
+	if b.options.ReadOnly {
+		b.db.mu.RUnlock()
+	} else {
+		b.db.mu.Unlock()
+	}
 }
 
 // Close 释放 Batch 持有的数据库锁
@@ -115,12 +115,18 @@ func (b *Batch) Put(key []byte, value []byte) error {
 		return ErrReadOnlyBatch
 	}
 
+	recordType := LogRecordNormal
+	if value != nil && len(value) == 0 {
+		// 用独立类型区分“键存在但值为空”和“键不存在”；nil 保持旧语义（不可读）
+		recordType = LogRecordNormalEmpty
+	}
+
 	b.mu.Lock()
 	// 写入 pendingWrites
 	b.pendingWrites[string(key)] = &LogRecord{
 		Key:   key,
 		Value: value,
-		Type:  LogRecordNormal,
+		Type:  recordType,
 	}
 	b.mu.Unlock()
 
@@ -140,12 +146,18 @@ func (b *Batch) Get(key []byte) ([]byte, error) {
 	if b.pendingWrites != nil {
 		b.mu.RLock()
 		if record := b.pendingWrites[string(key)]; record != nil {
-			if record.Type == LogRecordDeleted {
-				b.mu.RUnlock()
-				return nil, ErrKeyNotFound
-			}
 			b.mu.RUnlock()
-			return record.Value, nil
+			switch record.Type {
+			case LogRecordDeleted:
+				return nil, ErrKeyNotFound
+			case LogRecordNormalEmpty:
+				return []byte{}, nil
+			default:
+				if record.Value == nil {
+					return nil, ErrKeyNotFound
+				}
+				return record.Value, nil
+			}
 		}
 		b.mu.RUnlock()
 	}
@@ -153,9 +165,12 @@ func (b *Batch) Get(key []byte) ([]byte, error) {
 	// 从内存表获取
 	tables := b.db.getMemTables()
 	for _, table := range tables {
-		deleted, value := table.get(key)
+		deleted, empty, value := table.getWithState(key)
 		if deleted {
 			return nil, ErrKeyNotFound
+		}
+		if empty {
+			return []byte{}, nil
 		}
 		if len(value) != 0 {
 			return value, nil
@@ -234,7 +249,13 @@ func (b *Batch) Exist(key []byte) (bool, error) {
 		b.mu.RLock()
 		if record := b.pendingWrites[string(key)]; record != nil {
 			b.mu.RUnlock()
-			return record.Type != LogRecordDeleted, nil
+			if record.Type == LogRecordDeleted {
+				return false, nil
+			}
+			if record.Type == LogRecordNormal && record.Value == nil {
+				return false, nil
+			}
+			return true, nil
 		}
 		b.mu.RUnlock()
 	}
@@ -242,11 +263,11 @@ func (b *Batch) Exist(key []byte) (bool, error) {
 	// 从内存表获取
 	tables := b.db.getMemTables()
 	for _, table := range tables {
-		deleted, value := table.get(key)
+		deleted, empty, value := table.getWithState(key)
 		if deleted {
 			return false, nil
 		}
-		if len(value) != 0 {
+		if empty || len(value) != 0 {
 			return true, nil
 		}
 	}

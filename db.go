@@ -10,7 +10,6 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"reflect"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -44,8 +43,11 @@ type DB struct {
 	compactChan      chan discardState   // 用于通知需要压缩的分片
 	mu               sync.RWMutex
 	closed           bool
-	closeflushChan   chan struct{} // 用于优雅地关闭刷新监听协程
-	closeCompactChan chan struct{} // 用于优雅地关闭自动压缩监听协程
+	closeOnce        sync.Once
+	closeErr         error
+	bgWG             sync.WaitGroup // 自动压缩/IO 监控协程
+	closeflushChan   chan struct{}  // 用于优雅地关闭刷新监听协程
+	closeCompactChan chan struct{}  // 用于优雅地关闭自动压缩监听协程
 	options          Options
 	batchPool        sync.Pool // 批处理池，用于减少内存分配开销
 }
@@ -80,6 +82,12 @@ func Open(options Options) (*DB, error) {
 	if !hold {
 		return nil, ErrDatabaseIsUsing
 	}
+	opened := false
+	defer func() {
+		if !opened {
+			_ = fileLock.Unlock()
+		}
+	}()
 
 	// 如果不存在则创建废弃元数据文件，读取废弃数量
 	discardMetaPath := filepath.Join(options.DirPath, discardMetaName)
@@ -151,11 +159,18 @@ func Open(options Options) (*DB, error) {
 		bloomManager:     bloomManager,
 		fileLock:         fileLock,
 		flushChan:        make(chan *memtable, options.MemtableNums-1),
+		compactChan:      make(chan discardState, 1),
 		closeflushChan:   make(chan struct{}),
 		closeCompactChan: make(chan struct{}),
 		diskIO:           diskIO,
 		options:          options,
 		batchPool:        sync.Pool{New: makeBatch},
+	}
+
+	// 重建布隆过滤器：不能相信可能过期的 .BLOOM 文件，否则会产生假阴性
+	if err := db.rebuildBloomFilters(); err != nil {
+		// 失败时保持未就绪，TestKey 会返回 true，保证正确性
+		log.Printf("rebuild bloom filters failed: %v", err)
 	}
 
 	// 如果在打开数据库时有一些不可变内存表，将它们刷新到磁盘
@@ -172,22 +187,91 @@ func Open(options Options) (*DB, error) {
 	if options.AutoCompactSupport {
 		// 异步启动自动压缩协程，
 		// 监听废弃表状态，并自动压缩。
-		go db.listenAutoCompact()
+		db.bgWG.Add(1)
+		go func() {
+			defer db.bgWG.Done()
+			db.listenAutoCompact()
+		}()
 
 		// 启动磁盘IO监控，
 		// 在繁忙时阻塞低阈值压缩操作。
 		if options.EnableDiskIO {
-			go db.listenDiskIOState()
+			db.bgWG.Add(1)
+			go func() {
+				defer db.bgWG.Done()
+				db.listenDiskIOState()
+			}()
 		}
 	}
 
+	opened = true
 	return db, nil
+}
+
+// rebuildBloomFilters 从索引/ValueLog 重建布隆过滤器。
+func (db *DB) rebuildBloomFilters() error {
+	if db.bloomManager == nil {
+		return nil
+	}
+	db.bloomManager.ClearAll()
+
+	switch idx := db.index.(type) {
+	case *BPTree:
+		if err := idx.forEachKey(func(key []byte) error {
+			db.bloomManager.AddKey(key)
+			return nil
+		}); err != nil {
+			return err
+		}
+	case *HashTable:
+		// 哈希索引没有有序游标；扫描 ValueLog 中所有 key 更保守（可能多，但不会漏）。
+		for _, walFile := range db.vlog.walFiles {
+			reader := walFile.NewReader()
+			for {
+				chunk, _, err := reader.Next()
+				if err != nil {
+					if errors.Is(err, io.EOF) {
+						break
+					}
+					return err
+				}
+				record := decodeValueLogRecord(chunk)
+				if record != nil {
+					db.bloomManager.AddKey(record.key)
+				}
+			}
+		}
+	default:
+		return fmt.Errorf("unsupported index type for bloom rebuild")
+	}
+
+	db.bloomManager.MarkReady()
+	return nil
 }
 
 // Close 关闭数据库，关闭所有数据文件并释放文件锁。
 // 将closed标志设置为true。
 // 关闭后不能再使用DB实例。
 func (db *DB) Close() error {
+	db.closeOnce.Do(func() {
+		db.closeErr = db.closeInternal()
+	})
+	return db.closeErr
+}
+
+func (db *DB) closeInternal() error {
+	// 无论中途哪个资源关闭失败，都必须释放文件锁，否则同目录无法再次打开。
+	defer func() {
+		if db.fileLock != nil {
+			_ = db.fileLock.Unlock()
+		}
+		db.closed = true
+	}()
+
+	// 先停止自动压缩/IO 监控，避免关闭文件时它们还在使用
+	close(db.closeCompactChan)
+	db.bgWG.Wait()
+
 	select {
 	case _, ok := <-db.flushChan:
 		if !ok {
@@ -240,12 +324,6 @@ func (db *DB) Close() error {
 	if err = db.vlog.close(); err != nil {
 		return err
 	}
-	// 释放文件锁
-	if err = db.fileLock.Unlock(); err != nil {
-		return err
-	}
-
-	db.closed = true
 	return nil
 }
 
@@ -475,6 +553,29 @@ func (db *DB) flushMemtable(table *memtable) {
 		return
 	}
 
+	// Hash 索引的 PutBatch 不返回旧位置，需要先回查（MatchKeyFunc 会顺带读出旧 UUID）。
+	var hashOldPositions []*KeyPosition
+	if db.options.IndexType == Hash {
+		for _, kp := range keyPos {
+			old, err := db.currentKeyPosition(kp.key)
+			if err != nil {
+				log.Println("lookup old key position failed:", err)
+				continue
+			}
+			if old != nil {
+				hashOldPositions = append(hashOldPositions, old)
+			}
+		}
+	}
+
+	// 先加布隆，再写索引：避免“索引已可见、布隆还没加”期间读到假阴性。
+	// 如果索引写失败，布隆最多多几个 key（假阳性），不会漏 key。
+	if db.bloomManager != nil {
+		for _, kp := range keyPos {
+			db.bloomManager.AddKey(kp.key)
+		}
+	}
+
 	// 将所有键和位置写入索引。
 	var putMatchKeys []diskhash.MatchKeyFunc
 	if db.options.IndexType == Hash && len(keyPos) > 0 {
@@ -484,26 +585,33 @@ func (db *DB) flushMemtable(table *memtable) {
 		}
 	}
 
-	// 将所有键和位置写入索引。
 	oldKeyPostions, err := db.index.PutBatch(keyPos, putMatchKeys...)
 	if err != nil {
 		log.Println("index PutBatch failed:", err)
 		return
 	}
+	oldKeyPostions = append(oldKeyPostions, hashOldPositions...)
 
-	// 将键添加到布隆过滤器
-	if db.bloomManager != nil {
-		for _, kp := range keyPos {
-			db.bloomManager.AddKey(kp.key)
-		}
-	}
-
-	// 将旧键uuid添加到废弃表中
+	// 将旧键 uuid 加入废弃表（覆盖写的旧版本）。
 	for _, oldKeyPostion := range oldKeyPostions {
 		db.vlog.setDiscard(oldKeyPostion.partition, oldKeyPostion.uid)
 	}
 
-	// 将已删除键uuid添加到废弃表中，并从索引中删除已删除的键。
+	// 删除键：先查旧位置（Hash 索引不会返回），再删索引，最后把旧 uuid 加入废弃表。
+	var hashDeletePositions []*KeyPosition
+	if db.options.IndexType == Hash {
+		for _, key := range deletedKeys {
+			old, err := db.currentKeyPosition(key)
+			if err != nil {
+				log.Println("lookup deleted key position failed:", err)
+				continue
+			}
+			if old != nil {
+				hashDeletePositions = append(hashDeletePositions, old)
+			}
+		}
+	}
+
 	var deleteMatchKeys []diskhash.MatchKeyFunc
 	if db.options.IndexType == Hash && len(deletedKeys) > 0 {
 		deleteMatchKeys = make([]diskhash.MatchKeyFunc, len(deletedKeys))
@@ -512,10 +620,15 @@ func (db *DB) flushMemtable(table *memtable) {
 		}
 	}
 
-	// 从索引中删除已删除的键
 	if oldKeyPostions, err = db.index.DeleteBatch(deletedKeys, deleteMatchKeys...); err != nil {
 		log.Println("index DeleteBatch failed:", err)
 		return
+	}
+	oldKeyPostions = append(oldKeyPostions, hashDeletePositions...)
+
+	// 删除的 key 也必须进入废弃表，否则增量压缩会把它当有效记录重新插回索引。
+	for _, oldKeyPostion := range oldKeyPostions {
+		db.vlog.setDiscard(oldKeyPostion.partition, oldKeyPostion.uid)
 	}
 
 	// 同步索引
@@ -550,6 +663,17 @@ func (db *DB) flushMemtable(table *memtable) {
 		}
 	}
 	db.sendThresholdState()
+}
+
+// currentKeyPosition 返回 key 当前在索引中的位置。
+// Hash 索引的 Get 通过 MatchKeyFunc 回表，顺带把旧 UUID 填进 KeyPosition。
+func (db *DB) currentKeyPosition(key []byte) (*KeyPosition, error) {
+	if db.options.IndexType == Hash {
+		var keyPos *KeyPosition
+		_, err := db.index.Get(key, MatchKeyFunc(db, key, &keyPos, nil))
+		return keyPos, err
+	}
+	return db.index.Get(key)
 }
 
 func (db *DB) sendThresholdState() {
@@ -612,12 +736,12 @@ func (db *DB) listenAutoCompact() {
 	for {
 		select {
 		case state, ok := <-db.compactChan:
-			if ok {
-				thresholdstate = state.thresholdState
-			} else {
-				db.closeCompactChan <- struct{}{}
+			if !ok {
 				return
 			}
+			thresholdstate = state.thresholdState
+		case <-db.closeCompactChan:
+			return
 		case <-sig:
 			return
 		case <-ticker.C:
@@ -690,13 +814,26 @@ func (db *DB) listenDiskIOState() {
 		select {
 		case <-sig:
 			return
+		case <-db.closeCompactChan:
+			return
 		default:
-			err := db.diskIO.Monitor()
-			if err != nil {
-				panic(err)
+			if err := db.diskIO.Monitor(); err != nil {
+				log.Printf("disk io monitor stopped: %v", err)
+				return
 			}
 		}
 	}
+}
+
+// sameChunkPosition 只比较定位所需字段。
+// 迭代器给出的 ChunkSize 是估算值（可能包含 padding），不能用于判断记录是否仍是当前版本。
+func sameChunkPosition(a, b *wal.ChunkPosition) bool {
+	if a == nil || b == nil {
+		return false
+	}
+	return a.SegmentId == b.SegmentId &&
+		a.BlockNumber == b.BlockNumber &&
+		a.ChunkOffset == b.ChunkOffset
 }
 
 // Compact 会遍历vlog中的所有值，并将有效值写入新的vlog文件。
@@ -708,19 +845,22 @@ func (db *DB) Compact() error {
 	defer db.flushLock.Unlock()
 
 	log.Println("[Compact data]")
-	openVlogFile := func(part int, ext string) *wal.WAL {
+	openVlogFile := func(part int, ext string, initialID uint32) (*wal.WAL, error) {
 		walFile, err := wal.Open(wal.Options{
-			DirPath:        db.vlog.options.dirPath,
-			SegmentSize:    db.vlog.options.segmentSize,
-			SegmentFileExt: fmt.Sprintf(ext, part),
-			Sync:           false, // 我们会手动同步
-			BytesPerSync:   0,     // 与Sync相同
+			DirPath:          db.vlog.options.dirPath,
+			SegmentSize:      db.vlog.options.segmentSize,
+			SegmentFileExt:   fmt.Sprintf(ext, part),
+			InitialSegmentID: wal.SegmentID(initialID),
+			Sync:             false, // 我们会手动同步
+			BytesPerSync:     0,     // 与Sync相同
 		})
 		if err != nil {
-			_ = walFile.Delete()
-			panic(err)
+			if walFile != nil {
+				_ = walFile.Delete()
+			}
+			return nil, err
 		}
-		return walFile
+		return walFile, nil
 	}
 
 	g, _ := errgroup.WithContext(context.Background())
@@ -729,7 +869,15 @@ func (db *DB) Compact() error {
 	for i := 0; i < int(db.vlog.options.partitionNum); i++ {
 		part := i
 		g.Go(func() error {
-			newVlogFile := openVlogFile(part, tempValueLogFileExt)
+			// 新段使用比旧段更大的 ID，避免压缩过程中新旧段文件名冲突。
+			newID := db.vlog.walFiles[part].ActiveSegmentID() + 1
+			newVlogFile, err := openVlogFile(part, tempValueLogFileExt, uint32(newID))
+			if err != nil {
+				return err
+			}
+			// 索引可能在新文件 rename 之前就指向新段，先让读路径能找到它。
+			db.vlog.addReadableWAL(part, newVlogFile)
+			defer db.vlog.removeReadableWAL(part, newVlogFile)
 			validRecords := make([]*ValueLogRecord, 0)
 			reader := db.vlog.walFiles[part].NewReader() // 遍历wal中的所有记录，找到有效记录
 			for {
@@ -745,6 +893,9 @@ func (db *DB) Compact() error {
 				}
 
 				record := decodeValueLogRecord(chunk)
+				if record == nil {
+					continue
+				}
 				var hashTableKeyPos *KeyPosition
 				var matchKey func(diskhash.Slot) (bool, error)
 				if db.options.IndexType == Hash {
@@ -763,7 +914,7 @@ func (db *DB) Compact() error {
 				if keyPos == nil {
 					continue
 				}
-				if keyPos.partition == uint32(part) && reflect.DeepEqual(keyPos.position, pos) {
+				if keyPos.partition == uint32(part) && sameChunkPosition(keyPos.position, pos) {
 					validRecords = append(validRecords, record)
 				}
 
@@ -787,22 +938,37 @@ func (db *DB) Compact() error {
 				}
 			}
 
-			// 用新文件替换wal。
-			_ = db.vlog.walFiles[part].Delete()
+			// 用新文件替换 wal。读者在 Get 期间持有 db.mu.RLock，这里用写锁切换，
+			// 避免读者拿到旧指针后文件已被删除。
+			db.mu.Lock()
+			// 先关闭新文件句柄并 rename；旧段仍保持打开，rename 不会覆盖旧段名。
 			_ = newVlogFile.Close()
 			if err := newVlogFile.RenameFileExt(fmt.Sprintf(valueLogFileExt, part)); err != nil {
+				db.mu.Unlock()
 				return err
 			}
-			db.vlog.walFiles[part] = openVlogFile(part, valueLogFileExt)
-
-			// 压缩后清理dpTable
+			reopened, err := openVlogFile(part, valueLogFileExt, 1)
+			if err != nil {
+				db.mu.Unlock()
+				return err
+			}
+			// reopened 同时打开旧段和新段；此时再关闭旧 WAL，并删除旧段。
+			if oldWal := db.vlog.walFiles[part]; oldWal != nil {
+				_ = oldWal.Close()
+			}
+			_ = reopened.DeleteSegmentsBelow(wal.SegmentID(newID))
+			db.vlog.walFiles[part] = reopened
 			db.vlog.dpTables[part].clean()
+			db.mu.Unlock()
 
 			return nil
 		})
 	}
+	err := g.Wait()
+	db.mu.Lock()
 	db.vlog.cleanDiscardTable()
-	return g.Wait()
+	db.mu.Unlock()
+	return err
 }
 
 // CompactWithDiscardtable 会遍历vlog中的所有值，通过discardtable查找旧值，
@@ -815,19 +981,22 @@ func (db *DB) CompactWithDiscardtable() error {
 	defer db.flushLock.Unlock()
 
 	log.Println("[CompactWithDiscardtable data]")
-	openVlogFile := func(part int, ext string) *wal.WAL {
+	openVlogFile := func(part int, ext string, initialID uint32) (*wal.WAL, error) {
 		walFile, err := wal.Open(wal.Options{
-			DirPath:        db.vlog.options.dirPath,
-			SegmentSize:    db.vlog.options.segmentSize,
-			SegmentFileExt: fmt.Sprintf(ext, part),
-			Sync:           false, // 我们会手动同步
-			BytesPerSync:   0,     // 与Sync相同
+			DirPath:          db.vlog.options.dirPath,
+			SegmentSize:      db.vlog.options.segmentSize,
+			SegmentFileExt:   fmt.Sprintf(ext, part),
+			InitialSegmentID: wal.SegmentID(initialID),
+			Sync:             false, // 我们会手动同步
+			BytesPerSync:     0,     // 与Sync相同
 		})
 		if err != nil {
-			_ = walFile.Delete()
-			panic(err)
+			if walFile != nil {
+				_ = walFile.Delete()
+			}
+			return nil, err
 		}
-		return walFile
+		return walFile, nil
 	}
 
 	g, _ := errgroup.WithContext(context.Background())
@@ -836,7 +1005,15 @@ func (db *DB) CompactWithDiscardtable() error {
 	for i := 0; i < int(db.vlog.options.partitionNum); i++ {
 		part := i
 		g.Go(func() error {
-			newVlogFile := openVlogFile(part, tempValueLogFileExt)
+			// 新段使用比旧段更大的 ID，避免压缩过程中新旧段文件名冲突。
+			newID := db.vlog.walFiles[part].ActiveSegmentID() + 1
+			newVlogFile, err := openVlogFile(part, tempValueLogFileExt, uint32(newID))
+			if err != nil {
+				return err
+			}
+			// 索引可能在新文件 rename 之前就指向新段，先让读路径能找到它。
+			db.vlog.addReadableWAL(part, newVlogFile)
+			defer db.vlog.removeReadableWAL(part, newVlogFile)
 			validRecords := make([]*ValueLogRecord, 0)
 			reader := db.vlog.walFiles[part].NewReader()
 			// 遍历wal中的所有记录，找到有效记录
@@ -853,29 +1030,33 @@ func (db *DB) CompactWithDiscardtable() error {
 				}
 
 				record := decodeValueLogRecord(chunk)
-				if !db.vlog.isDiscard(part, record.uid) {
-					// 在dptable中未找到旧uuid，加入有效记录。
-					validRecords = append(validRecords, record)
+				if record == nil {
+					continue
 				}
-				if db.options.IndexType == Hash {
-					var hashTableKeyPos *KeyPosition
-					// var matchKey func(diskhash.Slot) (bool, error)
-					matchKey := MatchKeyFunc(db, record.key, &hashTableKeyPos, nil)
+
+				// 废弃表命中时可以直接跳过；未命中时仍要回查索引，
+				// 因为废弃表可能在重启/崩溃后不完整。索引不存在或位置不匹配的记录一律丢弃，
+				// 这样增量压缩也不会把已删除的 key 重新插回索引。
+				if !db.vlog.isDiscard(part, record.uid) {
 					var keyPos *KeyPosition
-					keyPos, err = db.index.Get(record.key, matchKey)
-					if err != nil {
-						_ = newVlogFile.Delete()
-						return err
-					}
-
 					if db.options.IndexType == Hash {
+						var hashTableKeyPos *KeyPosition
+						matchKey := MatchKeyFunc(db, record.key, &hashTableKeyPos, nil)
+						if _, err = db.index.Get(record.key, matchKey); err != nil {
+							_ = newVlogFile.Delete()
+							return err
+						}
 						keyPos = hashTableKeyPos
+					} else {
+						keyPos, err = db.index.Get(record.key)
+						if err != nil {
+							_ = newVlogFile.Delete()
+							return err
+						}
 					}
 
-					if keyPos == nil {
-						continue
-					}
-					if keyPos.partition == uint32(part) && reflect.DeepEqual(keyPos.position, pos) {
+					if keyPos != nil && keyPos.partition == uint32(part) &&
+						sameChunkPosition(keyPos.position, pos) {
 						validRecords = append(validRecords, record)
 					}
 				}
@@ -899,19 +1080,35 @@ func (db *DB) CompactWithDiscardtable() error {
 				}
 			}
 
-			// 用新文件替换wal。
-			_ = db.vlog.walFiles[part].Delete()
+			// 同 Compact：切换文件指针时持有写锁，避免并发读者读到已删除的旧文件。
+			db.mu.Lock()
+			// 先关闭新文件句柄并 rename；旧段仍保持打开，rename 不会覆盖旧段名。
 			_ = newVlogFile.Close()
 			if err := newVlogFile.RenameFileExt(fmt.Sprintf(valueLogFileExt, part)); err != nil {
+				db.mu.Unlock()
 				return err
 			}
-			db.vlog.walFiles[part] = openVlogFile(part, valueLogFileExt)
+			reopened, err := openVlogFile(part, valueLogFileExt, 1)
+			if err != nil {
+				db.mu.Unlock()
+				return err
+			}
+			// reopened 同时打开旧段和新段；此时再关闭旧 WAL，并删除旧段。
+			if oldWal := db.vlog.walFiles[part]; oldWal != nil {
+				_ = oldWal.Close()
+			}
+			_ = reopened.DeleteSegmentsBelow(wal.SegmentID(newID))
+			db.vlog.walFiles[part] = reopened
+			db.vlog.dpTables[part].clean()
+			db.mu.Unlock()
 			return nil
 		})
 	}
 
 	err := g.Wait()
+	db.mu.Lock()
 	db.vlog.cleanDiscardTable()
+	db.mu.Unlock()
 	return err
 }
 
@@ -971,6 +1168,7 @@ func loadDiscardEntryMeta(discardMetaPath string) (uint32, uint32, error) {
 		if err != nil {
 			return discardNumber, totalEntryNumber, err
 		}
+		defer file.Close()
 
 		// 将文件指针设置为0
 		_, err = file.Seek(0, 0)
@@ -999,6 +1197,7 @@ func storeDiscardEntryMeta(discardMetaPath string, discardNumber uint32, totalNu
 	if err != nil {
 		return err
 	}
+	defer file.Close()
 
 	// 将文件指针设置为0并覆盖
 	_, err = file.Seek(0, 0)
@@ -1017,6 +1216,5 @@ func storeDiscardEntryMeta(discardMetaPath string, discardNumber uint32, totalNu
 	if err != nil {
 		return err
 	}
-	file.Close()
 	return nil
 }

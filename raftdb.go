@@ -229,6 +229,7 @@ func (rdb *RaftDB) Put(key, value []byte) error {
 		// 等待操作完成
 		res := <-rs.ResultC()
 		if res.Completed() {
+			rs.Release()
 			return nil
 		}
 
@@ -278,6 +279,7 @@ func (rdb *RaftDB) Delete(key []byte) error {
 		// 等待操作完成
 		res := <-rs.ResultC()
 		if res.Completed() {
+			rs.Release()
 			return nil
 		}
 
@@ -396,6 +398,7 @@ func (rdb *RaftDB) BatchWrite(commands []Command, batchID uint64) error {
 		// 等待操作完成
 		res := <-rs.ResultC()
 		if res.Completed() {
+			rs.Release()
 			return nil
 		}
 
@@ -466,16 +469,22 @@ func (rdb *RaftDB) GetClusterMembership() (map[uint64]string, error) {
 
 // AddNode 向集群添加新节点
 func (rdb *RaftDB) AddNode(nodeID uint64, address string) error {
-	rdb.mu.Lock()
-	defer rdb.mu.Unlock()
-
-	if rdb.nodeHost == nil || !rdb.state {
+	// 先在不持有写锁的情况下判断状态和 Leader，避免 Lock 后调用 IsLeader 造成重入死锁
+	rdb.mu.RLock()
+	started := rdb.nodeHost != nil && rdb.state
+	leader := rdb.leaderID == rdb.config.NodeID
+	rdb.mu.RUnlock()
+	if !started {
 		return ErrNodeNotStarted
 	}
-
-	// 检查是否是Leader
-	if !rdb.IsLeader() {
+	if !leader {
 		return ErrNotLeader
+	}
+
+	rdb.mu.Lock()
+	defer rdb.mu.Unlock()
+	if rdb.nodeHost == nil || !rdb.state {
+		return ErrNodeNotStarted
 	}
 
 	// 根据Sync字段决定使用同步还是异步模式
@@ -494,6 +503,7 @@ func (rdb *RaftDB) AddNode(nodeID uint64, address string) error {
 		// 等待操作完成
 		res := <-rs.ResultC()
 		if res.Completed() {
+			rs.Release()
 			return nil
 		}
 
@@ -511,16 +521,21 @@ func (rdb *RaftDB) AddNode(nodeID uint64, address string) error {
 
 // RemoveNode 从集群移除节点
 func (rdb *RaftDB) RemoveNode(nodeID uint64) error {
-	rdb.mu.Lock()
-	defer rdb.mu.Unlock()
-
-	if rdb.nodeHost == nil || !rdb.state {
+	rdb.mu.RLock()
+	started := rdb.nodeHost != nil && rdb.state
+	leader := rdb.leaderID == rdb.config.NodeID
+	rdb.mu.RUnlock()
+	if !started {
 		return ErrNodeNotStarted
 	}
-
-	// 检查是否是Leader
-	if !rdb.IsLeader() {
+	if !leader {
 		return ErrNotLeader
+	}
+
+	rdb.mu.Lock()
+	defer rdb.mu.Unlock()
+	if rdb.nodeHost == nil || !rdb.state {
+		return ErrNodeNotStarted
 	}
 
 	// 根据Sync字段决定使用同步还是异步模式
@@ -539,6 +554,7 @@ func (rdb *RaftDB) RemoveNode(nodeID uint64) error {
 		// 等待操作完成
 		res := <-rs.ResultC()
 		if res.Completed() {
+			rs.Release()
 			return nil
 		}
 

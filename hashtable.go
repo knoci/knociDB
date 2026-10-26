@@ -184,6 +184,7 @@ func MatchKeyFunc(db *DB, key []byte, keyPos **KeyPosition, value *[]byte) func(
 		if !bytes.Equal(valueLogRecord.key, key) {
 			return false, nil
 		}
+		checkKeyPos.uid = valueLogRecord.uid
 		if keyPos != nil {
 			*keyPos = checkKeyPos
 		}

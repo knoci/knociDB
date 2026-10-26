@@ -177,19 +177,15 @@ func (db *DB) ExportSnapshot() error {
 			}
 			return fmt.Errorf("Failed to write file size: %v", err)
 		}
-		_, err = io.Copy(encoder, in)
-		// 更新CRC计算对象
-		_, err = crc.Write(nameBytes)
-		if err != nil {
+		// CRC 覆盖 name + size + content；用 TeeReader 把内容同时写入快照和 CRC。
+		if _, err = crc.Write(nameBytes); err != nil {
 			return fmt.Errorf("Failed to calculate CRC for file: %v", err)
 		}
-		_, err = crc.Write([]byte(fmt.Sprintf("%d", fileSize)))
-		if err != nil {
+		if _, err = crc.Write([]byte(fmt.Sprintf("%d", fileSize))); err != nil {
 			return fmt.Errorf("Failed to calculate CRC for file: %v", err)
 		}
-		_, err = io.Copy(crc, in)
-		if err != nil {
-			return fmt.Errorf("Failed to calculate CRC for file: %v", err)
+		if _, err = io.Copy(encoder, io.TeeReader(in, crc)); err != nil {
+			return fmt.Errorf("Failed to copy file to snapshot: %v", err)
 		}
 		err = in.Close()
 		if err != nil {
@@ -199,6 +195,15 @@ func (db *DB) ExportSnapshot() error {
 			}
 			return fmt.Errorf("Failed to copy file to snapshot: %v", err)
 		}
+	}
+
+	// 写结束标记（-1），不再依赖“nameLen > 255”来识别 CRC。
+	if err = writeInt32(encoder, -1); err != nil {
+		inner_err := os.RemoveAll(tmpCopyDir)
+		if inner_err != nil {
+			return fmt.Errorf("Unexpected error occur: %v", inner_err)
+		}
+		return fmt.Errorf("Failed to write snapshot end marker: %v", err)
 	}
 
 	// 计算CRC校验位
@@ -225,6 +230,25 @@ func (db *DB) ExportSnapshot() error {
 	log.Printf("Snapshot exported: %s", snapFile)
 	db.cleanupSnapshots(snapDir)
 	return nil
+}
+
+// latestSnapshotFile 返回快照目录中文件名最大的 .ZST 文件。
+func latestSnapshotFile(snapDir string) (string, error) {
+	files, err := os.ReadDir(snapDir)
+	if err != nil {
+		return "", err
+	}
+	var names []string
+	for _, f := range files {
+		if !f.IsDir() && strings.HasSuffix(f.Name(), snapshotExt) {
+			names = append(names, f.Name())
+		}
+	}
+	if len(names) == 0 {
+		return "", fmt.Errorf("no snapshot file in %s", snapDir)
+	}
+	sort.Strings(names)
+	return filepath.Join(snapDir, names[len(names)-1]), nil
 }
 
 // cleanupSnapshots 清理过期和多余的快照
@@ -317,9 +341,11 @@ func (db *DB) ImportSnapshot(snapPath string) error {
 			}
 			return fmt.Errorf("Failed to read file name length: %v", err)
 		}
-		if nameLen > 255 {
-			expectedCRC = uint32(nameLen)
-			break
+		if nameLen == -1 {
+			break // 结束标记
+		}
+		if nameLen < 0 {
+			return fmt.Errorf("invalid snapshot file name length: %d", nameLen)
 		}
 
 		// 读取文件名
@@ -334,6 +360,9 @@ func (db *DB) ImportSnapshot(snapPath string) error {
 		if err != nil {
 			return fmt.Errorf("Failed to read file size: %v", err)
 		}
+		if fileSize < 0 {
+			return fmt.Errorf("invalid snapshot file size: %d", fileSize)
+		}
 
 		// 创建目标文件
 		filePath := filepath.Join(tmpDir, fileName)
@@ -341,30 +370,32 @@ func (db *DB) ImportSnapshot(snapPath string) error {
 		if err != nil {
 			return fmt.Errorf("Failed to create file: %v", err)
 		}
-		defer out.Close()
 
-		// 复制文件内容
-		_, err = io.CopyN(out, decoder, fileSize)
-		if err != nil {
+		// CRC 同样覆盖 name + size + content
+		if _, err = crc.Write(nameBytes); err != nil {
+			_ = out.Close()
+			return fmt.Errorf("Failed to calculate CRC for file: %v", err)
+		}
+		if _, err = crc.Write([]byte(fmt.Sprintf("%d", fileSize))); err != nil {
+			_ = out.Close()
+			return fmt.Errorf("Failed to calculate CRC for file: %v", err)
+		}
+		if _, err = io.CopyN(out, io.TeeReader(decoder, crc), fileSize); err != nil {
+			_ = out.Close()
 			return fmt.Errorf("Failed to copy file content: %v", err)
 		}
-
-		// 更新CRC计算对象
-		_, err = crc.Write(nameBytes)
-		if err != nil {
-			return fmt.Errorf("Failed to calculate CRC for file: %v", err)
-		}
-		_, err = crc.Write([]byte(fmt.Sprintf("%d", fileSize)))
-		if err != nil {
-			return fmt.Errorf("Failed to calculate CRC for file: %v", err)
-		}
-		_, err = io.Copy(crc, out)
-		if err != nil {
-			return fmt.Errorf("Failed to calculate CRC for file: %v", err)
+		if err = out.Close(); err != nil {
+			return fmt.Errorf("Failed to close file: %v", err)
 		}
 	}
 
 	// 读取并验证CRC校验位
+	crcBytes := make([]byte, 4)
+	if _, err := io.ReadFull(decoder, crcBytes); err != nil {
+		return fmt.Errorf("Failed to read CRC value: %v", err)
+	}
+	expectedCRC = binary.LittleEndian.Uint32(crcBytes)
+
 	actualCRC := crc.Sum32()
 	if actualCRC != expectedCRC {
 		return fmt.Errorf("CRC check failed: expected %v, got %v", expectedCRC, actualCRC)

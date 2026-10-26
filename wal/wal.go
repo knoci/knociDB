@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -112,15 +113,19 @@ func Open(options Options) (*WAL, error) {
 		return nil, err
 	}
 
-	// 获取所有段文件 ID
+	// 获取所有段文件 ID。必须精确匹配后缀，避免把 xxx.VLOG.0.temp 当成正式段文件。
 	var segmentIDs []int
 	for _, entry := range entries {
 		if entry.IsDir() {
 			continue
 		}
-		var id int
-		_, err := fmt.Sscanf(entry.Name(), "%d"+options.SegmentFileExt, &id)
-		if err != nil {
+		name := entry.Name()
+		if !strings.HasSuffix(name, options.SegmentFileExt) {
+			continue
+		}
+		idStr := strings.TrimSuffix(name, options.SegmentFileExt)
+		id, err := strconv.Atoi(idStr)
+		if err != nil || id < 0 {
 			continue
 		}
 		segmentIDs = append(segmentIDs, id)
@@ -128,7 +133,11 @@ func Open(options Options) (*WAL, error) {
 
 	// 空目录，仅初始化一个新的段文件
 	if len(segmentIDs) == 0 {
-		segment, err := openSegmentFile(options.DirPath, options.SegmentFileExt, initialSegmentFileID)
+		initialID := options.InitialSegmentID
+		if initialID == 0 {
+			initialID = initialSegmentFileID
+		}
+		segment, err := openSegmentFile(options.DirPath, options.SegmentFileExt, initialID)
 		if err != nil {
 			return nil, err
 		}
@@ -149,6 +158,12 @@ func Open(options Options) (*WAL, error) {
 				wal.olderSegments[segment.id] = segment
 			}
 		}
+	}
+
+	// 修复崩溃时写到一半的尾部记录：只需要扫描最后一个（active）段。
+	// 旧段在轮转前已经 Sync，正常情况下尾部是完整的；全量扫描会让 1GB vlog 启动变慢。
+	if err := wal.activeSegment.recoverTail(); err != nil {
+		return nil, err
 	}
 
 	// 仅当 SyncInterval 大于 0 时启动同步操作
@@ -524,6 +539,24 @@ func (wal *WAL) Close() error {
 	}
 	// 关闭活跃段。
 	return wal.activeSegment.Close()
+}
+
+// DeleteSegmentsBelow 删除所有 ID 小于 id 的旧段文件。
+// 压缩写入新段后，索引已经指向新段，可以把旧段清掉；崩溃时旧段仍可被读取。
+func (wal *WAL) DeleteSegmentsBelow(id SegmentID) error {
+	wal.mu.Lock()
+	defer wal.mu.Unlock()
+
+	for segID, segment := range wal.olderSegments {
+		if segID >= id {
+			continue
+		}
+		if err := segment.Remove(); err != nil {
+			return err
+		}
+		delete(wal.olderSegments, segID)
+	}
+	return nil
 }
 
 // Delete 删除 WAL 的所有段文件。

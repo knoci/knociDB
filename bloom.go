@@ -33,6 +33,7 @@ type BloomFilter struct {
 	dirty       bool
 	dirtyCount  uint32
 	lastSavedAt time.Time
+	ready       bool // 位数组是否覆盖当前索引中的全部 key
 }
 
 // BloomFilterOptions 布隆过滤器配置选项
@@ -75,6 +76,7 @@ func NewBloomFilter(options BloomFilterOptions, partitionID int) *BloomFilter {
 		dirty:       false,
 		dirtyCount:  0,
 		lastSavedAt: now,
+		ready:       false,
 	}
 }
 
@@ -111,6 +113,7 @@ func LoadBloomFilter(dirPath string, partitionID int) (*BloomFilter, error) {
 		filter: filter,
 		path:   path,
 		size:   size,
+		ready:  true,
 	}, nil
 }
 
@@ -138,6 +141,21 @@ func (bf *BloomFilter) Test(key []byte) bool {
 	}
 
 	return bf.filter.Test(key)
+}
+
+// SetReady 标记过滤器是否已经覆盖当前索引中的全部 key。
+// 未就绪时必须让 TestKey 返回 true，避免假阴性。
+func (bf *BloomFilter) SetReady(ready bool) {
+	bf.mu.Lock()
+	bf.ready = ready
+	bf.mu.Unlock()
+}
+
+// Ready 返回过滤器是否就绪。
+func (bf *BloomFilter) Ready() bool {
+	bf.mu.RLock()
+	defer bf.mu.RUnlock()
+	return bf.ready
 }
 
 // Size 返回过滤器中的元素数量
@@ -223,6 +241,7 @@ func (bf *BloomFilter) Clear() {
 	bf.updatedAt = time.Now()
 	bf.dirty = true
 	bf.dirtyCount++
+	bf.ready = false
 }
 
 // EstimateFalsePositiveRate 估算当前的假阳性率
@@ -465,7 +484,24 @@ func (bfm *BloomFilterManager) AddKey(key []byte) {
 func (bfm *BloomFilterManager) TestKey(key []byte) bool {
 	partitionID := int(bfm.options.keyHashFunction(key) % uint64(bfm.options.PartitionNum))
 	filter := bfm.GetFilter(partitionID)
+	if !filter.Ready() {
+		// 未就绪时宁可多查一次索引，也不能把存在的 key 判为不存在
+		return true
+	}
 	return filter.Test(key)
+}
+
+// MarkReady 标记所有分区过滤器已覆盖当前索引。
+func (bfm *BloomFilterManager) MarkReady() {
+	bfm.mu.RLock()
+	filters := make([]*BloomFilter, 0, len(bfm.filters))
+	for _, f := range bfm.filters {
+		filters = append(filters, f)
+	}
+	bfm.mu.RUnlock()
+	for _, f := range filters {
+		f.SetReady(true)
+	}
 }
 
 // SaveAll 保存所有布隆过滤器

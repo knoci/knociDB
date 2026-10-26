@@ -270,6 +270,24 @@ func (bt *BPTree) Close() error {
 	return nil
 }
 
+// forEachKey 遍历所有分区的索引 key，用于启动时重建布隆过滤器。
+func (bt *BPTree) forEachKey(fn func(key []byte) error) error {
+	for _, tree := range bt.trees {
+		if err := tree.View(func(tx *bbolt.Tx) error {
+			cursor := tx.Bucket(indexBucketName).Cursor()
+			for k, _ := cursor.First(); k != nil; k, _ = cursor.Next() {
+				if err := fn(k); err != nil {
+					return err
+				}
+			}
+			return nil
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // Sync 对数据库文件sync()。
 func (bt *BPTree) Sync() error {
 	for _, tree := range bt.trees {

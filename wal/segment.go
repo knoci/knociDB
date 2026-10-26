@@ -142,6 +142,45 @@ func (seg *segment) NewIter() *segmentIter {
 	}
 }
 
+// recoverTail 截断文件尾部不完整的 chunk。
+// 崩溃可能留下“头部完整但数据不足”或只有半个 chunk 头的尾部；
+// 这里从前往后扫描，保留最后一条完整记录，把后面的垃圾截掉。
+func (seg *segment) recoverTail() error {
+	if seg.closed {
+		return ErrClosed
+	}
+	size := seg.Size()
+	if size == 0 {
+		return nil
+	}
+
+	iter := seg.NewIter()
+	var lastEnd int64
+	for {
+		_, next, err := seg.readInternal(iter.blockNumber, iter.chunkOffset)
+		if err != nil {
+			break
+		}
+		end := int64(next.BlockNumber)*blockSize + next.ChunkOffset
+		if end <= lastEnd {
+			break
+		}
+		lastEnd = end
+		iter.blockNumber = next.BlockNumber
+		iter.chunkOffset = next.ChunkOffset
+	}
+
+	if lastEnd < size {
+		// Windows 上以 O_APPEND 打开的句柄可能不允许 fd.Truncate，改用路径级 Truncate。
+		if err := os.Truncate(seg.fd.Name(), lastEnd); err != nil {
+			return err
+		}
+		seg.currentBlockNumber = uint32(lastEnd / blockSize)
+		seg.currentBlockSize = uint32(lastEnd % blockSize)
+	}
+	return nil
+}
+
 // Sync 将段文件刷新到磁盘。
 func (seg *segment) Sync() error {
 	if seg.closed {
@@ -415,6 +454,9 @@ func (seg *segment) readInternal(blockNumber uint32, chunkOffset int64) ([]byte,
 		if chunkOffset >= size {
 			return nil, nil, io.EOF
 		}
+		if chunkOffset+chunkHeaderSize > size {
+			return nil, nil, io.ErrUnexpectedEOF
+		}
 
 		if seg.isStartupTraversal {
 			// 有两种情况我们需要从文件中读取块：
@@ -443,10 +485,13 @@ func (seg *segment) readInternal(blockNumber uint32, chunkOffset int64) ([]byte,
 
 		// 切片复制数据
 		start := chunkOffset + chunkHeaderSize
-		result = append(result, block[start:start+int64(length)]...)
+		checksumEnd := start + int64(length)
+		if checksumEnd > size {
+			return nil, nil, io.ErrUnexpectedEOF
+		}
+		result = append(result, block[start:checksumEnd]...)
 
 		// 校验和
-		checksumEnd := chunkOffset + chunkHeaderSize + int64(length)
 		checksum := crc32.ChecksumIEEE(block[chunkOffset+4 : checksumEnd])
 		savedSum := binary.LittleEndian.Uint32(header[:4])
 		if savedSum != checksum {

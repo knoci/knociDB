@@ -673,6 +673,8 @@ func TestDBAutoCompactWithBusyIO(t *testing.T) {
 }
 
 func getValueFromVlog(db *DB, key []byte) ([]byte, error) {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
 	var value []byte
 	var matchKey func(diskhash.Slot) (bool, error)
 	if db.options.IndexType == Hash {
@@ -716,6 +718,8 @@ func produceAndWriteLogs(numLogs int64, offset int64, db *DB) []*testLog {
 }
 
 func getRecordFromVlog(db *DB, key []byte) (*ValueLogRecord, error) {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
 	var value []byte
 	var matchKey func(diskhash.Slot) (bool, error)
 	if db.options.IndexType == Hash {
