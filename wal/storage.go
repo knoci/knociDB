@@ -63,7 +63,8 @@ type S3Storage struct {
 	bucket string
 }
 
-// NewObjectStorage 创建一个新的对象存储
+// NewObjectStorage 从当前目录的 config.yaml 创建一个新的对象存储。
+// 该入口保留给旧代码；新代码应使用 NewObjectStorageWithConfig，避免全局配置。
 func NewObjectStorage() (ObjectStorage, error) {
 	viper.SetConfigName("config")
 	viper.SetConfigType("yaml")
@@ -73,32 +74,29 @@ func NewObjectStorage() (ObjectStorage, error) {
 		return nil, fmt.Errorf("failed to read config file: %v", err)
 	}
 
-	var storage ObjectStorage
-	var err error
-	config := ObjectStorageConfig{
+	return NewObjectStorageWithConfig(ObjectStorageConfig{
 		Type:      ObjectStorageType(viper.GetString("object_storage.type")),
 		Endpoint:  viper.GetString("object_storage.endpoint"),
 		Region:    viper.GetString("object_storage.region"),
 		Bucket:    viper.GetString("object_storage.bucket"),
 		AccessKey: viper.GetString("object_storage.accesskey"),
 		SecretKey: viper.GetString("object_storage.secretkey"),
+	})
+}
+
+// NewObjectStorageWithConfig 使用显式配置创建对象存储。
+func NewObjectStorageWithConfig(config ObjectStorageConfig) (ObjectStorage, error) {
+	if config.Type == "" {
+		config.Type = S3ObjectStorage
 	}
 	switch config.Type {
 	case S3ObjectStorage, R2ObjectStorage, COSObjectStorage:
-		storage, err = newS3Storage(config)
-		if err != nil {
-			return nil, err
-		}
+		return newS3Storage(config)
 	case OSSObjectStorage:
-		storage, err = newOSSStorage(config)
-		if err != nil {
-			return nil, err
-		}
+		return newOSSStorage(config)
 	default:
 		return nil, fmt.Errorf("unsupported object storage type: %s", config.Type)
 	}
-
-	return storage, nil
 }
 
 // newS3Storage 创建一个新的S3对象存储
@@ -213,16 +211,23 @@ func (s *S3Storage) List() ([]string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
-	resp, err := s.client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
-		Bucket: aws.String(s.bucket),
-	})
-	if err != nil {
-		return nil, fmt.Errorf("failed to list objects in S3: %w", err)
-	}
-
 	var objects []string
-	for _, obj := range resp.Contents {
-		objects = append(objects, aws.ToString(obj.Key))
+	var token *string
+	for {
+		resp, err := s.client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+			Bucket:            aws.String(s.bucket),
+			ContinuationToken: token,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("failed to list objects in S3: %w", err)
+		}
+		for _, obj := range resp.Contents {
+			objects = append(objects, aws.ToString(obj.Key))
+		}
+		if !aws.ToBool(resp.IsTruncated) {
+			break
+		}
+		token = resp.NextContinuationToken
 	}
 
 	return objects, nil

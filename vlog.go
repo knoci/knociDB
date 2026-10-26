@@ -54,9 +54,6 @@ type valueLogOptions struct {
 
 	// 总数量
 	totalNumber uint32
-
-	// 对象存储
-	objectStorage bool
 }
 
 // 为值日志打开 WAL 文件，将打开多个 WAL 文件用于并发读写
@@ -96,6 +93,18 @@ func recoverValueLogTempFiles(dirPath string, partition int) error {
 	return nil
 }
 
+// activeSegmentNames 返回每个分区当前活跃段文件名，
+// 冷段上传必须跳过这些仍可能继续追加的文件。
+func (vlog *valueLog) activeSegmentNames() map[string]struct{} {
+	out := make(map[string]struct{}, len(vlog.walFiles))
+	for i, walFile := range vlog.walFiles {
+		ext := fmt.Sprintf(valueLogFileExt, i)
+		name := filepath.Base(wal.SegmentFileName(vlog.options.dirPath, ext, walFile.ActiveSegmentID()))
+		out[name] = struct{}{}
+	}
+	return out
+}
+
 func openValueLog(options valueLogOptions) (*valueLog, error) {
 	var walFiles []*wal.WAL
 	var dpTables []*discardtable
@@ -109,7 +118,6 @@ func openValueLog(options valueLogOptions) (*valueLog, error) {
 			SegmentFileExt: fmt.Sprintf(valueLogFileExt, i),
 			Sync:           false, // 手动同步
 			BytesPerSync:   0,     // 与 Sync 相同
-			ObjectStorage:  options.objectStorage,
 		})
 		if err != nil {
 			return nil, err

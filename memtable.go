@@ -43,7 +43,6 @@ type (
 		memSize         uint32 // 内存表的最大大小
 		walBytesPerSync uint32 // 通过 BytesPerSync 参数将 WAL 文件刷新到磁盘
 		walSync         bool   // WAL 在每次写入后立即刷新
-		objectStorage   bool   // 是否使用对象存储
 	}
 )
 
@@ -83,7 +82,6 @@ func openMemtables(options Options) ([]*memtable, error) {
 			memSize:         options.MemtableSize,
 			walSync:         options.Sync,
 			walBytesPerSync: options.BytesPerSync,
-			objectStorage:   options.ObjectStorage,
 		})
 		if errOpenMemtable != nil {
 			return nil, errOpenMemtable
@@ -110,7 +108,6 @@ func openMemtable(options memtableOptions) (*memtable, error) {
 		SegmentFileExt: fmt.Sprintf(walFileExt, options.tableID),
 		Sync:           options.walSync,
 		BytesPerSync:   options.walBytesPerSync,
-		ObjectStorage:  options.objectStorage,
 	})
 	if err != nil {
 		return nil, err

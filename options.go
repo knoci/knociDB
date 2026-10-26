@@ -74,8 +74,8 @@ type Options struct {
 	// 如果超过超时时间，写入操作将失败，默认值为 100ms
 	WaitMemSpaceTimeout time.Duration
 
-	// 是否启用对象存储
-	ObjectStorage bool
+	// ObjectTier 配置对象存储冷层/备份层。零值表示关闭。
+	ObjectTier ObjectTierOptions
 
 	// 是否启用布隆过滤器 默认值为 true
 	EnableBloomFilter bool
@@ -148,7 +148,6 @@ var DefaultOptions = Options{
 	DiskIOBusyRate:                 0.5,
 	AutoCompactSupport:             false,
 	WaitMemSpaceTimeout:            100 * time.Millisecond,
-	ObjectStorage:                  false,
 	EnableBloomFilter:              true,
 	BloomFilterExpectedElements:    100000,
 	BloomFilterFalsePositiveRate:   0.01,

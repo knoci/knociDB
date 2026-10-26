@@ -41,13 +41,13 @@ type BatchCommand struct {
 type KVStateMachine struct {
 	clusterID    uint64
 	nodeID       uint64
-	db           *DB // 数据库
+	db           KVEngine // 数据库核心接口
 	appliedIndex uint64
 	mu           sync.RWMutex
 }
 
 // NewKVStateMachine 创建一个新的KV状态机实例
-func NewKVStateMachine(clusterID, nodeID uint64, db *DB) *KVStateMachine {
+func NewKVStateMachine(clusterID, nodeID uint64, db KVEngine) *KVStateMachine {
 	return &KVStateMachine{
 		clusterID:    clusterID,
 		nodeID:       nodeID,

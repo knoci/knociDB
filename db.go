@@ -50,6 +50,13 @@ type DB struct {
 	closeCompactChan chan struct{}  // 用于优雅地关闭自动压缩监听协程
 	options          Options
 	batchPool        sync.Pool // 批处理池，用于减少内存分配开销
+
+	objectTier     *objectTier   // 对象存储冷层/备份层
+	objectTierStop chan struct{} // 停止冷段后台上传
+	objectTierWG   sync.WaitGroup
+
+	// 记录打开过的 memtable，Close 时兜底关闭，避免 flush 竞态遗留 WAL 句柄。
+	memtables map[uint32]*memtable
 }
 
 // Open 使用指定的选项打开数据库。
@@ -73,6 +80,20 @@ func Open(options Options) (*DB, error) {
 		}
 	}
 
+	// 对象存储冷层：在打开 DB 前先创建，配置错误直接失败。
+	tier, err := newObjectTier(options.ObjectTier)
+	if err != nil {
+		return nil, fmt.Errorf("init object tier failed: %w", err)
+	}
+	if tier != nil {
+		defer func() {
+			// 只有成功把 tier 交给 DB 时才不关闭；失败路径避免泄漏。
+			if tier != nil {
+				_ = tier.Close()
+			}
+		}()
+	}
+
 	// 创建文件锁，防止多个进程使用相同的数据库目录
 	fileLock := flock.New(filepath.Join(options.DirPath, fileLockName))
 	hold, err := fileLock.TryLock()
@@ -88,6 +109,11 @@ func Open(options Options) (*DB, error) {
 			_ = fileLock.Unlock()
 		}
 	}()
+
+	// 持锁后再恢复，避免两个进程同时导入同一快照。
+	if err := restoreFromObjectTier(options); err != nil {
+		return nil, err
+	}
 
 	// 如果不存在则创建废弃元数据文件，读取废弃数量
 	discardMetaPath := filepath.Join(options.DirPath, discardMetaName)
@@ -122,7 +148,6 @@ func Open(options Options) (*DB, error) {
 		compactBatchCapacity: options.CompactBatchCapacity,
 		discardtableNumber:   discardNumber,
 		totalNumber:          totalEntryNumber,
-		objectStorage:        options.ObjectStorage,
 	})
 	if err != nil {
 		return nil, err
@@ -151,6 +176,11 @@ func Open(options Options) (*DB, error) {
 		bloomManager = NewBloomFilterManager(bloomOptions)
 	}
 
+	memtableMap := make(map[uint32]*memtable, len(memtables))
+	for _, table := range memtables {
+		memtableMap[table.options.tableID] = table
+	}
+
 	db := &DB{
 		activeMem:        memtables[len(memtables)-1],
 		immuMems:         memtables[:len(memtables)-1],
@@ -165,6 +195,14 @@ func Open(options Options) (*DB, error) {
 		diskIO:           diskIO,
 		options:          options,
 		batchPool:        sync.Pool{New: makeBatch},
+		memtables:        memtableMap,
+	}
+
+	if tier != nil {
+		db.objectTier = tier
+		db.objectTierStop = make(chan struct{})
+		tier = nil // 所有权交给 DB
+		db.startObjectTierUploader()
 	}
 
 	// 重建布隆过滤器：不能相信可能过期的 .BLOOM 文件，否则会产生假阴性
@@ -249,6 +287,47 @@ func (db *DB) rebuildBloomFilters() error {
 	return nil
 }
 
+func (db *DB) startObjectTierUploader() {
+	if db.objectTier == nil {
+		return
+	}
+	db.objectTierWG.Add(1)
+	go func() {
+		defer db.objectTierWG.Done()
+		db.uploadColdSegments(true)
+		ticker := time.NewTicker(db.objectTier.opts.UploadInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-db.objectTierStop:
+				return
+			case <-ticker.C:
+				db.uploadColdSegments(true)
+			}
+		}
+	}()
+}
+
+func (db *DB) uploadColdSegments(skipActive bool) {
+	if db.objectTier == nil || db.vlog == nil {
+		return
+	}
+	var active map[string]struct{}
+	if skipActive {
+		db.mu.RLock()
+		active = db.vlog.activeSegmentNames()
+		db.mu.RUnlock()
+	}
+	n, err := db.objectTier.UploadColdSegments(db.options.DirPath, active)
+	if err != nil {
+		log.Printf("upload cold segments failed: %v", err)
+		return
+	}
+	if n > 0 {
+		log.Printf("uploaded %d cold segment(s) to object storage", n)
+	}
+}
+
 // Close 关闭数据库，关闭所有数据文件并释放文件锁。
 // 将closed标志设置为true。
 // 关闭后不能再使用DB实例。
@@ -268,6 +347,12 @@ func (db *DB) closeInternal() error {
 		db.closed = true
 	}()
 
+	// 先停止对象存储后台上传；最后的上传要等内存表刷完再做。
+	if db.objectTierStop != nil {
+		close(db.objectTierStop)
+		db.objectTierWG.Wait()
+	}
+
 	// 先停止自动压缩/IO 监控，避免关闭文件时它们还在使用
 	close(db.closeCompactChan)
 	db.bgWG.Wait()
@@ -286,10 +371,22 @@ func (db *DB) closeInternal() error {
 	}
 	<-db.closeflushChan
 
+	// 内存表已刷盘，上传新产生的冷段后再关闭 vlog。
+	if db.objectTier != nil {
+		_ = db.vlog.sync()
+		db.uploadColdSegments(false)
+		_ = db.objectTier.Close()
+	}
+
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
-	// 关闭所有内存表
+	// 关闭所有打开过的内存表。注册表包含已从 immuMems 移除、但可能仍有句柄的 WAL。
+	for _, table := range db.memtables {
+		if err := table.close(); err != nil {
+			return err
+		}
+	}
 	for _, table := range db.immuMems {
 		if err := table.close(); err != nil {
 			return err
@@ -504,6 +601,7 @@ func (db *DB) waitMemtableSpace() error {
 			return err
 		}
 		db.activeMem = table
+		db.memtables[table.options.tableID] = table
 	case <-timer.C:
 		return ErrWaitMemtableSpaceTimeOut
 	}
@@ -646,6 +744,7 @@ func (db *DB) flushMemtable(table *memtable) {
 	// 删除内存中保存的旧内存表
 	db.mu.Lock()
 	defer db.mu.Unlock()
+	oldTableID := table.options.tableID
 	if table == db.activeMem {
 		options := db.activeMem.options
 		options.tableID++
@@ -655,6 +754,7 @@ func (db *DB) flushMemtable(table *memtable) {
 			panic("flush activate memtable wrong")
 		}
 		db.activeMem = table
+		db.memtables[table.options.tableID] = table
 	} else {
 		if len(db.immuMems) == 1 {
 			db.immuMems = db.immuMems[:0]
@@ -662,6 +762,7 @@ func (db *DB) flushMemtable(table *memtable) {
 			db.immuMems = db.immuMems[1:]
 		}
 	}
+	delete(db.memtables, oldTableID)
 	db.sendThresholdState()
 }
 

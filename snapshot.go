@@ -228,6 +228,9 @@ func (db *DB) ExportSnapshot() error {
 		return fmt.Errorf("Failed to rename snapshot file: %v", err)
 	}
 	log.Printf("Snapshot exported: %s", snapFile)
+	if err := uploadSnapshotWithOptions(db.options, snapFile); err != nil {
+		return fmt.Errorf("upload snapshot to object storage failed: %w", err)
+	}
 	db.cleanupSnapshots(snapDir)
 	return nil
 }
@@ -297,13 +300,17 @@ func (db *DB) ImportSnapshot(snapPath string) error {
 	if err := db.Close(); err != nil {
 		return fmt.Errorf("Close failed: %v", err)
 	}
+	return importSnapshotToDir(snapPath, db.options.DirPath)
+}
 
+// importSnapshotToDir 把 .ZST 快照解压并原子替换到目标目录。
+// 它不持有 DB，因此可用于 Open 之前的对象存储恢复。
+func importSnapshotToDir(snapPath, dir string) error {
 	// 验证快照文件是否存在
 	if _, err := os.Stat(snapPath); os.IsNotExist(err) {
 		return fmt.Errorf("Snapshot file not found: %s", snapPath)
 	}
 
-	dir := db.options.DirPath
 	timestamp := time.Now().Format(snapshotLayout)
 
 	// 创建临时目录用于解压快照
