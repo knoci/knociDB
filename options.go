@@ -77,6 +77,9 @@ type Options struct {
 	// ObjectTier 配置对象存储冷层/备份层。零值表示关闭。
 	ObjectTier ObjectTierOptions
 
+	// TTLScanInterval 是核心 TTL 后台清理间隔；<=0 表示关闭后台清理。
+	TTLScanInterval time.Duration
+
 	// 是否启用布隆过滤器 默认值为 true
 	EnableBloomFilter bool
 
@@ -148,6 +151,7 @@ var DefaultOptions = Options{
 	DiskIOBusyRate:                 0.5,
 	AutoCompactSupport:             false,
 	WaitMemSpaceTimeout:            100 * time.Millisecond,
+	TTLScanInterval:                time.Second,
 	EnableBloomFilter:              true,
 	BloomFilterExpectedElements:    100000,
 	BloomFilterFalsePositiveRate:   0.01,

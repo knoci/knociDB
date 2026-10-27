@@ -3,6 +3,7 @@ package knocidb
 import (
 	"bytes"
 	"container/heap"
+	"time"
 
 	"github.com/dgraph-io/badger/v4/y"
 	"github.com/knoci/knocidb/wal"
@@ -122,7 +123,7 @@ func (mi *Iterator) cleanKey(oldKey []byte, version int) {
 		if r := recover(); r != nil {
 			if mi.locked {
 				mi.locked = false
-				mi.db.mu.Unlock()
+				mi.db.mu.RUnlock()
 			}
 		}
 	}()
@@ -181,7 +182,7 @@ func (mi *Iterator) Value() []byte {
 		if r := recover(); r != nil {
 			if mi.locked {
 				mi.locked = false
-				mi.db.mu.Unlock()
+				mi.db.mu.RUnlock()
 			}
 		}
 	}()
@@ -212,6 +213,19 @@ func (mi *Iterator) Valid() bool {
 		return false
 	}
 	topIter := mi.h[0]
+	// TTL 过期 key 对迭代器不可见；这里只跳过，后台 sweeper 负责物理删除。
+	if mi.db.ttl != nil {
+		if expired, err := mi.db.ttl.isExpired(topIter.iter.Key(), time.Now().UnixMilli()); err == nil && expired {
+			mi.cleanKey(topIter.iter.Key(), topIter.version)
+			topIter.iter.Next()
+			if topIter.iter.Valid() {
+				heap.Fix(&mi.h, topIter.idx)
+			} else {
+				heap.Remove(&mi.h, topIter.idx)
+			}
+			return mi.Valid()
+		}
+	}
 	// 如果topIter是memtable迭代器，并且当前值被删除
 	if topIter.iType == MemItr && topIter.iter.Value().(y.ValueStruct).Meta == LogRecordDeleted {
 		// 删除键
@@ -238,7 +252,7 @@ func (mi *Iterator) Close() error {
 	}
 	if mi.locked {
 		mi.locked = false
-		mi.db.mu.Unlock()
+		mi.db.mu.RUnlock()
 	}
 	return nil
 }
@@ -251,17 +265,17 @@ func (db *DB) NewIterator(options IteratorOptions) (*Iterator, error) {
 	if db.options.IndexType == Hash {
 		return nil, ErrDBIteratorUnsupportedTypeHASH
 	}
-	db.mu.Lock()
+	db.mu.RLock()
 	success := false
 	defer func() {
 		if r := recover(); r != nil {
 			if !success {
-				db.mu.Unlock()
+				db.mu.RUnlock()
 			}
 			panic(r)
 		}
 		if !success {
-			db.mu.Unlock()
+			db.mu.RUnlock()
 		}
 	}()
 

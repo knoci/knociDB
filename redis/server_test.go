@@ -1,0 +1,161 @@
+package redis
+
+import (
+	"bufio"
+	"fmt"
+	"io"
+	"net"
+	"strconv"
+	"strings"
+	"testing"
+
+	"github.com/knoci/knocidb"
+	"github.com/stretchr/testify/require"
+)
+
+type testError string
+
+func (e testError) Error() string { return string(e) }
+
+func newTestServer(t *testing.T, options ...ServerOption) (*Server, *knocidb.DB, net.Conn) {
+	t.Helper()
+	dbOptions := knocidb.DefaultOptions
+	dbOptions.DirPath = t.TempDir()
+	db, err := knocidb.Open(dbOptions)
+	require.NoError(t, err)
+	srv, lis, err := Start("127.0.0.1:0", db, options...)
+	require.NoError(t, err)
+	conn, err := net.Dial("tcp", lis.Addr().String())
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_ = conn.Close()
+		_ = srv.Close()
+		_ = db.Close()
+	})
+	return srv, db, conn
+}
+
+func sendCommand(t *testing.T, conn net.Conn, args ...string) {
+	t.Helper()
+	var b strings.Builder
+	fmt.Fprintf(&b, "*%d\r\n", len(args))
+	for _, arg := range args {
+		fmt.Fprintf(&b, "$%d\r\n%s\r\n", len(arg), arg)
+	}
+	_, err := io.WriteString(conn, b.String())
+	require.NoError(t, err)
+}
+
+func readValue(t *testing.T, r *bufio.Reader) any {
+	t.Helper()
+	prefix, err := r.ReadByte()
+	require.NoError(t, err)
+	line := func() string {
+		s, err := r.ReadString('\n')
+		require.NoError(t, err)
+		return strings.TrimSuffix(strings.TrimSuffix(s, "\n"), "\r")
+	}
+	switch prefix {
+	case '+':
+		return line()
+	case '-':
+		return testError(line())
+	case ':':
+		n, err := strconv.ParseInt(line(), 10, 64)
+		require.NoError(t, err)
+		return n
+	case '$':
+		n, err := strconv.Atoi(line())
+		require.NoError(t, err)
+		if n < 0 {
+			return nil
+		}
+		buf := make([]byte, n+2)
+		_, err = io.ReadFull(r, buf)
+		require.NoError(t, err)
+		return string(buf[:n])
+	case '*':
+		n, err := strconv.Atoi(line())
+		require.NoError(t, err)
+		if n < 0 {
+			return nil
+		}
+		out := make([]any, n)
+		for i := range out {
+			out[i] = readValue(t, r)
+		}
+		return out
+	default:
+		t.Fatalf("unexpected RESP prefix %q", prefix)
+		return nil
+	}
+}
+
+func do(t *testing.T, conn net.Conn, args ...string) any {
+	t.Helper()
+	sendCommand(t, conn, args...)
+	return readValue(t, bufio.NewReader(conn))
+}
+
+func TestServerBasicsAndDataTypes(t *testing.T) {
+	_, _, conn := newTestServer(t)
+
+	require.Equal(t, "PONG", do(t, conn, "PING"))
+	require.Equal(t, "hello", do(t, conn, "ECHO", "hello"))
+
+	require.Equal(t, "OK", do(t, conn, "SET", "name", "knoci"))
+	require.Equal(t, "knoci", do(t, conn, "GET", "name"))
+	require.Equal(t, int64(1), do(t, conn, "EXISTS", "name"))
+	require.Equal(t, "string", do(t, conn, "TYPE", "name"))
+	require.Equal(t, "OK", do(t, conn, "MSET", "m1", "v1", "m2", "v2"))
+	require.Equal(t, []any{"v1", "v2"}, do(t, conn, "MGET", "m1", "m2"))
+
+	require.Equal(t, int64(2), do(t, conn, "HSET", "user:1", "name", "Alice", "age", "20"))
+	require.Equal(t, "Alice", do(t, conn, "HGET", "user:1", "name"))
+	require.Equal(t, []any{"age", "20", "name", "Alice"}, do(t, conn, "HGETALL", "user:1"))
+	require.Equal(t, "hash", do(t, conn, "TYPE", "user:1"))
+	require.Equal(t, []any{"knoci", nil}, do(t, conn, "MGET", "name", "user:1"))
+
+	require.Equal(t, int64(3), do(t, conn, "RPUSH", "queue", "a", "b", "c"))
+	require.Equal(t, []any{"a", "b", "c"}, do(t, conn, "LRANGE", "queue", "0", "-1"))
+	require.Equal(t, "a", do(t, conn, "LPOP", "queue"))
+	require.Equal(t, int64(2), do(t, conn, "LLEN", "queue"))
+
+	require.Equal(t, int64(2), do(t, conn, "SADD", "tags", "go", "db", "go"))
+	require.Equal(t, int64(1), do(t, conn, "SISMEMBER", "tags", "go"))
+	require.ElementsMatch(t, []any{"go", "db"}, do(t, conn, "SMEMBERS", "tags"))
+
+	require.Equal(t, int64(1), do(t, conn, "EXPIRE", "name", "60"))
+	ttl := do(t, conn, "TTL", "name")
+	require.NotEqual(t, int64(-1), ttl)
+	require.NotEqual(t, int64(-2), ttl)
+	require.Equal(t, int64(1), do(t, conn, "PERSIST", "name"))
+	require.Equal(t, int64(-1), do(t, conn, "TTL", "name"))
+
+	_, isErr := do(t, conn, "LPUSH", "name", "x").(testError)
+	require.True(t, isErr, "wrong type should return WRONGTYPE")
+	require.Equal(t, int64(1), do(t, conn, "DEL", "name"))
+	require.Equal(t, "none", do(t, conn, "TYPE", "name"))
+}
+
+func TestServerTransactionUnsupported(t *testing.T) {
+	_, _, conn := newTestServer(t)
+	_, isErr := do(t, conn, "MULTI").(testError)
+	require.True(t, isErr)
+}
+
+func TestServerAuthAndHello(t *testing.T) {
+	_, _, conn := newTestServer(t, WithPassword("secret"))
+
+	_, isErr := do(t, conn, "GET", "k").(testError)
+	require.True(t, isErr)
+	_, isErr = do(t, conn, "GET", "k").(testError)
+	require.True(t, isErr)
+
+	require.Equal(t, "OK", do(t, conn, "AUTH", "secret"))
+	require.Equal(t, "PONG", do(t, conn, "PING"))
+
+	hello, ok := do(t, conn, "HELLO", "2").([]any)
+	require.True(t, ok)
+	require.Contains(t, hello, "knocidb")
+}

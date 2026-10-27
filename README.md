@@ -16,12 +16,14 @@
 - 🌐 **Distributed deployment** with Raft protocol
 - 💾 **S3 Object Storage** read and load wal
 - 🔌 **gRPC support** client-stream Batch, server-stream Scan, optional auth/TLS
+- 🧩 **Redis-compatible subset** strings/hash/list/set/zset, TTL, SCAN, Pub/Sub, cluster protocol
 
 ## Quick Start
 ```go
 package main
 
 import (
+	"time"
 	"github.com/knoci/knocidb"
 )
 
@@ -52,6 +54,21 @@ func main() {
 	}
 	println(string(val))
 
+	// put a key with TTL
+	err = db.PutWithTTL([]byte("session"), []byte("alive"), 30*time.Second)
+	if err != nil {
+		panic(err)
+	}
+
+	// read remaining TTL
+	ttl, ok, err := db.GetTTL([]byte("session"))
+	if err != nil {
+		panic(err)
+	}
+	if ok {
+		println(ttl.String())
+	}
+
 	// delete a key
 	err = db.Delete([]byte("name"))
 	if err != nil {
@@ -79,6 +96,14 @@ $ go run main.go --dir ./grpc_data --addr 127.0.0.1:50051
 
 $ cd ../client
 $ go run main.go --addr 127.0.0.1:50051
+```
+
+🧩 For the Redis-compatible subset, see `examples/redis`. It supports strings, hashes, lists, sets, sorted sets, TTL, SCAN and Pub/Sub.
+```bash
+$ cd examples/redis
+$ go run main.go --dir ./redis_data --addr 127.0.0.1:6379
+
+$ redis-cli -p 6379
 ```
 
 ## Info

@@ -57,6 +57,10 @@ type DB struct {
 
 	// 记录打开过的 memtable，Close 时兜底关闭，避免 flush 竞态遗留 WAL 句柄。
 	memtables map[uint32]*memtable
+
+	ttl     *ttlStore
+	ttlStop chan struct{}
+	ttlWG   sync.WaitGroup
 }
 
 // Open 使用指定的选项打开数据库。
@@ -114,6 +118,17 @@ func Open(options Options) (*DB, error) {
 	if err := restoreFromObjectTier(options); err != nil {
 		return nil, err
 	}
+
+	// TTL 旁路索引：独立 bbolt 文件，随快照一起复制。
+	ttl, err := openTTLStore(options.DirPath)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		if !opened {
+			_ = ttl.close()
+		}
+	}()
 
 	// 如果不存在则创建废弃元数据文件，读取废弃数量
 	discardMetaPath := filepath.Join(options.DirPath, discardMetaName)
@@ -196,6 +211,7 @@ func Open(options Options) (*DB, error) {
 		options:          options,
 		batchPool:        sync.Pool{New: makeBatch},
 		memtables:        memtableMap,
+		ttl:              ttl,
 	}
 
 	if tier != nil {
@@ -203,6 +219,11 @@ func Open(options Options) (*DB, error) {
 		db.objectTierStop = make(chan struct{})
 		tier = nil // 所有权交给 DB
 		db.startObjectTierUploader()
+	}
+	if options.TTLScanInterval > 0 {
+		db.ttlStop = make(chan struct{})
+		db.ttlWG.Add(1)
+		go db.ttlSweeper()
 	}
 
 	// 重建布隆过滤器：不能相信可能过期的 .BLOOM 文件，否则会产生假阴性
@@ -308,6 +329,29 @@ func (db *DB) startObjectTierUploader() {
 	}()
 }
 
+func (db *DB) ttlSweeper() {
+	defer db.ttlWG.Done()
+	ticker := time.NewTicker(db.options.TTLScanInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-db.ttlStop:
+			return
+		case now := <-ticker.C:
+			keys, err := db.ttl.expired(now.UnixMilli())
+			if err != nil {
+				log.Printf("ttl scan failed: %v", err)
+				continue
+			}
+			for _, key := range keys {
+				if err := db.Delete(key); err != nil {
+					log.Printf("ttl delete failed: %v", err)
+				}
+			}
+		}
+	}
+}
+
 func (db *DB) uploadColdSegments(skipActive bool) {
 	if db.objectTier == nil || db.vlog == nil {
 		return
@@ -346,6 +390,15 @@ func (db *DB) closeInternal() error {
 		}
 		db.closed = true
 	}()
+
+	// 先停止 TTL 后台清理，避免关闭 bbolt 后仍有扫描。
+	if db.ttlStop != nil {
+		close(db.ttlStop)
+		db.ttlWG.Wait()
+	}
+	if db.ttl != nil {
+		defer db.ttl.close()
+	}
 
 	// 先停止对象存储后台上传；最后的上传要等内存表刷完再做。
 	if db.objectTierStop != nil {
@@ -445,6 +498,12 @@ func (db *DB) Sync() error {
 	// 同步值日志
 	if err := db.vlog.sync(); err != nil {
 		return err
+	}
+	// 同步 TTL 旁路索引
+	if db.ttl != nil {
+		if err := db.ttl.sync(); err != nil {
+			return err
+		}
 	}
 
 	return nil

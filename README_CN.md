@@ -16,12 +16,14 @@
 - 🌐 基于Raft的**分布式部署**
 - 💾 **S3 对象存储**读取和加载 wal
 - 🔌 **gRPC 支持** 客户端流式批量、服务端流式扫描、可选鉴权与 TLS
+- 🧩 **Redis 兼容子集** string/hash/list/set/zset、TTL、SCAN、Pub/Sub、集群协议
 
 ## 快速开始
 ```go
 package main
 
 import (
+	"time"
 	"github.com/knoci/knocidb"
 )
 
@@ -52,6 +54,21 @@ func main() {
 	}
 	println(string(val))
 
+	// 存入一个带 TTL 的键
+	err = db.PutWithTTL([]byte("session"), []byte("alive"), 30*time.Second)
+	if err != nil {
+		panic(err)
+	}
+
+	// 读取剩余 TTL
+	ttl, ok, err := db.GetTTL([]byte("session"))
+	if err != nil {
+		panic(err)
+	}
+	if ok {
+		println(ttl.String())
+	}
+
 	// 删除一个键
 	err = db.Delete([]byte("name"))
 	if err != nil {
@@ -79,6 +96,14 @@ $ go run main.go --dir ./grpc_data --addr 127.0.0.1:50051
 
 $ cd ../client
 $ go run main.go --addr 127.0.0.1:50051
+```
+
+🧩 关于 Redis 兼容子集，请查看 `examples/redis`。支持 string/hash/list/set/zset、TTL、SCAN 和 Pub/Sub。
+```bash
+$ cd examples/redis
+$ go run main.go --dir ./redis_data --addr 127.0.0.1:6379
+
+$ redis-cli -p 6379
 ```
 
 ## 信息

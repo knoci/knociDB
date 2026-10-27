@@ -2,6 +2,7 @@ package knocidb
 
 import (
 	"fmt"
+	"time"
 
 	"sync"
 
@@ -23,6 +24,7 @@ import (
 type Batch struct {
 	db            *DB
 	pendingWrites map[string]*LogRecord
+	pendingTTL    map[string]int64 // expireAt(ms); 0 表示删除 TTL
 	options       BatchOptions
 	mu            sync.RWMutex
 	committed     bool
@@ -39,6 +41,7 @@ func (db *DB) NewBatch(options BatchOptions) *Batch {
 	}
 	if !options.ReadOnly {
 		batch.pendingWrites = make(map[string]*LogRecord)
+		batch.pendingTTL = make(map[string]int64)
 		node, err := snowflake.NewNode(1)
 		if err != nil {
 			panic(fmt.Sprintf("snowflake.NewNode(1) failed: %v", err))
@@ -65,6 +68,14 @@ func (b *Batch) init(rdonly, sync bool, disableWal bool, db *DB) *Batch {
 	b.options.Sync = sync
 	b.options.DisableWal = disableWal
 	b.db = db
+	if !rdonly {
+		if b.pendingWrites == nil {
+			b.pendingWrites = make(map[string]*LogRecord)
+		}
+		if b.pendingTTL == nil {
+			b.pendingTTL = make(map[string]int64)
+		}
+	}
 	b.lock()
 	return b
 }
@@ -76,6 +87,7 @@ func (b *Batch) withPendingWrites() {
 func (b *Batch) reset() {
 	b.db = nil
 	b.pendingWrites = nil
+	b.pendingTTL = nil
 	b.committed = false
 }
 
@@ -133,6 +145,66 @@ func (b *Batch) Put(key []byte, value []byte) error {
 	return nil
 }
 
+// PutWithTTL 写入 key/value，并设置相对 TTL。
+// ttl <= 0 返回错误；要移除 TTL 请使用 Persist。
+func (b *Batch) PutWithTTL(key []byte, value []byte, ttl time.Duration) error {
+	if ttl <= 0 {
+		return fmt.Errorf("ttl must be positive")
+	}
+	if err := b.Put(key, value); err != nil {
+		return err
+	}
+	b.mu.Lock()
+	b.pendingTTL[string(key)] = time.Now().Add(ttl).UnixMilli()
+	b.mu.Unlock()
+	return nil
+}
+
+// SetTTL 只修改已有 key 的过期时间，不写数据。
+func (b *Batch) SetTTL(key []byte, ttl time.Duration) error {
+	if len(key) == 0 {
+		return ErrKeyIsEmpty
+	}
+	if ttl <= 0 {
+		return fmt.Errorf("ttl must be positive")
+	}
+	if b.options.ReadOnly {
+		return ErrReadOnlyBatch
+	}
+	b.mu.Lock()
+	b.pendingTTL[string(key)] = time.Now().Add(ttl).UnixMilli()
+	b.mu.Unlock()
+	return nil
+}
+
+// Persist 移除 key 的 TTL。
+func (b *Batch) Persist(key []byte) error {
+	if len(key) == 0 {
+		return ErrKeyIsEmpty
+	}
+	if b.options.ReadOnly {
+		return ErrReadOnlyBatch
+	}
+	b.mu.Lock()
+	b.pendingTTL[string(key)] = 0
+	b.mu.Unlock()
+	return nil
+}
+
+func (b *Batch) ttlExpired(key []byte) (bool, error) {
+	now := time.Now().UnixMilli()
+	b.mu.RLock()
+	if expireAt, ok := b.pendingTTL[string(key)]; ok {
+		b.mu.RUnlock()
+		return expireAt > 0 && expireAt <= now, nil
+	}
+	b.mu.RUnlock()
+	if b.db.ttl == nil {
+		return false, nil
+	}
+	return b.db.ttl.isExpired(key, now)
+}
+
 // Get 从批处理中获取与给定键关联的值。
 func (b *Batch) Get(key []byte) ([]byte, error) {
 	if len(key) == 0 {
@@ -160,6 +232,14 @@ func (b *Batch) Get(key []byte) ([]byte, error) {
 			}
 		}
 		b.mu.RUnlock()
+	}
+
+	expired, err := b.ttlExpired(key)
+	if err != nil {
+		return nil, err
+	}
+	if expired {
+		return nil, ErrKeyNotFound
 	}
 
 	// 从内存表获取
@@ -230,6 +310,11 @@ func (b *Batch) Delete(key []byte) error {
 		Key:  key,
 		Type: LogRecordDeleted,
 	}
+	if _, ok := b.pendingTTL[string(key)]; ok {
+		b.pendingTTL[string(key)] = 0
+	} else if b.db.ttl != nil && b.db.ttl.has(key) {
+		b.pendingTTL[string(key)] = 0
+	}
 	b.mu.Unlock()
 
 	return nil
@@ -258,6 +343,14 @@ func (b *Batch) Exist(key []byte) (bool, error) {
 			return true, nil
 		}
 		b.mu.RUnlock()
+	}
+
+	expired, err := b.ttlExpired(key)
+	if err != nil {
+		return false, err
+	}
+	if expired {
+		return false, nil
 	}
 
 	// 从内存表获取
@@ -307,7 +400,7 @@ func (b *Batch) Commit() error {
 		return ErrDBClosed
 	}
 
-	if b.options.ReadOnly || len(b.pendingWrites) == 0 {
+	if b.options.ReadOnly || (len(b.pendingWrites) == 0 && len(b.pendingTTL) == 0) {
 		return nil
 	}
 
@@ -319,15 +412,39 @@ func (b *Batch) Commit() error {
 		return ErrBatchCommitted
 	}
 
-	// 等待内存表空间
-	if err := b.db.waitMemtableSpace(); err != nil {
-		return err
+	// 写入数据之前先落“设置 TTL”；崩溃时最多留下一个指向不存在 key 的 TTL。
+	sets := make(map[string]int64)
+	deletes := make(map[string]int64)
+	for key, expireAt := range b.pendingTTL {
+		if expireAt > 0 {
+			sets[key] = expireAt
+		} else {
+			deletes[key] = 0
+		}
 	}
-	batchID := b.batchID.Generate()
-	// 调用内存表的批量写入
-	err := b.db.activeMem.putBatch(b.pendingWrites, batchID, b.options.WriteOptions)
-	if err != nil {
-		return err
+	if b.db.ttl != nil {
+		if err := b.db.ttl.apply(sets); err != nil {
+			return err
+		}
+	}
+
+	if len(b.pendingWrites) > 0 {
+		// 等待内存表空间
+		if err := b.db.waitMemtableSpace(); err != nil {
+			return err
+		}
+		batchID := b.batchID.Generate()
+		// 调用内存表的批量写入
+		if err := b.db.activeMem.putBatch(b.pendingWrites, batchID, b.options.WriteOptions); err != nil {
+			return err
+		}
+	}
+
+	// 数据提交后再删除 TTL；崩溃时最多留下一个过期/孤儿 TTL。
+	if b.db.ttl != nil {
+		if err := b.db.ttl.apply(deletes); err != nil {
+			return err
+		}
 	}
 
 	b.committed = true

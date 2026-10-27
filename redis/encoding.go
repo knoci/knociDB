@@ -4,9 +4,8 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"fmt"
+	"math"
 	"time"
-
-	"github.com/knoci/knocidb"
 )
 
 const (
@@ -18,6 +17,7 @@ const (
 	typeHash   byte = 2
 	typeList   byte = 3
 	typeSet    byte = 4
+	typeZSet   byte = 5
 
 	// listSeqOffset 把有符号序号映射到 uint64，保证字节序排序与数值序一致。
 	listSeqOffset int64 = 1 << 62
@@ -69,6 +69,58 @@ func hashFieldKey(key, field []byte) []byte {
 
 func setMemberKey(key, member []byte) []byte {
 	return append(setPrefix(key), b64(member)...)
+}
+
+func zsetScorePrefix(key []byte) []byte {
+	return []byte(namespace + "z:" + b64(key) + ":s:")
+}
+
+func zsetMemberPrefix(key []byte) []byte {
+	return []byte(namespace + "z:" + b64(key) + ":m:")
+}
+
+func zsetMemberKey(key, member []byte) []byte {
+	return append(zsetMemberPrefix(key), b64(member)...)
+}
+
+func zsetScoreKey(key []byte, score float64, member []byte) []byte {
+	prefix := zsetScorePrefix(key)
+	out := make([]byte, len(prefix)+8+len(member))
+	copy(out, prefix)
+	putSortableScore(out[len(prefix):], score)
+	copy(out[len(prefix)+8:], member)
+	return out
+}
+
+// putSortableScore 把 float64 编码成可按字节序排序的 8 字节。
+// 负数取反、正数翻符号位，保证 -inf < ... < +inf。
+func putSortableScore(dst []byte, score float64) {
+	bits := math.Float64bits(score)
+	if bits&(1<<63) != 0 {
+		bits = ^bits
+	} else {
+		bits ^= 1 << 63
+	}
+	binary.BigEndian.PutUint64(dst, bits)
+}
+
+func decodeSortableScore(src []byte) (float64, error) {
+	if len(src) < 8 {
+		return 0, fmt.Errorf("invalid score encoding")
+	}
+	bits := binary.BigEndian.Uint64(src[:8])
+	if bits&(1<<63) != 0 {
+		bits ^= 1 << 63
+	} else {
+		bits = ^bits
+	}
+	return math.Float64frombits(bits), nil
+}
+
+func encodeScoreValue(score float64) []byte {
+	out := make([]byte, 8)
+	putSortableScore(out, score)
+	return out
 }
 
 func listEntryKey(key []byte, seq int64) []byte {
@@ -126,6 +178,8 @@ func typeName(typ byte) string {
 		return "list"
 	case typeSet:
 		return "set"
+	case typeZSet:
+		return "zset"
 	default:
 		return "none"
 	}
@@ -141,9 +195,9 @@ func typeByte(name string) (byte, bool) {
 		return typeList, true
 	case "set":
 		return typeSet, true
+	case "zset":
+		return typeZSet, true
 	default:
 		return 0, false
 	}
 }
-
-var _ = knocidb.ErrKeyNotFound
