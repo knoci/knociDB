@@ -2,6 +2,7 @@ package knocidb
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -210,3 +211,230 @@ func TestObjectTierDisabledDoesNotUpload(t *testing.T) {
 }
 
 var _ wal.ObjectStorage = (*fakeObjectStore)(nil)
+
+func TestRaftSnapshotUploadsToObjectTier(t *testing.T) {
+	base := t.TempDir()
+	fake := newFakeObjectStore()
+
+	config := createTestRaftConfig(1, 400, "localhost:10300", base)
+	options := createTestDBOptions(t, base)
+	options.ObjectTier = ObjectTierOptions{
+		Enabled: true,
+		Store:   fake,
+		Prefix:  "raft-node-1",
+	}
+
+	rdb, err := OpenRaft(config, options)
+	require.NoError(t, err)
+	defer rdb.Close()
+
+	require.Eventually(t, func() bool { return rdb.IsLeader() }, 5*time.Second, 100*time.Millisecond)
+	require.NoError(t, rdb.Put([]byte("raft-object-key"), []byte("raft-object-value")))
+
+	require.NotNil(t, rdb.stateMachine)
+	require.NoError(t, rdb.stateMachine.SaveSnapshot(io.Discard, nil, nil))
+
+	var found bool
+	for _, key := range fake.keys() {
+		if strings.HasPrefix(key, "raft-node-1/snapshots/") && strings.HasSuffix(key, snapshotExt) {
+			found = true
+		}
+	}
+	require.True(t, found, "raft leader snapshot should be uploaded, keys=%v", fake.keys())
+}
+
+func TestRaftNodeDiskLossRestoresFromObjectTier(t *testing.T) {
+	base := t.TempDir()
+	fake := newFakeObjectStore()
+	dbDir := filepath.Join(base, "db")
+	require.NoError(t, os.MkdirAll(dbDir, os.ModePerm))
+
+	config := createTestRaftConfig(1, 401, "localhost:10301", base)
+	options := createTestDBOptions(t, base)
+	options.DirPath = dbDir
+	options.ObjectTier = ObjectTierOptions{
+		Enabled: true,
+		Store:   fake,
+		Prefix:  "raft-disk-loss",
+	}
+
+	rdb, err := OpenRaft(config, options)
+	require.NoError(t, err)
+	require.Eventually(t, func() bool { return rdb.IsLeader() }, 5*time.Second, 100*time.Millisecond)
+	require.NoError(t, rdb.Put([]byte("disk-loss-key"), []byte("disk-loss-value")))
+	require.NoError(t, rdb.stateMachine.SaveSnapshot(io.Discard, nil, nil))
+	require.NoError(t, rdb.Close())
+
+	// 模拟数据盘丢失，但保留 Raft 目录。
+	require.NoError(t, os.RemoveAll(dbDir))
+	require.NoError(t, os.MkdirAll(dbDir, os.ModePerm))
+
+	reopened, err := OpenRaft(config, options)
+	require.NoError(t, err)
+	defer reopened.Close()
+	require.Eventually(t, func() bool { return reopened.IsLeader() }, 5*time.Second, 100*time.Millisecond)
+	value, err := reopened.Get([]byte("disk-loss-key"))
+	require.NoError(t, err)
+	require.Equal(t, []byte("disk-loss-value"), value)
+}
+
+func TestMultiNodeRaftObjectTierFailover(t *testing.T) {
+	const nodeCount = 5
+	nodes := make([]*RaftDB, nodeCount)
+	stores := make([]*fakeObjectStore, nodeCount)
+	cleanups := make([]func(), nodeCount)
+
+	initialMembers := make(map[uint64]string)
+	for i := 0; i < nodeCount; i++ {
+		initialMembers[uint64(i+1)] = fmt.Sprintf("localhost:%d", 10400+i)
+	}
+
+	for i := 0; i < nodeCount; i++ {
+		tempDir, cleanup := setupTestEnvironment(t)
+		cleanups[i] = cleanup
+		stores[i] = newFakeObjectStore()
+
+		nodeID := uint64(i + 1)
+		config := createTestRaftConfig(nodeID, 500, fmt.Sprintf("localhost:%d", 10400+i), tempDir)
+		config.InitialMembers = initialMembers
+		config.SnapshotIntervalSeconds = 1
+		options := createTestDBOptions(t, tempDir)
+		options.ObjectTier = ObjectTierOptions{
+			Enabled: true,
+			Store:   stores[i],
+			Prefix:  fmt.Sprintf("raft-node-%d", nodeID),
+		}
+		rdb, err := OpenRaft(config, options)
+		require.NoError(t, err)
+		nodes[i] = rdb
+	}
+
+	defer func() {
+		for i, node := range nodes {
+			if node != nil {
+				_ = node.Close()
+			}
+			if cleanups[i] != nil {
+				cleanups[i]()
+			}
+		}
+	}()
+
+	findLeader := func() int {
+		for i, node := range nodes {
+			if node != nil && node.IsLeader() {
+				return i
+			}
+		}
+		return -1
+	}
+
+	require.Eventually(t, func() bool { return findLeader() >= 0 }, 8*time.Second, 100*time.Millisecond)
+	leader := findLeader()
+	require.NoError(t, nodes[leader].Put([]byte("failover-key"), []byte("v1")))
+
+	// 杀 Leader，等待新 Leader。
+	require.NoError(t, nodes[leader].Close())
+	nodes[leader] = nil
+	require.Eventually(t, func() bool { return findLeader() >= 0 }, 10*time.Second, 100*time.Millisecond)
+	newLeader := findLeader()
+	require.NotEqual(t, leader, newLeader)
+	require.NoError(t, nodes[newLeader].Put([]byte("failover-key-2"), []byte("v2")))
+
+	// 杀一个 Follower，Leader 仍应可写。
+	follower := -1
+	for i, node := range nodes {
+		if node != nil && i != newLeader {
+			follower = i
+			break
+		}
+	}
+	require.GreaterOrEqual(t, follower, 0)
+	require.NoError(t, nodes[follower].Close())
+	nodes[follower] = nil
+	require.NoError(t, nodes[newLeader].Put([]byte("failover-key-3"), []byte("v3")))
+	value, err := nodes[newLeader].Get([]byte("failover-key-3"))
+	require.NoError(t, err)
+	require.Equal(t, []byte("v3"), value)
+}
+
+func TestRaftSnapshotObjectStoreFailure(t *testing.T) {
+	base := t.TempDir()
+	fake := newFakeObjectStore()
+	fake.failUpload = true
+
+	config := createTestRaftConfig(1, 402, "localhost:10302", base)
+	options := createTestDBOptions(t, base)
+	options.ObjectTier = ObjectTierOptions{
+		Enabled: true,
+		Store:   fake,
+		Prefix:  "raft-fail",
+	}
+
+	rdb, err := OpenRaft(config, options)
+	require.NoError(t, err)
+	defer rdb.Close()
+	require.Eventually(t, func() bool { return rdb.IsLeader() }, 5*time.Second, 100*time.Millisecond)
+	require.NoError(t, rdb.Put([]byte("failure-key"), []byte("value")))
+	err = rdb.stateMachine.SaveSnapshot(io.Discard, nil, nil)
+	require.Error(t, err)
+	// 快照上传失败后，状态机应重新打开 DB 并可继续服务。
+	require.NoError(t, rdb.Put([]byte("after-failure"), []byte("ok")))
+}
+
+func TestThreeNodeRaftObjectTierLeaderFailover(t *testing.T) {
+	const nodeCount = 3
+	nodes := make([]*RaftDB, nodeCount)
+	cleanups := make([]func(), nodeCount)
+	initialMembers := make(map[uint64]string)
+	for i := 0; i < nodeCount; i++ {
+		initialMembers[uint64(i+1)] = fmt.Sprintf("localhost:%d", 10500+i)
+	}
+
+	for i := 0; i < nodeCount; i++ {
+		tempDir, cleanup := setupTestEnvironment(t)
+		cleanups[i] = cleanup
+		config := createTestRaftConfig(uint64(i+1), 501, fmt.Sprintf("localhost:%d", 10500+i), tempDir)
+		config.InitialMembers = initialMembers
+		options := createTestDBOptions(t, tempDir)
+		options.ObjectTier = ObjectTierOptions{
+			Enabled: true,
+			Store:   newFakeObjectStore(),
+			Prefix:  fmt.Sprintf("three-node-%d", i+1),
+		}
+		rdb, err := OpenRaft(config, options)
+		require.NoError(t, err)
+		nodes[i] = rdb
+	}
+	defer func() {
+		for i, node := range nodes {
+			if node != nil {
+				_ = node.Close()
+			}
+			if cleanups[i] != nil {
+				cleanups[i]()
+			}
+		}
+	}()
+
+	findLeader := func() int {
+		for i, node := range nodes {
+			if node != nil && node.IsLeader() {
+				return i
+			}
+		}
+		return -1
+	}
+	require.Eventually(t, func() bool { return findLeader() >= 0 }, 8*time.Second, 100*time.Millisecond)
+	leader := findLeader()
+	require.NoError(t, nodes[leader].Put([]byte("three-key"), []byte("before")))
+	require.NoError(t, nodes[leader].Close())
+	nodes[leader] = nil
+	require.Eventually(t, func() bool { return findLeader() >= 0 }, 10*time.Second, 100*time.Millisecond)
+	newLeader := findLeader()
+	require.NotEqual(t, leader, newLeader)
+	require.NoError(t, nodes[newLeader].Put([]byte("three-key"), []byte("after")))
+	value, err := nodes[newLeader].Get([]byte("three-key"))
+	require.NoError(t, err)
+	require.Equal(t, []byte("after"), value)
+}
