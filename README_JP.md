@@ -77,10 +77,10 @@ func main() {
 }
 ```
 ## 使用例
-💡 Raftの使用方法については、examples/raftディレクトリの使用例を参照してください。READMEドキュメントでRaftの具体的な使用方法を確認できます。
+💡 Clusterの使用方法については、examples/clusterディレクトリの使用例を参照してください。READMEドキュメントでClusterの具体的な使用方法を確認できます。
 ```bash
-$ cd examples/raft
-$ go build -o raft-example main.go
+$ cd examples/cluster
+$ go build -o cluster-example main.go
 ```
 🔆 knociDBのより多くの機能を体験したい場合は、examples/cmd_clientにコマンドラインクライアントの実装があります。ファイル内のREADMEドキュメントで具体的な使用方法を確認できます。
 ```bash

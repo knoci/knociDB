@@ -78,10 +78,10 @@ func main() {
 ```
 
 ## Examples
-💡 For Raft usage ,please check out usage examples in the `examples/raft` directory, and you can get specific method of using raft through the README document.
+💡 For Cluster usage, please check out usage examples in the `examples/cluster` directory, and you can get the specific method of using Cluster through the README document.
 ```bash
-$ cd examples/raft
-$ go build -o raft-example main.go
+$ cd examples/cluster
+$ go build -o cluster-example main.go
 ```
 🔆 If you want to  experience more features of knociDB, there is a cmd implementation client in the  `examples/cmd_client`, you can obtain the specific method of using cmd_client through the README document in the file.
 ```bash

@@ -1,55 +1,49 @@
-# KnociDB Raft Example
+# KnociDB Cluster Example
 
-This example demonstrates how to build a distributed key-value storage system using KnociDB's Raft consensus module.
+This example demonstrates KnociDB's L1 transparent cluster: a single Raft group with leader-aware write forwarding. With the internal RPC addresses configured, `put/get/delete` can be sent to any node.
 
 ## Usage
 
 ### Compilation
 
 ```bash
-go build -o raft-example main.go
+go build -o cluster-example main.go
 ```
 
 ### Starting the Cluster
 
-#### Start the First Node (as the Initial Node of the Cluster)
+#### Start the First Node (Bootstrap)
 
 ```bash
-# Windows
-.\raft-example --id=1 --addr=localhost:8001 --dir=./node --peers=1=localhost:8001,2=localhost:8002,3=localhost:8003
-
-# Linux/macOS
-./raft-example --id=1 --addr=localhost:8001 --dir=./node --peers=1=localhost:8001,2=localhost:8002,3=localhost:8003
+./cluster-example --id=1 --addr=localhost:8001 --rpc=localhost:9001 \
+  --dir=./node --peers=1=localhost:8001,2=localhost:8002,3=localhost:8003 \
+  --rpc-peers=1=localhost:9001,2=localhost:9002,3=localhost:9003
 ```
 
-#### Start the Second Node and Join the Cluster
+#### Start the Second and Third Nodes
 
 ```bash
-# Windows
-.\raft-example --id=2 --addr=localhost:8002 --dir=./node --peers=1=localhost:8001,2=localhost:8002,3=localhost:8003 --join
+./cluster-example --id=2 --addr=localhost:8002 --rpc=localhost:9002 \
+  --dir=./node --peers=1=localhost:8001,2=localhost:8002,3=localhost:8003 \
+  --rpc-peers=1=localhost:9001,2=localhost:9002,3=localhost:9003 --join
 
-# Linux/macOS
-./raft-example --id=2 --addr=localhost:8002 --dir=./node --peers=1=localhost:8001,2=localhost:8002,3=localhost:8003 --join
+./cluster-example --id=3 --addr=localhost:8003 --rpc=localhost:9003 \
+  --dir=./node --peers=1=localhost:8001,2=localhost:8002,3=localhost:8003 \
+  --rpc-peers=1=localhost:9001,2=localhost:9002,3=localhost:9003 --join
 ```
 
-#### Start the Third Node and Join the Cluster
-
-```bash
-# Windows
-.\raft-example --id=3 --addr=localhost:8003 --dir=./node --peers=1=localhost:8001,2=localhost:8002,3=localhost:8003 --join
-
-# Linux/macOS
-./raft-example --id=3 --addr=localhost:8003 --dir=./node --peers=1=localhost:8001,2=localhost:8002,3=localhost:8003 --join
-```
+On Windows, use `.\cluster-example` instead of `./cluster-example`.
 
 ### Command Line Arguments
 
 - `--id`: Node ID (must be a unique positive integer)
 - `--cluster`: Cluster ID (default is 1)
-- `--addr`: Raft node address (format: host:port)
+- `--addr`: Dragonboat Raft address (format: host:port)
+- `--rpc`: Internal forwarding RPC address (optional)
 - `--dir`: Data directory
 - `--join`: Whether to join an existing cluster as a new node
 - `--peers`: List of cluster members (format: id1=host1:port1,id2=host2:port2,...)
+- `--rpc-peers`: NodeID -> forwarding RPC address (required for follower forwarding)
 - `--sync`: Whether to use synchronous mode (default is true)
 - `--interactive`: Whether to enable interactive mode (default is true)
 
@@ -70,7 +64,7 @@ After starting a node, you can interact with the system using the following comm
 ## Example Workflow
 
 1. Start three nodes to form a cluster
-2. Execute `put name KnociDB` on any node to write data
+2. Execute `put name KnociDB` on a follower; the node forwards to the leader
 3. Execute `get name` on other nodes to verify data synchronization
 4. Execute `leader` to check the current Leader node
 5. Execute `members` to view cluster members

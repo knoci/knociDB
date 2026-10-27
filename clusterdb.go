@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net"
 	"sync"
 	"time"
 
@@ -20,26 +21,32 @@ var (
 	ErrTimeout = errors.New("operation timeout")
 	// ErrCanceled 表示操作被取消
 	ErrCanceled = errors.New("operation canceled")
-	// ErrRaftNotStartted 表示节点未开启
-	ErrNodeNotStarted = errors.New("raft not started")
-	// ErrRaftIsClosed 表示节点已关闭
-	ErrRaftIsClosed = errors.New("raft is closed")
+	// ErrNodeNotStarted 表示节点未开启
+	ErrNodeNotStarted = errors.New("cluster not started")
+	// ErrClusterClosed 表示节点已关闭
+	ErrClusterClosed = errors.New("cluster is closed")
 )
 
-// RaftDB 管理Raft节点和处理共识操作
-type RaftDB struct {
+// ClusterDB 管理单 Raft Group 集群节点和共识操作。
+type ClusterDB struct {
 	nodeHost     *dragonboat.NodeHost
-	config       RaftOptions
+	config       ClusterOptions
 	dbOptions    Options
 	mu           sync.RWMutex
 	leaderID     uint64
 	stateMachine *KVStateMachine
 	state        bool
 	Sync         bool // 是否使用同步模式进行操作
+
+	rpcListener net.Listener
+	rpcWG       sync.WaitGroup
 }
 
-// NewRaftDB 创建一个新的节点管理器
-func OpenRaft(config RaftOptions, dboption Options) (*RaftDB, error) {
+// OpenCluster 打开一个单 Raft Group 的集群节点。
+func OpenCluster(config ClusterOptions, dboption Options) (*ClusterDB, error) {
+	if err := ValidateClusterOptions(&config); err != nil {
+		return nil, err
+	}
 	// 创建NodeHost配置
 	nhc := config.GetNodeHostOptions()
 
@@ -50,7 +57,7 @@ func OpenRaft(config RaftOptions, dboption Options) (*RaftDB, error) {
 	}
 
 	// 创建节点管理器
-	rdb := &RaftDB{
+	rdb := &ClusterDB{
 		nodeHost:  nodeHost,
 		config:    config,
 		dbOptions: dboption,
@@ -59,15 +66,21 @@ func OpenRaft(config RaftOptions, dboption Options) (*RaftDB, error) {
 		Sync:      config.Sync,
 	}
 
-	err = rdb.start()
-	if err != nil {
+	if err = rdb.start(); err != nil {
+		nodeHost.Close()
 		return nil, err
+	}
+	if config.RPCAddress != "" {
+		if err = rdb.startRPC(); err != nil {
+			_ = rdb.stop()
+			return nil, err
+		}
 	}
 	return rdb, nil
 }
 
-// Start 启动Raft节点
-func (rdb *RaftDB) start() error {
+// start 启动本地存储和 Raft 副本。
+func (rdb *ClusterDB) start() error {
 	rdb.mu.Lock()
 	defer rdb.mu.Unlock()
 	// 创建状态机工厂函数
@@ -82,7 +95,7 @@ func (rdb *RaftDB) start() error {
 	}
 
 	// 获取Raft配置
-	rc := rdb.config.GetRaftOptions()
+	rc := rdb.config.GetRaftConfig()
 
 	// 检查是否需要加入现有集群
 	if rdb.config.JoinCluster {
@@ -115,18 +128,25 @@ func (rdb *RaftDB) start() error {
 	return nil
 }
 
-func (rdb *RaftDB) Close() error {
+func (rdb *ClusterDB) Close() error {
 	if !rdb.state {
-		return ErrRaftIsClosed
+		return ErrClusterClosed
 	}
 	return rdb.stop()
 }
 
-// Stop 停止Raft节点
-func (rdb *RaftDB) stop() error {
+// stop 停止本地 RPC、Raft 副本和 NodeHost。
+func (rdb *ClusterDB) stop() error {
+	rdb.mu.Lock()
+	if rdb.rpcListener != nil {
+		_ = rdb.rpcListener.Close()
+		rdb.rpcListener = nil
+	}
+	rdb.mu.Unlock()
+	rdb.rpcWG.Wait()
+
 	rdb.mu.Lock()
 	defer rdb.mu.Unlock()
-
 	if rdb.nodeHost != nil {
 		rdb.nodeHost.Close()
 		rdb.nodeHost = nil
@@ -136,19 +156,22 @@ func (rdb *RaftDB) stop() error {
 }
 
 // leaderMonitor 监控Leader变化
-func (rdb *RaftDB) leaderMonitor() {
+func (rdb *ClusterDB) leaderMonitor() {
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ticker.C:
-			if rdb.nodeHost == nil {
+			rdb.mu.RLock()
+			nodeHost := rdb.nodeHost
+			rdb.mu.RUnlock()
+			if nodeHost == nil {
 				return
 			}
 
 			// 获取Leader信息
-			leaderID, _, valid, err := rdb.nodeHost.GetLeaderID(rdb.config.ClusterID)
+			leaderID, _, valid, err := nodeHost.GetLeaderID(rdb.config.ClusterID)
 			if err != nil || !valid {
 				continue
 			}
@@ -167,7 +190,7 @@ func (rdb *RaftDB) leaderMonitor() {
 }
 
 // IsLeader 检查当前节点是否是Leader
-func (rdb *RaftDB) IsLeader() bool {
+func (rdb *ClusterDB) IsLeader() bool {
 	rdb.mu.RLock()
 	defer rdb.mu.RUnlock()
 
@@ -175,7 +198,7 @@ func (rdb *RaftDB) IsLeader() bool {
 }
 
 // GetLeaderID 获取当前Leader的NodeID
-func (rdb *RaftDB) GetLeaderID() (uint64, error) {
+func (rdb *ClusterDB) GetLeaderID() (uint64, error) {
 	rdb.mu.RLock()
 	defer rdb.mu.RUnlock()
 
@@ -194,8 +217,8 @@ func (rdb *RaftDB) GetLeaderID() (uint64, error) {
 	return leaderID, nil
 }
 
-// Put 通过Raft共识写入键值对
-func (rdb *RaftDB) Put(key, value []byte) error {
+// putLocal 在当前节点通过 Raft 共识写入键值对。
+func (rdb *ClusterDB) putLocal(key, value []byte) error {
 	if rdb.nodeHost == nil || !rdb.state {
 		return ErrNodeNotStarted
 	}
@@ -245,8 +268,8 @@ func (rdb *RaftDB) Put(key, value []byte) error {
 	}
 }
 
-// Delete 通过Raft共识删除键
-func (rdb *RaftDB) Delete(key []byte) error {
+// deleteLocal 在当前节点通过 Raft 共识删除键。
+func (rdb *ClusterDB) deleteLocal(key []byte) error {
 	if rdb.nodeHost == nil || !rdb.state {
 		return ErrNodeNotStarted
 	}
@@ -295,8 +318,8 @@ func (rdb *RaftDB) Delete(key []byte) error {
 	}
 }
 
-// Get 通过Raft共识读取键值
-func (rdb *RaftDB) Get(key []byte) ([]byte, error) {
+// getLocal 在当前节点通过 Raft ReadIndex 读取键值。
+func (rdb *ClusterDB) getLocal(key []byte) ([]byte, error) {
 	if rdb.nodeHost == nil || !rdb.state {
 		return nil, ErrNodeNotStarted
 	}
@@ -364,7 +387,7 @@ func (rdb *RaftDB) Get(key []byte) ([]byte, error) {
 }
 
 // BatchWrite 通过Raft共识批量写入
-func (rdb *RaftDB) BatchWrite(commands []Command, batchID uint64) error {
+func (rdb *ClusterDB) BatchWrite(commands []Command, batchID uint64) error {
 	if rdb.nodeHost == nil || !rdb.state {
 		return ErrNodeNotStarted
 	}
@@ -415,7 +438,7 @@ func (rdb *RaftDB) BatchWrite(commands []Command, batchID uint64) error {
 }
 
 // GetClusterMembership 获取集群成员信息
-func (rdb *RaftDB) GetClusterMembership() (map[uint64]string, error) {
+func (rdb *ClusterDB) GetClusterMembership() (map[uint64]string, error) {
 	rdb.mu.RLock()
 	defer rdb.mu.RUnlock()
 
@@ -468,7 +491,7 @@ func (rdb *RaftDB) GetClusterMembership() (map[uint64]string, error) {
 }
 
 // AddNode 向集群添加新节点
-func (rdb *RaftDB) AddNode(nodeID uint64, address string) error {
+func (rdb *ClusterDB) AddNode(nodeID uint64, address string) error {
 	// 先在不持有写锁的情况下判断状态和 Leader，避免 Lock 后调用 IsLeader 造成重入死锁
 	rdb.mu.RLock()
 	started := rdb.nodeHost != nil && rdb.state
@@ -520,7 +543,7 @@ func (rdb *RaftDB) AddNode(nodeID uint64, address string) error {
 }
 
 // RemoveNode 从集群移除节点
-func (rdb *RaftDB) RemoveNode(nodeID uint64) error {
+func (rdb *ClusterDB) RemoveNode(nodeID uint64) error {
 	rdb.mu.RLock()
 	started := rdb.nodeHost != nil && rdb.state
 	leader := rdb.leaderID == rdb.config.NodeID

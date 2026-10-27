@@ -241,7 +241,7 @@ func TestRegressionRaftBatchCommand(t *testing.T) {
 }
 
 func TestRegressionAddNodeNoDeadlock(t *testing.T) {
-	rdb := &RaftDB{config: RaftOptions{NodeID: 1}}
+	rdb := &ClusterDB{config: ClusterOptions{NodeID: 1}}
 	done := make(chan error, 1)
 	go func() { done <- rdb.AddNode(2, "localhost:1") }()
 	select {

@@ -13,7 +13,7 @@ import (
 )
 
 func setupTestEnvironment(t *testing.T) (string, func()) {
-	tempDir, err := os.MkdirTemp("", "raft-test-")
+	tempDir, err := os.MkdirTemp("", "cluster-test-")
 	require.NoError(t, err)
 
 	cleanup := func() {
@@ -26,12 +26,12 @@ func setupTestEnvironment(t *testing.T) (string, func()) {
 func createTestDB(t *testing.T, dirPath string) *DB {
 	options := DefaultOptions
 	options.DirPath = dirPath
-	options.RaftPath = filepath.Join(dirPath, "raft")
+	options.ClusterPath = filepath.Join(dirPath, "raft")
 	options.SnapshotPath = filepath.Join(dirPath, "snapshot")
 
 	err := os.MkdirAll(options.DirPath, os.ModePerm)
 	require.NoError(t, err)
-	err = os.MkdirAll(options.RaftPath, os.ModePerm)
+	err = os.MkdirAll(options.ClusterPath, os.ModePerm)
 	require.NoError(t, err)
 	err = os.MkdirAll(options.SnapshotPath, os.ModePerm)
 	require.NoError(t, err)
@@ -42,12 +42,12 @@ func createTestDB(t *testing.T, dirPath string) *DB {
 func createTestDBOptions(t *testing.T, dirPath string) Options {
 	options := DefaultOptions
 	options.DirPath = dirPath
-	options.RaftPath = filepath.Join(dirPath, "raft")
+	options.ClusterPath = filepath.Join(dirPath, "raft")
 	options.SnapshotPath = filepath.Join(dirPath, "snapshot")
 
 	err := os.MkdirAll(options.DirPath, os.ModePerm)
 	require.NoError(t, err)
-	err = os.MkdirAll(options.RaftPath, os.ModePerm)
+	err = os.MkdirAll(options.ClusterPath, os.ModePerm)
 	require.NoError(t, err)
 	err = os.MkdirAll(options.SnapshotPath, os.ModePerm)
 	require.NoError(t, err)
@@ -55,8 +55,8 @@ func createTestDBOptions(t *testing.T, dirPath string) Options {
 	return options
 }
 
-func createTestRaftConfig(nodeID, clusterID uint64, raftAddress, dataDir string) RaftOptions {
-	config := DefaultRaftOptions(nodeID, clusterID, raftAddress, dataDir)
+func createTestClusterOptions(nodeID, clusterID uint64, raftAddress, dataDir string) ClusterOptions {
+	config := DefaultClusterOptions(nodeID, clusterID, raftAddress, dataDir)
 	config.TickMs = 50
 	config.ElectionRTTMs = 5
 	config.HeartbeatRTTMs = 1
@@ -69,41 +69,44 @@ func createTestRaftConfig(nodeID, clusterID uint64, raftAddress, dataDir string)
 	return config
 }
 
-func TestValidateRaftOptions(t *testing.T) {
+func TestValidateClusterOptions(t *testing.T) {
 	t.Run("Valid config", func(t *testing.T) {
-		config := DefaultRaftOptions(1, 1, "localhost:10000", "/tmp/raft")
-		err := ValidateRaftOptions(&config)
+		config := DefaultClusterOptions(1, 1, "localhost:10000", "/tmp/raft")
+		err := ValidateClusterOptions(&config)
 		assert.NoError(t, err)
+		assert.Equal(t, "localhost:10000", config.InitialMembers[1])
+		_, hasZero := config.InitialMembers[0]
+		assert.False(t, hasZero)
 	})
 
 	t.Run("Invalid NodeID", func(t *testing.T) {
-		config := DefaultRaftOptions(0, 1, "localhost:10000", "/tmp/raft")
-		err := ValidateRaftOptions(&config)
+		config := DefaultClusterOptions(0, 1, "localhost:10000", "/tmp/raft")
+		err := ValidateClusterOptions(&config)
 		assert.Error(t, err)
 	})
 
 	t.Run("Invalid ClusterID", func(t *testing.T) {
-		config := DefaultRaftOptions(1, 0, "localhost:10000", "/tmp/raft")
-		err := ValidateRaftOptions(&config)
+		config := DefaultClusterOptions(1, 0, "localhost:10000", "/tmp/raft")
+		err := ValidateClusterOptions(&config)
 		assert.Error(t, err)
 	})
 
 	t.Run("Empty RaftAddress", func(t *testing.T) {
-		config := DefaultRaftOptions(1, 1, "", "/tmp/raft")
-		err := ValidateRaftOptions(&config)
+		config := DefaultClusterOptions(1, 1, "", "/tmp/raft")
+		err := ValidateClusterOptions(&config)
 		assert.Error(t, err)
 	})
 
 	t.Run("Empty DataDir", func(t *testing.T) {
-		config := DefaultRaftOptions(1, 1, "localhost:10000", "")
-		err := ValidateRaftOptions(&config)
+		config := DefaultClusterOptions(1, 1, "localhost:10000", "")
+		err := ValidateClusterOptions(&config)
 		assert.Error(t, err)
 	})
 
 	t.Run("No InitialMembers", func(t *testing.T) {
-		config := DefaultRaftOptions(1, 1, "localhost:10000", "/tmp/raft")
+		config := DefaultClusterOptions(1, 1, "localhost:10000", "/tmp/raft")
 		config.InitialMembers = map[uint64]string{}
-		err := ValidateRaftOptions(&config)
+		err := ValidateClusterOptions(&config)
 		assert.Error(t, err)
 	})
 }
@@ -205,14 +208,14 @@ func TestCommandSerialization(t *testing.T) {
 	})
 }
 
-func TestRaftDB(t *testing.T) {
+func TestClusterDB(t *testing.T) {
 	tempDir, cleanup := setupTestEnvironment(t)
 	defer cleanup()
 
-	config := createTestRaftConfig(1, 100, "localhost:10000", tempDir)
+	config := createTestClusterOptions(1, 100, "localhost:10000", tempDir)
 	option := createTestDBOptions(t, tempDir)
 
-	nm, err := OpenRaft(config, option)
+	nm, err := OpenCluster(config, option)
 	require.NoError(t, err)
 
 	time.Sleep(2 * time.Second)
@@ -260,9 +263,9 @@ func TestRaftDB(t *testing.T) {
 	require.NoError(t, err)
 }
 
-func TestMultiNodeRaftCluster(t *testing.T) {
+func TestMultiNodeCluster(t *testing.T) {
 	nodeCount := 3
-	nodes := make([]*RaftDB, nodeCount)
+	nodes := make([]*ClusterDB, nodeCount)
 	tempDirs := make([]string, nodeCount)
 	cleanups := make([]func(), nodeCount)
 
@@ -282,13 +285,13 @@ func TestMultiNodeRaftCluster(t *testing.T) {
 		nodeID := uint64(i + 1)
 		port := 10100 + i
 		address := fmt.Sprintf("localhost:%d", port)
-		config := createTestRaftConfig(nodeID, 300, address, tempDir)
+		config := createTestClusterOptions(nodeID, 300, address, tempDir)
 		config.InitialMembers = initialMembers
 		option := createTestDBOptions(t, tempDir)
 
-		raftDB, err := OpenRaft(config, option)
+		clusterDB, err := OpenCluster(config, option)
 		require.NoError(t, err)
-		nodes[i] = raftDB
+		nodes[i] = clusterDB
 	}
 
 	defer func() {
@@ -325,4 +328,69 @@ func TestMultiNodeRaftCluster(t *testing.T) {
 			assert.Equal(t, []byte("cluster-value"), value)
 		})
 	}
+}
+
+func TestClusterLeaderForwarding(t *testing.T) {
+	const nodeCount = 3
+	nodes := make([]*ClusterDB, nodeCount)
+	cleanups := make([]func(), nodeCount)
+	initialMembers := make(map[uint64]string)
+	peerRPC := make(map[uint64]string)
+	for i := 0; i < nodeCount; i++ {
+		nodeID := uint64(i + 1)
+		initialMembers[nodeID] = fmt.Sprintf("localhost:%d", 10600+i)
+		peerRPC[nodeID] = fmt.Sprintf("localhost:%d", 10700+i)
+	}
+
+	for i := 0; i < nodeCount; i++ {
+		tempDir, cleanup := setupTestEnvironment(t)
+		cleanups[i] = cleanup
+		nodeID := uint64(i + 1)
+		config := createTestClusterOptions(nodeID, 600, fmt.Sprintf("localhost:%d", 10600+i), tempDir)
+		config.InitialMembers = initialMembers
+		config.RPCAddress = peerRPC[nodeID]
+		config.PeerRPC = peerRPC
+		option := createTestDBOptions(t, tempDir)
+		node, err := OpenCluster(config, option)
+		require.NoError(t, err)
+		nodes[i] = node
+	}
+
+	defer func() {
+		for i, node := range nodes {
+			if node != nil {
+				_ = node.Close()
+			}
+			if cleanups[i] != nil {
+				cleanups[i]()
+			}
+		}
+	}()
+
+	time.Sleep(5 * time.Second)
+	leaderIndex := -1
+	for i, node := range nodes {
+		if node.IsLeader() {
+			leaderIndex = i
+			break
+		}
+	}
+	require.GreaterOrEqual(t, leaderIndex, 0)
+
+	follower := -1
+	for i := range nodes {
+		if i != leaderIndex {
+			follower = i
+			break
+		}
+	}
+	require.GreaterOrEqual(t, follower, 0)
+
+	require.NoError(t, nodes[follower].Put([]byte("forward-key"), []byte("forward-value")))
+	value, err := nodes[follower].Get([]byte("forward-key"))
+	require.NoError(t, err)
+	require.Equal(t, []byte("forward-value"), value)
+	value, err = nodes[leaderIndex].Get([]byte("forward-key"))
+	require.NoError(t, err)
+	require.Equal(t, []byte("forward-value"), value)
 }

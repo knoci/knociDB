@@ -95,7 +95,7 @@ func TestObjectTierSnapshotRoundTrip(t *testing.T) {
 	options := DefaultOptions
 	options.DirPath = dbDir
 	options.SnapshotPath = snapDir
-	options.RaftPath = filepath.Join(base, "raft")
+	options.ClusterPath = filepath.Join(base, "raft")
 	options.ObjectTier = ObjectTierOptions{
 		Enabled:  true,
 		Store:    fake,
@@ -137,7 +137,7 @@ func TestObjectTierColdSegmentUploadAndNoMemtableWAL(t *testing.T) {
 	options := DefaultOptions
 	options.DirPath = dbDir
 	options.SnapshotPath = snapDir
-	options.RaftPath = filepath.Join(base, "raft")
+	options.ClusterPath = filepath.Join(base, "raft")
 	options.ValueLogFileSize = 8 * KB
 	options.MemtableSize = 32 * KB
 	options.WaitMemSpaceTimeout = time.Second
@@ -182,7 +182,7 @@ func TestObjectTierSnapshotUploadFailure(t *testing.T) {
 	options := DefaultOptions
 	options.DirPath = dbDir
 	options.SnapshotPath = snapDir
-	options.RaftPath = filepath.Join(base, "raft")
+	options.ClusterPath = filepath.Join(base, "raft")
 	options.ObjectTier = ObjectTierOptions{
 		Enabled: true,
 		Store:   fake,
@@ -202,7 +202,7 @@ func TestObjectTierDisabledDoesNotUpload(t *testing.T) {
 	options := DefaultOptions
 	options.DirPath = filepath.Join(base, "db")
 	options.SnapshotPath = filepath.Join(base, "snapshots")
-	options.RaftPath = filepath.Join(base, "raft")
+	options.ClusterPath = filepath.Join(base, "raft")
 
 	db, err := Open(options)
 	require.NoError(t, err)
@@ -212,11 +212,11 @@ func TestObjectTierDisabledDoesNotUpload(t *testing.T) {
 
 var _ wal.ObjectStorage = (*fakeObjectStore)(nil)
 
-func TestRaftSnapshotUploadsToObjectTier(t *testing.T) {
+func TestClusterSnapshotUploadsToObjectTier(t *testing.T) {
 	base := t.TempDir()
 	fake := newFakeObjectStore()
 
-	config := createTestRaftConfig(1, 400, "localhost:10300", base)
+	config := createTestClusterOptions(1, 400, "localhost:10300", base)
 	options := createTestDBOptions(t, base)
 	options.ObjectTier = ObjectTierOptions{
 		Enabled: true,
@@ -224,7 +224,7 @@ func TestRaftSnapshotUploadsToObjectTier(t *testing.T) {
 		Prefix:  "raft-node-1",
 	}
 
-	rdb, err := OpenRaft(config, options)
+	rdb, err := OpenCluster(config, options)
 	require.NoError(t, err)
 	defer rdb.Close()
 
@@ -243,13 +243,13 @@ func TestRaftSnapshotUploadsToObjectTier(t *testing.T) {
 	require.True(t, found, "raft leader snapshot should be uploaded, keys=%v", fake.keys())
 }
 
-func TestRaftNodeDiskLossRestoresFromObjectTier(t *testing.T) {
+func TestClusterNodeDiskLossRestoresFromObjectTier(t *testing.T) {
 	base := t.TempDir()
 	fake := newFakeObjectStore()
 	dbDir := filepath.Join(base, "db")
 	require.NoError(t, os.MkdirAll(dbDir, os.ModePerm))
 
-	config := createTestRaftConfig(1, 401, "localhost:10301", base)
+	config := createTestClusterOptions(1, 401, "localhost:10301", base)
 	options := createTestDBOptions(t, base)
 	options.DirPath = dbDir
 	options.ObjectTier = ObjectTierOptions{
@@ -258,7 +258,7 @@ func TestRaftNodeDiskLossRestoresFromObjectTier(t *testing.T) {
 		Prefix:  "raft-disk-loss",
 	}
 
-	rdb, err := OpenRaft(config, options)
+	rdb, err := OpenCluster(config, options)
 	require.NoError(t, err)
 	require.Eventually(t, func() bool { return rdb.IsLeader() }, 5*time.Second, 100*time.Millisecond)
 	require.NoError(t, rdb.Put([]byte("disk-loss-key"), []byte("disk-loss-value")))
@@ -269,7 +269,7 @@ func TestRaftNodeDiskLossRestoresFromObjectTier(t *testing.T) {
 	require.NoError(t, os.RemoveAll(dbDir))
 	require.NoError(t, os.MkdirAll(dbDir, os.ModePerm))
 
-	reopened, err := OpenRaft(config, options)
+	reopened, err := OpenCluster(config, options)
 	require.NoError(t, err)
 	defer reopened.Close()
 	require.Eventually(t, func() bool { return reopened.IsLeader() }, 5*time.Second, 100*time.Millisecond)
@@ -278,9 +278,9 @@ func TestRaftNodeDiskLossRestoresFromObjectTier(t *testing.T) {
 	require.Equal(t, []byte("disk-loss-value"), value)
 }
 
-func TestMultiNodeRaftObjectTierFailover(t *testing.T) {
+func TestMultiNodeClusterObjectTierFailover(t *testing.T) {
 	const nodeCount = 5
-	nodes := make([]*RaftDB, nodeCount)
+	nodes := make([]*ClusterDB, nodeCount)
 	stores := make([]*fakeObjectStore, nodeCount)
 	cleanups := make([]func(), nodeCount)
 
@@ -295,7 +295,7 @@ func TestMultiNodeRaftObjectTierFailover(t *testing.T) {
 		stores[i] = newFakeObjectStore()
 
 		nodeID := uint64(i + 1)
-		config := createTestRaftConfig(nodeID, 500, fmt.Sprintf("localhost:%d", 10400+i), tempDir)
+		config := createTestClusterOptions(nodeID, 500, fmt.Sprintf("localhost:%d", 10400+i), tempDir)
 		config.InitialMembers = initialMembers
 		config.SnapshotIntervalSeconds = 1
 		options := createTestDBOptions(t, tempDir)
@@ -304,7 +304,7 @@ func TestMultiNodeRaftObjectTierFailover(t *testing.T) {
 			Store:   stores[i],
 			Prefix:  fmt.Sprintf("raft-node-%d", nodeID),
 		}
-		rdb, err := OpenRaft(config, options)
+		rdb, err := OpenCluster(config, options)
 		require.NoError(t, err)
 		nodes[i] = rdb
 	}
@@ -358,12 +358,12 @@ func TestMultiNodeRaftObjectTierFailover(t *testing.T) {
 	require.Equal(t, []byte("v3"), value)
 }
 
-func TestRaftSnapshotObjectStoreFailure(t *testing.T) {
+func TestClusterSnapshotObjectStoreFailure(t *testing.T) {
 	base := t.TempDir()
 	fake := newFakeObjectStore()
 	fake.failUpload = true
 
-	config := createTestRaftConfig(1, 402, "localhost:10302", base)
+	config := createTestClusterOptions(1, 402, "localhost:10302", base)
 	options := createTestDBOptions(t, base)
 	options.ObjectTier = ObjectTierOptions{
 		Enabled: true,
@@ -371,7 +371,7 @@ func TestRaftSnapshotObjectStoreFailure(t *testing.T) {
 		Prefix:  "raft-fail",
 	}
 
-	rdb, err := OpenRaft(config, options)
+	rdb, err := OpenCluster(config, options)
 	require.NoError(t, err)
 	defer rdb.Close()
 	require.Eventually(t, func() bool { return rdb.IsLeader() }, 5*time.Second, 100*time.Millisecond)
@@ -382,9 +382,9 @@ func TestRaftSnapshotObjectStoreFailure(t *testing.T) {
 	require.NoError(t, rdb.Put([]byte("after-failure"), []byte("ok")))
 }
 
-func TestThreeNodeRaftObjectTierLeaderFailover(t *testing.T) {
+func TestThreeNodeClusterObjectTierLeaderFailover(t *testing.T) {
 	const nodeCount = 3
-	nodes := make([]*RaftDB, nodeCount)
+	nodes := make([]*ClusterDB, nodeCount)
 	cleanups := make([]func(), nodeCount)
 	initialMembers := make(map[uint64]string)
 	for i := 0; i < nodeCount; i++ {
@@ -394,7 +394,7 @@ func TestThreeNodeRaftObjectTierLeaderFailover(t *testing.T) {
 	for i := 0; i < nodeCount; i++ {
 		tempDir, cleanup := setupTestEnvironment(t)
 		cleanups[i] = cleanup
-		config := createTestRaftConfig(uint64(i+1), 501, fmt.Sprintf("localhost:%d", 10500+i), tempDir)
+		config := createTestClusterOptions(uint64(i+1), 501, fmt.Sprintf("localhost:%d", 10500+i), tempDir)
 		config.InitialMembers = initialMembers
 		options := createTestDBOptions(t, tempDir)
 		options.ObjectTier = ObjectTierOptions{
@@ -402,7 +402,7 @@ func TestThreeNodeRaftObjectTierLeaderFailover(t *testing.T) {
 			Store:   newFakeObjectStore(),
 			Prefix:  fmt.Sprintf("three-node-%d", i+1),
 		}
-		rdb, err := OpenRaft(config, options)
+		rdb, err := OpenCluster(config, options)
 		require.NoError(t, err)
 		nodes[i] = rdb
 	}

@@ -19,14 +19,16 @@ const (
 
 // 命令行参数
 var (
-	nodeID      = flag.Uint64("id", 1, "Node ID")
-	clusterID   = flag.Uint64("cluster", defaultClusterID, "Cluster ID")
-	raftAddress = flag.String("addr", "localhost:8001", "Raft node address")
-	dataDir     = flag.String("dir", "./node", "Data directory")
-	join        = flag.Bool("join", false, "Join existing cluster")
-	peersStr    = flag.String("peers", "", "Cluster members list, format: id1=host1:port1,id2=host2:port2")
-	sync        = flag.Bool("sync", true, "Use synchronous mode")
-	interactive = flag.Bool("interactive", true, "Enable interactive mode")
+	nodeID         = flag.Uint64("id", 1, "Node ID")
+	clusterID      = flag.Uint64("cluster", defaultClusterID, "Cluster ID")
+	clusterAddress = flag.String("addr", "localhost:8001", "Cluster Raft address")
+	rpcAddress     = flag.String("rpc", "", "Internal forwarding RPC address")
+	dataDir        = flag.String("dir", "./node", "Data directory")
+	join           = flag.Bool("join", false, "Join existing cluster")
+	peersStr       = flag.String("peers", "", "Cluster members, format: id1=host1:port1,id2=host2:port2")
+	rpcPeersStr    = flag.String("rpc-peers", "", "Forwarding RPC peers, format: id1=host1:port1,id2=host2:port2")
+	sync           = flag.Bool("sync", true, "Use synchronous mode")
+	interactive    = flag.Bool("interactive", true, "Enable interactive mode")
 )
 
 // 解析peers字符串为map
@@ -55,7 +57,7 @@ func parsePeers(peersStr string) (map[uint64]string, error) {
 }
 
 // 处理用户输入命令
-func handleCommand(raftDB *knocidb.RaftDB) {
+func handleCommand(clusterDB *knocidb.ClusterDB) {
 	for {
 		fmt.Print("KnociDB> ")
 		var cmd, key, value string
@@ -67,7 +69,7 @@ func handleCommand(raftDB *knocidb.RaftDB) {
 				fmt.Println("Usage: put <key> <value>")
 				continue
 			}
-			err := raftDB.Put([]byte(key), []byte(value))
+			err := clusterDB.Put([]byte(key), []byte(value))
 			if err != nil {
 				fmt.Printf("Error: %v\n", err)
 			} else {
@@ -79,7 +81,7 @@ func handleCommand(raftDB *knocidb.RaftDB) {
 				fmt.Println("Usage: get <key>")
 				continue
 			}
-			val, err := raftDB.Get([]byte(key))
+			val, err := clusterDB.Get([]byte(key))
 			if err != nil {
 				fmt.Printf("Error: %v\n", err)
 			} else {
@@ -91,7 +93,7 @@ func handleCommand(raftDB *knocidb.RaftDB) {
 				fmt.Println("Usage: delete <key>")
 				continue
 			}
-			err := raftDB.Delete([]byte(key))
+			err := clusterDB.Delete([]byte(key))
 			if err != nil {
 				fmt.Printf("Error: %v\n", err)
 			} else {
@@ -99,10 +101,10 @@ func handleCommand(raftDB *knocidb.RaftDB) {
 			}
 
 		case "leader":
-			if raftDB.IsLeader() {
+			if clusterDB.IsLeader() {
 				fmt.Println("Current node is Leader")
 			} else {
-				leaderID, err := raftDB.GetLeaderID()
+				leaderID, err := clusterDB.GetLeaderID()
 				if err != nil {
 					fmt.Printf("Failed to get Leader: %v\n", err)
 				} else {
@@ -111,7 +113,7 @@ func handleCommand(raftDB *knocidb.RaftDB) {
 			}
 
 		case "members":
-			members, err := raftDB.GetClusterMembership()
+			members, err := clusterDB.GetClusterMembership()
 			if err != nil {
 				fmt.Printf("Failed to get cluster members: %v\n", err)
 			} else {
@@ -131,7 +133,7 @@ func handleCommand(raftDB *knocidb.RaftDB) {
 				fmt.Printf("Invalid node ID: %v\n", err)
 				continue
 			}
-			err = raftDB.AddNode(nodeID, value)
+			err = clusterDB.AddNode(nodeID, value)
 			if err != nil {
 				fmt.Printf("Failed to add node: %v\n", err)
 			} else {
@@ -148,7 +150,7 @@ func handleCommand(raftDB *knocidb.RaftDB) {
 				fmt.Printf("Invalid node ID: %v\n", err)
 				continue
 			}
-			err = raftDB.RemoveNode(nodeID)
+			err = clusterDB.RemoveNode(nodeID)
 			if err != nil {
 				fmt.Printf("Failed to remove node: %v\n", err)
 			} else {
@@ -190,36 +192,43 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to parse peers: %v", err)
 	}
+	rpcPeers, err := parsePeers(*rpcPeersStr)
+	if err != nil {
+		log.Fatalf("Failed to parse rpc peers: %v", err)
+	}
 
 	// 如果peers为空，添加自身
 	if len(peers) == 0 {
-		peers[*nodeID] = *raftAddress
+		peers[*nodeID] = *clusterAddress
 	}
 
 	// 创建DB配置
 	options := knocidb.DefaultOptions
 	options.DirPath = nodeDir
-	options.RaftPath = filepath.Join(nodeDir, "raft")
+	options.ClusterPath = filepath.Join(nodeDir, "cluster")
 	options.SnapshotPath = filepath.Join(nodeDir, "snapshot")
 
-	// 创建Raft配置
-	config := knocidb.DefaultRaftOptions(*nodeID, *clusterID, *raftAddress, nodeDir)
+	// 创建Cluster配置
+	config := knocidb.DefaultClusterOptions(*nodeID, *clusterID, *clusterAddress, nodeDir)
 	config.JoinCluster = *join
 	config.InitialMembers = peers
+	config.RPCAddress = *rpcAddress
+	config.PeerRPC = rpcPeers
 	config.Sync = *sync
 
-	// 打开RaftDB
-	raftDB, err := knocidb.OpenRaft(config, options)
+	// 打开ClusterDB
+	clusterDB, err := knocidb.OpenCluster(config, options)
 	if err != nil {
-		log.Fatalf("Failed to start Raft node: %v", err)
+		log.Fatalf("Failed to start Cluster node: %v", err)
 	}
-	defer raftDB.Close()
+	defer clusterDB.Close()
 
 	// 打印节点信息
-	fmt.Printf("KnociDB Raft node started:\n")
+	fmt.Printf("KnociDB Cluster node started:\n")
 	fmt.Printf("  Node ID: %d\n", *nodeID)
 	fmt.Printf("  Cluster ID: %d\n", *clusterID)
-	fmt.Printf("  Address: %s\n", *raftAddress)
+	fmt.Printf("  Raft address: %s\n", *clusterAddress)
+	fmt.Printf("  RPC address: %s\n", *rpcAddress)
 	fmt.Printf("  Data directory: %s\n", nodeDir)
 	fmt.Printf("  Sync mode: %v\n", *sync)
 	fmt.Printf("  Cluster members: %v\n", peers)
@@ -230,7 +239,7 @@ func main() {
 
 	// 如果启用交互模式，启动命令处理
 	if *interactive {
-		go handleCommand(raftDB)
+		go handleCommand(clusterDB)
 	}
 
 	// 等待信号

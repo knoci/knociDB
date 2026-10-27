@@ -78,10 +78,10 @@ func main() {
 ```
 
 ## 示例
-💡 关于Raft的使用，请查看`examples/raft`目录中的使用示例，您可以通过该文件中的README文档获取使用raft的具体方法。
+💡 关于 Cluster 的使用，请查看 `examples/cluster` 目录中的使用示例，您可以通过该文件中的 README 文档获取使用 Cluster 的具体方法。
 ```bash
-$ cd examples/raft
-$ go build -o raft-example main.go
+$ cd examples/cluster
+$ go build -o cluster-example main.go
 ```
 🔆 如果您想体验knociDB的更多功能，在`examples/cmd_client`中有一个命令行实现客户端，您可以通过该文件中的README文档获取使用cmd_client的具体方法。
 ```bash

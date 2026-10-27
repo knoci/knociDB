@@ -27,7 +27,7 @@ var (
 
 type Client struct {
 	db           *knocidb.DB
-	distributeDB *knocidb.RaftDB
+	distributeDB *knocidb.ClusterDB
 	isDistribute bool
 	batch        *BatchClient // 批处理客户端
 }
@@ -36,13 +36,13 @@ func NewClient(isDistribute bool) (*Client, error) {
 	if isDistribute {
 		// 创建分布式数据库目录
 		dbDir := filepath.Join(*dirPath, fmt.Sprintf("%d", *nodeID), "db")
-		raftDir := filepath.Join(*dirPath, fmt.Sprintf("%d", *nodeID), "raft")
+		clusterDir := filepath.Join(*dirPath, fmt.Sprintf("%d", *nodeID), "cluster")
 
 		if err := os.MkdirAll(dbDir, 0750); err != nil {
 			return nil, fmt.Errorf("create dir failed: %v", err)
 		}
-		if err := os.MkdirAll(raftDir, 0750); err != nil {
-			return nil, fmt.Errorf("create raft dir failed: %v", err)
+		if err := os.MkdirAll(clusterDir, 0750); err != nil {
+			return nil, fmt.Errorf("create cluster dir failed: %v", err)
 		}
 
 		// 解析peers列表
@@ -64,12 +64,12 @@ func NewClient(isDistribute bool) (*Client, error) {
 			}
 		}
 
-		// 创建Raft配置
-		cfg := knocidb.RaftOptions{
+		// 创建 Cluster 配置
+		cfg := knocidb.ClusterOptions{
 			NodeID:                  *nodeID,
 			ClusterID:               1, // 使用固定的集群ID
 			RaftAddress:             *listenAddr,
-			DataDir:                 raftDir,
+			DataDir:                 clusterDir,
 			JoinCluster:             *join,
 			InitialMembers:          initialMembers,
 			TickMs:                  100,
@@ -83,12 +83,12 @@ func NewClient(isDistribute bool) (*Client, error) {
 		dbOpts := knocidb.DefaultOptions
 		dbOpts.DirPath = dbDir
 		dbOpts.PartitionNum = *partitionNum
-		dbOpts.RaftPath = raftDir
+		dbOpts.ClusterPath = clusterDir
 
 		// 创建分布式数据库
-		distributeDB, err := knocidb.OpenRaft(cfg, dbOpts)
+		distributeDB, err := knocidb.OpenCluster(cfg, dbOpts)
 		if err != nil {
-			return nil, fmt.Errorf("open raft database failed: %v", err)
+			return nil, fmt.Errorf("open cluster database failed: %v", err)
 		}
 
 		client := &Client{distributeDB: distributeDB, isDistribute: true}
@@ -121,7 +121,7 @@ func (c *Client) Close() error {
 	if c.isDistribute {
 		// 先关闭分布式数据库
 		if err := c.distributeDB.Close(); err != nil {
-			return fmt.Errorf("close raft database failed: %v", err)
+			return fmt.Errorf("close cluster database failed: %v", err)
 		}
 		// 再关闭底层数据库
 		return c.db.Close()

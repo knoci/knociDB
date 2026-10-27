@@ -17,8 +17,8 @@ type Options struct {
 	// SnapshotPath 指定存储快照文件的目录路径
 	SnapshotPath string
 
-	// RaftPath 指定Raft有关目录路径
-	RaftPath string
+	// ClusterPath 指定 Cluster/Raft 元数据目录路径。
+	ClusterPath string
 
 	// MemtableSize 表示内存表的最大字节大小 默认值为 64MB
 	MemtableSize uint32
@@ -133,7 +133,7 @@ const (
 var DefaultOptions = Options{
 	DirPath:                        tempDBDir(),
 	SnapshotPath:                   tempSnapDir(),
-	RaftPath:                       tempRaftDir(),
+	ClusterPath:                    tempClusterDir(),
 	MemtableSize:                   64 * MB,
 	MemtableNums:                   15,
 	Sync:                           false,
@@ -170,7 +170,7 @@ var DefaultWriteOptions = WriteOptions{
 }
 
 // Options 表示Raft节点的配置信息
-type RaftOptions struct {
+type ClusterOptions struct {
 	// NodeID 是当前节点的唯一标识符
 	NodeID uint64
 	// ClusterID 是Raft集群的唯一标识符
@@ -181,8 +181,8 @@ type RaftOptions struct {
 	DataDir string
 	// JoinCluster 表示是否作为新节点加入现有集群
 	JoinCluster bool
-	// InitialMembers 是初始集群成员的映射，键是NodeID，值是RaftAddress
-	//如果是创建节点，InitiaMembers大小必须大于1（至少包括自己）,如果是加入节点，可以置空
+	// InitialMembers 是初始集群成员的映射，键是NodeID，值是RaftAddress。
+	// Bootstrap 节点至少包含自己；Join 节点可以为空。
 	InitialMembers map[uint64]string
 	// TickMs 是心跳间隔，单位为毫秒
 	TickMs uint64
@@ -194,10 +194,15 @@ type RaftOptions struct {
 	SnapshotIntervalSeconds uint64
 	// Sync 指定节点是同步还是异步更新状态
 	Sync bool
+
+	// RPCAddress 是本节点的内部转发 RPC 地址；为空时不启动转发服务。
+	RPCAddress string
+	// PeerRPC 是 NodeID -> 内部转发 RPC 地址的映射。
+	PeerRPC map[uint64]string
 }
 
 // GetNodeHostOptions 返回Dragonboat节点主机配置
-func (c *RaftOptions) GetNodeHostOptions() config.NodeHostConfig {
+func (c *ClusterOptions) GetNodeHostOptions() config.NodeHostConfig {
 	return config.NodeHostConfig{
 		RaftAddress:    c.RaftAddress,
 		NodeHostDir:    filepath.Join(c.DataDir, "nodehost"),
@@ -207,8 +212,8 @@ func (c *RaftOptions) GetNodeHostOptions() config.NodeHostConfig {
 	}
 }
 
-// GetRaftOptions 返回Raft节点配置
-func (c *RaftOptions) GetRaftOptions() config.Config {
+// GetRaftConfig 返回 Dragonboat 的 Raft 配置。
+func (c *ClusterOptions) GetRaftConfig() config.Config {
 	return config.Config{
 		ReplicaID:               c.NodeID,
 		ShardID:                 c.ClusterID,
@@ -225,8 +230,8 @@ func (c *RaftOptions) GetRaftOptions() config.Config {
 }
 
 // DefaultOptions 返回默认的Raft配置
-func DefaultRaftOptions(nodeID, clusterID uint64, raftAddress, dataDir string) RaftOptions {
-	opt := RaftOptions{
+func DefaultClusterOptions(nodeID, clusterID uint64, raftAddress, dataDir string) ClusterOptions {
+	opt := ClusterOptions{
 		NodeID:                  nodeID,
 		ClusterID:               clusterID,
 		RaftAddress:             raftAddress,
@@ -239,12 +244,12 @@ func DefaultRaftOptions(nodeID, clusterID uint64, raftAddress, dataDir string) R
 		SnapshotIntervalSeconds: 3600, // 默认每小时创建一次快照
 		Sync:                    true,
 	}
-	opt.InitialMembers[0] = raftAddress
+	opt.InitialMembers[nodeID] = raftAddress
 	return opt
 }
 
 // ValidateOptions 验证配置是否有效
-func ValidateRaftOptions(opt *RaftOptions) error {
+func ValidateClusterOptions(opt *ClusterOptions) error {
 	if opt.NodeID == 0 {
 		return fmt.Errorf("NodeID can not be0")
 	}
@@ -282,7 +287,7 @@ func tempSnapDir() string {
 	return dir
 }
 
-func tempRaftDir() string {
-	dir, _ := os.MkdirTemp("", "knocidb-raft")
+func tempClusterDir() string {
+	dir, _ := os.MkdirTemp("", "knocidb-cluster")
 	return dir
 }
