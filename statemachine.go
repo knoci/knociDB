@@ -167,7 +167,7 @@ func (s *KVStateMachine) SaveSnapshot(w io.Writer, fc statemachine.ISnapshotFile
 			return fmt.Errorf("reopen database failed : %v, export error: %w", openErr, err)
 		}
 		s.db = db
-		return fmt.Errorf("database export snashot failed: %w", err)
+		return fmt.Errorf("database export snapshot failed: %w", err)
 	}
 
 	// Reopen the database after successful export
@@ -203,14 +203,14 @@ func (s *KVStateMachine) SaveSnapshot(w io.Writer, fc statemachine.ISnapshotFile
 
 	// Write metadata
 	if _, err := w.Write(data); err != nil {
-		return fmt.Errorf("write matadate failed: %w", err)
+		return fmt.Errorf("write metadata failed: %w", err)
 	}
 
 	// Write checksum
 	checksumBuf := make([]byte, 4)
 	binary.LittleEndian.PutUint32(checksumBuf, checksum)
 	if _, err := w.Write(checksumBuf); err != nil {
-		return fmt.Errorf("write checksum faied: %w", err)
+		return fmt.Errorf("write checksum failed: %w", err)
 	}
 
 	// 把导出的 .ZST 文件内容也写入快照流，使快照自包含、可跨节点传输。
@@ -248,20 +248,20 @@ func (s *KVStateMachine) RecoverFromSnapshot(r io.Reader, files []statemachine.S
 	// 读取元数据长度
 	lenBuf := make([]byte, 4)
 	if _, err := io.ReadFull(r, lenBuf); err != nil {
-		return fmt.Errorf("read matadata length failed: %w", err)
+		return fmt.Errorf("read metadata length failed: %w", err)
 	}
 	metadataLen := binary.LittleEndian.Uint32(lenBuf)
 
 	// 读取元数据
 	metadataBytes := make([]byte, metadataLen)
 	if _, err := io.ReadFull(r, metadataBytes); err != nil {
-		return fmt.Errorf("read matadate failed: %w", err)
+		return fmt.Errorf("read metadata failed: %w", err)
 	}
 
 	// 读取校验和
 	checksumBuf := make([]byte, 4)
 	if _, err := io.ReadFull(r, checksumBuf); err != nil {
-		return fmt.Errorf("read checksum faied: %w", err)
+		return fmt.Errorf("read checksum failed: %w", err)
 	}
 	expectedChecksum := binary.LittleEndian.Uint32(checksumBuf)
 
