@@ -125,3 +125,51 @@ func TestExportSnapshotEmptyPath(t *testing.T) {
 		t.Fatal("empty SnapshotPath should fail")
 	}
 }
+
+func TestImportSnapshotValidArchive(t *testing.T) {
+	base := t.TempDir()
+	src := filepath.Join(base, "src")
+	if err := os.MkdirAll(src, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(src, "INDEX.0"), []byte("index"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	archive := filepath.Join(base, "snap.ZST")
+	if err := writeSnapshotArchive(src, archive); err != nil {
+		t.Fatal(err)
+	}
+	out := filepath.Join(base, "out")
+	if err := importSnapshotToDir(archive, out); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(filepath.Join(out, "INDEX.0"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "index" {
+		t.Fatalf("unexpected content: %q", got)
+	}
+}
+
+func TestImportSnapshotTargetIsFile(t *testing.T) {
+	base := t.TempDir()
+	src := filepath.Join(base, "src")
+	if err := os.MkdirAll(src, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(src, "INDEX.0"), []byte("index"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	archive := filepath.Join(base, "snap.ZST")
+	if err := writeSnapshotArchive(src, archive); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(base, "target")
+	if err := os.WriteFile(target, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := importSnapshotToDir(archive, target); err == nil {
+		t.Fatal("target file should fail")
+	}
+}

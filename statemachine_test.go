@@ -344,3 +344,23 @@ func TestRecoverFromSnapshotErrors(t *testing.T) {
 		t.Fatal("empty snapshot path should fail")
 	}
 }
+
+func TestKVStateMachineSaveSnapshot(t *testing.T) {
+	_, db, cleanup := setupStateMachineTest(t)
+	defer cleanup()
+	sm := NewKVStateMachine(1, 1, db)
+	require.NoError(t, db.Put([]byte("snap-key"), []byte("snap-value")))
+
+	var buf bytes.Buffer
+	require.NoError(t, sm.SaveSnapshot(&buf, nil, nil))
+	require.Greater(t, buf.Len(), 0)
+
+	value, err := sm.db.Get([]byte("snap-key"))
+	require.NoError(t, err)
+	require.Equal(t, []byte("snap-value"), value)
+
+	require.NoError(t, sm.RecoverFromSnapshot(bytes.NewReader(buf.Bytes()), nil, nil))
+	value, err = sm.db.Get([]byte("snap-key"))
+	require.NoError(t, err)
+	require.Equal(t, []byte("snap-value"), value)
+}

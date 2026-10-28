@@ -353,3 +353,30 @@ func TestWAL_DeleteSegmentsBelow(t *testing.T) {
 		t.Fatalf("old segment still exists: %v", err)
 	}
 }
+
+func TestWALCloseAndReadErrors(t *testing.T) {
+	dir := t.TempDir()
+	w, err := Open(Options{DirPath: dir, SegmentFileExt: ".ERR", SegmentSize: 64 * 1024})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pos, err := w.Write([]byte("x"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write([]byte("x")); err == nil {
+		t.Fatal("write after close should fail")
+	}
+	if _, err := w.Read(&ChunkPosition{SegmentId: pos.SegmentId + 100}); err == nil {
+		t.Fatal("read invalid segment should fail")
+	}
+	if err := w.Delete(); err != nil {
+		t.Fatal(err)
+	}
+}

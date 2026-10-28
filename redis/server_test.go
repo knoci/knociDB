@@ -216,3 +216,22 @@ func TestServerExtendedCommands(t *testing.T) {
 	require.Equal(t, "OK", do(t, conn, "SELECT", "0"))
 	require.NotNil(t, do(t, conn, "COMMAND"))
 }
+
+func TestServerZSetEdgeCases(t *testing.T) {
+	_, _, conn := newTestServer(t)
+
+	if _, isErr := do(t, conn, "ZADD", "z", "bad", "a").(testError); !isErr {
+		t.Fatal("invalid score should fail")
+	}
+	require.Equal(t, int64(2), do(t, conn, "ZADD", "z", "1", "a", "2", "b"))
+	require.Equal(t, []any{"a", "1", "b", "2"}, do(t, conn, "ZRANGE", "z", "0", "-1", "WITHSCORES"))
+	require.Equal(t, []any{"a", "b"}, do(t, conn, "ZRANGEBYSCORE", "z", "1", "2"))
+	require.Equal(t, int64(2), do(t, conn, "ZCOUNT", "z", "-inf", "+inf"))
+	require.Nil(t, do(t, conn, "ZSCORE", "z", "missing"))
+	require.Nil(t, do(t, conn, "ZRANK", "z", "missing"))
+	require.Equal(t, "2.5", do(t, conn, "ZINCRBY", "z", "1.5", "a"))
+	require.Equal(t, int64(1), do(t, conn, "ZREM", "z", "b"))
+
+	require.NotNil(t, do(t, conn, "SCAN", "0", "MATCH", "z*", "COUNT", "10", "TYPE", "zset"))
+	require.NotNil(t, do(t, conn, "KEYS", "z*"))
+}

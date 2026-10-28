@@ -1,6 +1,7 @@
 package knocidb
 
 import (
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -271,4 +272,35 @@ func TestCoreTTLNoSweeperLifecycle(t *testing.T) {
 	require.NoError(t, db.PutWithTTL([]byte("k"), []byte("v"), time.Second))
 	require.NoError(t, db.Sync())
 	require.NoError(t, db.Close())
+}
+
+func TestTTLStoreNilAndInvalid(t *testing.T) {
+	var store *ttlStore
+	if _, ok, err := store.get([]byte("k")); ok || err != nil {
+		t.Fatalf("nil get: %v %v", ok, err)
+	}
+	if store.has([]byte("k")) {
+		t.Fatal("nil has")
+	}
+	if expired, err := store.isExpired([]byte("k"), 1); expired || err != nil {
+		t.Fatalf("nil isExpired: %v %v", expired, err)
+	}
+	if err := store.apply(map[string]int64{"k": 1}); err != nil {
+		t.Fatal(err)
+	}
+	if keys, err := store.expired(1); keys != nil || err != nil {
+		t.Fatalf("nil expired: %v %v", keys, err)
+	}
+	if err := store.close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.sync(); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.writeTo(filepath.Join(t.TempDir(), "ttl.db")); err != nil {
+		t.Fatal(err)
+	}
+	if got := decodeExpireAt([]byte{1, 2}); got != 0 {
+		t.Fatalf("decodeExpireAt = %d", got)
+	}
 }
