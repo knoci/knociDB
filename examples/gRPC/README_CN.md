@@ -75,7 +75,7 @@ go run ./examples/gRPC/client \
 - 扫描（服务端流）：
   - 载荷格式：`uint32 start_len | start | uint32 end_len | end`
   - 响应格式：`uint32 key_len | key | value`
-  - 仅在 `IndexType=BTree` 下有效；Hash 索引返回 `FailedPrecondition`
+  - 使用当前唯一支持的 B+Tree 索引
 
 ## 错误码映射
 

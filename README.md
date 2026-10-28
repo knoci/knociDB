@@ -12,9 +12,11 @@
 ## Features
 - ⚡ **High-performance** key-value storage
 - 🔄 **Batch operations** with ACD guarantees
-- 🌲 **B+Tree** and **Hash index** support
-- 🌐 **Distributed deployment** with Raft protocol
+- 🌲 **B+Tree index** support (legacy diskhash index removed)
+- 🌐 **ClusterDB** single-Raft group with leader-aware forwarding and optional RPC auth
 - 💾 **S3 Object Storage** read and load wal
+- 📸 **Async snapshots** B+Tree-only background snapshot with atomic archive + manifest
+- 📋 **Atomic DB manifest** file inventory and generation tracking
 - 🔌 **gRPC support** client-stream Batch, server-stream Scan, optional auth/TLS
 - 🧩 **Redis-compatible subset** strings/hash/list/set/zset, TTL, SCAN, Pub/Sub, cluster protocol
 

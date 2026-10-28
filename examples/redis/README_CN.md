@@ -83,7 +83,7 @@ MULTI/EXEC/WATCH、Streams、Lua、RESP3、Redis Cluster 的 gossip/failover/复
 
 ## 说明
 
-- knociDB 必须使用 BTree 索引（Options.IndexType = knocidb.BTree），因为 hash/set/zset/list 的遍历依赖有序扫描。
+- knociDB 现在只提供 B+Tree 索引；hash/set/zset/list 的遍历依赖它的有序扫描。
 - Redis key 统一放在 r1: 前缀下；hash field、set member、list element 都是独立的 knociDB key；list 元素用 8 字节逻辑序号定位。
 - TTL 存在每个 key 的元数据里，后台 sweeper 默认每秒清理一次过期 key。
 - 这是库级示例，不是生产级 Redis 替代品。

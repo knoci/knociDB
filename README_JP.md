@@ -12,9 +12,11 @@
 ## 機能
 - ⚡ **高性能** キーバリューストレージ
 - 🔄 ACD保証付きの**バッチ操作**
-- 🌲 **B+Tree**と**ハッシュインデックス**のサポート
-- 🌐 Raftプロトコルによる**分散デプロイメント**
+- 🌲 **B+Treeインデックス**のサポート（旧diskhashインデックスは削除）
+- 🌐 **ClusterDB** 単一Raftグループ、Leader-aware転送、任意のRPC認証
 - 💾 **S3オブジェクトストレージ**の読み取りとwalのロード
+- 📸 **非同期スナップショット** B+Tree専用のバックグラウンドスナップショット、アトミックアーカイブ、manifest
+- 📋 **アトミックDB manifest** ファイル一覧とgeneration管理
 - 🔌 **gRPC対応** クライアントストリームBatch、サーバーストリームScan、認証/TLSオプション
 - 🧩 **Redis互換サブセット** string/hash/list/set/zset、TTL、SCAN、Pub/Sub、クラスタプロトコル
 

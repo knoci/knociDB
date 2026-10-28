@@ -114,9 +114,9 @@ const (
 
 // Batch 客户端流：接收多条操作并批量提交
 func (s *Server) Batch(stream KVService_BatchServer) error {
-    batch := s.db.NewBatch(knocidb.DefaultBatchOptions)
-    defer batch.Close()
-    for {
+	batch := s.db.NewBatch(knocidb.DefaultBatchOptions)
+	defer batch.Close()
+	for {
 		msg, err := stream.Recv()
 		if err == io.EOF {
 			break
@@ -175,9 +175,6 @@ func (s *Server) Batch(stream KVService_BatchServer) error {
 // Scan 服务端流：在B+Tree模式下按范围扫描并流式返回KV
 // 请求载荷：uint32 start_len | start | uint32 end_len | end
 func (s *Server) Scan(in *wrapperspb.BytesValue, stream KVService_ScanServer) error {
-	if s.db.GetOptions().IndexType == knocidb.Hash {
-		return status.Error(codes.FailedPrecondition, knocidb.ErrDBIteratorUnsupportedTypeHASH.Error())
-	}
 	r := bytes.NewReader(in.Value)
 	var sLen uint32
 	if err := binary.Read(r, binary.LittleEndian, &sLen); err != nil {

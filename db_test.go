@@ -7,7 +7,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/knoci/knocidb/diskhash"
 	"github.com/knoci/knocidb/util"
 
 	"github.com/stretchr/testify/assert"
@@ -675,20 +674,9 @@ func TestDBAutoCompactWithBusyIO(t *testing.T) {
 func getValueFromVlog(db *DB, key []byte) ([]byte, error) {
 	db.mu.RLock()
 	defer db.mu.RUnlock()
-	var value []byte
-	var matchKey func(diskhash.Slot) (bool, error)
-	if db.options.IndexType == Hash {
-		matchKey = MatchKeyFunc(db, key, nil, &value)
-	}
-	position, err := db.index.Get(key, matchKey)
+	position, err := db.index.Get(key)
 	if err != nil {
 		return nil, err
-	}
-	if db.options.IndexType == Hash {
-		if value == nil {
-			return nil, ErrKeyNotFound
-		}
-		return value, nil
 	}
 	if position == nil {
 		return nil, ErrKeyNotFound
@@ -720,12 +708,7 @@ func produceAndWriteLogs(numLogs int64, offset int64, db *DB) []*testLog {
 func getRecordFromVlog(db *DB, key []byte) (*ValueLogRecord, error) {
 	db.mu.RLock()
 	defer db.mu.RUnlock()
-	var value []byte
-	var matchKey func(diskhash.Slot) (bool, error)
-	if db.options.IndexType == Hash {
-		matchKey = MatchKeyFunc(db, key, nil, &value)
-	}
-	position, err := db.index.Get(key, matchKey)
+	position, err := db.index.Get(key)
 	if err != nil {
 		return nil, err
 	}
@@ -1048,15 +1031,6 @@ func TestDBMultiClients(t *testing.T) {
 //	}
 //	err = iter.Close()
 //	require.NoError(t, err)
-//
-//	// unsupported type
-//	options = DefaultOptions
-//	options.IndexType = Hash
-//	db, err = Open(options)
-//	require.NoError(t, err)
-//	itr, err := db.NewIterator(IteratorOptions{Reverse: false})
-//	assert.Equal(t, ErrDBIteratorUnsupportedTypeHASH, err)
-//	assert.Nil(t, itr)
 //}
 
 func TestDeprecatetableMetaPersist(t *testing.T) {

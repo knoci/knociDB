@@ -153,8 +153,8 @@ func TestServerTTLBackground(t *testing.T) {
 
 func TestServerClusterRouting(t *testing.T) {
 	nodes := []ClusterNode{
-		{ID: "n1", Host: "127.0.0.1", Port: 10600, StartSlot: 0, EndSlot: 8191},
-		{ID: "n2", Host: "127.0.0.1", Port: 10601, StartSlot: 8192, EndSlot: 16383},
+		{ID: "n1", Host: "127.0.0.1", Port: 11600, StartSlot: 0, EndSlot: 8191},
+		{ID: "n2", Host: "127.0.0.1", Port: 11601, StartSlot: 8192, EndSlot: 16383},
 	}
 	start := func(id, addr string) (*Server, *knocidb.DB, net.Conn) {
 		options := knocidb.DefaultOptions
@@ -167,8 +167,8 @@ func TestServerClusterRouting(t *testing.T) {
 		require.NoError(t, err)
 		return srv, db, conn
 	}
-	srv1, db1, conn1 := start("n1", "127.0.0.1:10600")
-	srv2, db2, conn2 := start("n2", "127.0.0.1:10601")
+	srv1, db1, conn1 := start("n1", "127.0.0.1:11600")
+	srv2, db2, conn2 := start("n2", "127.0.0.1:11601")
 	defer func() {
 		_ = conn1.Close()
 		_ = conn2.Close()

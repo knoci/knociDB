@@ -40,6 +40,7 @@ Windows 下把 `./cluster-example` 换成 `.\cluster-example`。
 - `--cluster`: 集群ID（默认为1）
 - `--addr`: Dragonboat Raft 地址（格式：host:port）
 - `--rpc`: 内部转发 RPC 地址（可选）
+- `--rpc-secret`: 内部转发 RPC 共享密钥；为空表示不鉴权
 - `--dir`: 数据目录
 - `--join`: 是否作为新节点加入现有集群
 - `--peers`: 集群成员列表（格式：id1=host1:port1,id2=host2:port2,...）

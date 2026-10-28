@@ -289,6 +289,9 @@ func (db *DB) cleanupSnapshots(snapDir string) {
 		} else {
 			log.Printf("Removed old snapshot: %s", path)
 		}
+		if err := os.Remove(path + snapshotManifestExt); err != nil && !os.IsNotExist(err) {
+			log.Printf("Failed to remove snapshot manifest: %v", err)
+		}
 	}
 }
 
@@ -309,6 +312,9 @@ func importSnapshotToDir(snapPath, dir string) error {
 	// 验证快照文件是否存在
 	if _, err := os.Stat(snapPath); os.IsNotExist(err) {
 		return fmt.Errorf("Snapshot file not found: %s", snapPath)
+	}
+	if err := validateSnapshotManifest(snapPath); err != nil {
+		return err
 	}
 
 	timestamp := time.Now().Format(snapshotLayout)

@@ -1,9 +1,12 @@
 package knocidb
 
 import (
+	"errors"
+	"fmt"
 	"log"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 )
@@ -211,4 +214,230 @@ func TestImportSnapshotError(t *testing.T) {
 		t.Fatalf("should fail when db is closed")
 	}
 	defer os.RemoveAll("testdata")
+}
+
+func TestAsyncSnapshotRoundTrip(t *testing.T) {
+	base := t.TempDir()
+	dbDir := filepath.Join(base, "db")
+	snapDir := filepath.Join(base, "snapshots")
+
+	options := DefaultOptions
+	options.DirPath = dbDir
+	options.SnapshotPath = snapDir
+	db, err := Open(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for i := 0; i < 100; i++ {
+		key := []byte(fmt.Sprintf("async-key-%03d", i))
+		if err := db.Put(key, []byte(fmt.Sprintf("value-%03d", i))); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	task, err := db.StartSnapshot()
+	if err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	if err := task.Wait(); err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(task.ManifestPath()); err != nil {
+		t.Fatalf("snapshot manifest missing: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	restoreDir := filepath.Join(base, "restore")
+	if err := importSnapshotToDir(task.Path(), restoreDir); err != nil {
+		t.Fatal(err)
+	}
+	restoreOptions := DefaultOptions
+	restoreOptions.DirPath = restoreDir
+	restoreOptions.SnapshotPath = filepath.Join(base, "restore-snapshots")
+	restored, err := Open(restoreOptions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer restored.Close()
+	for i := 0; i < 100; i++ {
+		key := []byte(fmt.Sprintf("async-key-%03d", i))
+		want := []byte(fmt.Sprintf("value-%03d", i))
+		got, err := restored.Get(key)
+		if err != nil {
+			t.Fatalf("get %s: %v", key, err)
+		}
+		if string(got) != string(want) {
+			t.Fatalf("value mismatch for %s: want %s got %s", key, want, got)
+		}
+	}
+}
+
+func TestAsyncSnapshotClosed(t *testing.T) {
+	base := t.TempDir()
+	options := DefaultOptions
+	options.DirPath = filepath.Join(base, "db")
+	options.SnapshotPath = filepath.Join(base, "snapshots")
+	db, err := Open(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.StartSnapshot(); !errors.Is(err, ErrDBClosed) {
+		t.Fatalf("want ErrDBClosed, got %v", err)
+	}
+}
+
+func TestAsyncSnapshotWithConcurrentWrites(t *testing.T) {
+	base := t.TempDir()
+	options := DefaultOptions
+	options.DirPath = filepath.Join(base, "db")
+	options.SnapshotPath = filepath.Join(base, "snapshots")
+	db, err := Open(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 50; i++ {
+		if err := db.Put([]byte(fmt.Sprintf("base-%03d", i)), []byte("base")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	task, err := db.StartSnapshot()
+	if err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 100; i++ {
+			_ = db.Put([]byte(fmt.Sprintf("concurrent-%03d", i)), []byte("concurrent"))
+		}
+	}()
+	if err := task.Wait(); err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	wg.Wait()
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	restoreDir := filepath.Join(base, "restore")
+	if err := importSnapshotToDir(task.Path(), restoreDir); err != nil {
+		t.Fatal(err)
+	}
+	restoreOptions := DefaultOptions
+	restoreOptions.DirPath = restoreDir
+	restoreOptions.SnapshotPath = filepath.Join(base, "restore-snapshots")
+	restored, err := Open(restoreOptions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer restored.Close()
+	for i := 0; i < 50; i++ {
+		key := []byte(fmt.Sprintf("base-%03d", i))
+		if _, err := restored.Get(key); err != nil {
+			t.Fatalf("base key %s missing after restore: %v", key, err)
+		}
+	}
+}
+
+func TestAsyncSnapshotCloseWaitsForTask(t *testing.T) {
+	base := t.TempDir()
+	options := DefaultOptions
+	options.DirPath = filepath.Join(base, "db")
+	options.SnapshotPath = filepath.Join(base, "snapshots")
+	db, err := Open(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Put([]byte("close-key"), []byte("close-value")); err != nil {
+		t.Fatal(err)
+	}
+	task, err := db.StartSnapshot()
+	if err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := task.Wait(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(task.Path()); err != nil {
+		t.Fatalf("snapshot file missing: %v", err)
+	}
+}
+
+func TestAsyncSnapshotInProgress(t *testing.T) {
+	base := t.TempDir()
+	options := DefaultOptions
+	options.DirPath = filepath.Join(base, "db")
+	options.SnapshotPath = filepath.Join(base, "snapshots")
+	db, err := Open(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.flushLock.Lock()
+	task, err := db.StartSnapshot()
+	if err != nil {
+		db.flushLock.Unlock()
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	if _, err := db.StartSnapshot(); !errors.Is(err, ErrSnapshotInProgress) {
+		db.flushLock.Unlock()
+		_ = task.Wait()
+		_ = db.Close()
+		t.Fatalf("want ErrSnapshotInProgress, got %v", err)
+	}
+	db.flushLock.Unlock()
+	if err := task.Wait(); err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestAsyncSnapshotRejectsCorruptManifest(t *testing.T) {
+	base := t.TempDir()
+	options := DefaultOptions
+	options.DirPath = filepath.Join(base, "db")
+	options.SnapshotPath = filepath.Join(base, "snapshots")
+	db, err := Open(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Put([]byte("k"), []byte("v")); err != nil {
+		t.Fatal(err)
+	}
+	task, err := db.StartSnapshot()
+	if err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	if err := task.Wait(); err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(task.ManifestPath(), []byte("{"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := importSnapshotToDir(task.Path(), filepath.Join(base, "restore")); err == nil {
+		t.Fatal("corrupt manifest should be rejected")
+	}
 }

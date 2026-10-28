@@ -1,8 +1,12 @@
 package knocidb
 
 import (
+	"bytes"
+	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"testing"
@@ -74,6 +78,7 @@ func TestValidateClusterOptions(t *testing.T) {
 		config := DefaultClusterOptions(1, 1, "localhost:10000", "/tmp/raft")
 		err := ValidateClusterOptions(&config)
 		assert.NoError(t, err)
+		assert.Equal(t, 5*time.Second, config.RPCTimeout)
 		assert.Equal(t, "localhost:10000", config.InitialMembers[1])
 		_, hasZero := config.InitialMembers[0]
 		assert.False(t, hasZero)
@@ -259,6 +264,38 @@ func TestClusterDB(t *testing.T) {
 		assert.Equal(t, "localhost:10000", members[1])
 	})
 
+	t.Run("RemoveMissingNode", func(t *testing.T) {
+		// Dragonboat 对不存在成员的删除是幂等配置变更。
+		require.NoError(t, nm.RemoveNode(99))
+		members, err := nm.GetClusterMembership()
+		require.NoError(t, err)
+		require.Len(t, members, 1)
+	})
+
+	t.Run("AsyncOperations", func(t *testing.T) {
+		nm.Sync = false
+		defer func() { nm.Sync = true }()
+
+		require.NoError(t, nm.Put([]byte("async-key"), []byte("async-value")))
+		value, err := nm.Get([]byte("async-key"))
+		require.NoError(t, err)
+		require.Equal(t, []byte("async-value"), value)
+		require.NoError(t, nm.Delete([]byte("async-key")))
+
+		require.NoError(t, nm.BatchWrite([]Command{{
+			Op:    OpPut,
+			Key:   []byte("async-batch-key"),
+			Value: []byte("async-batch-value"),
+		}}, 7))
+		value, err = nm.Get([]byte("async-batch-key"))
+		require.NoError(t, err)
+		require.Equal(t, []byte("async-batch-value"), value)
+
+		members, err := nm.GetClusterMembership()
+		require.NoError(t, err)
+		require.Len(t, members, 1)
+	})
+
 	err = nm.Close()
 	require.NoError(t, err)
 }
@@ -350,6 +387,7 @@ func TestClusterLeaderForwarding(t *testing.T) {
 		config.InitialMembers = initialMembers
 		config.RPCAddress = peerRPC[nodeID]
 		config.PeerRPC = peerRPC
+		config.RPCSecret = "test-secret"
 		option := createTestDBOptions(t, tempDir)
 		node, err := OpenCluster(config, option)
 		require.NoError(t, err)
@@ -393,4 +431,127 @@ func TestClusterLeaderForwarding(t *testing.T) {
 	value, err = nodes[leaderIndex].Get([]byte("forward-key"))
 	require.NoError(t, err)
 	require.Equal(t, []byte("forward-value"), value)
+
+	_, err = nodes[follower].Get([]byte("missing-forward-key"))
+	require.ErrorIs(t, err, ErrKeyNotFound)
+
+	require.NoError(t, nodes[follower].Delete([]byte("forward-key")))
+	_, err = nodes[leaderIndex].Get([]byte("forward-key"))
+	require.ErrorIs(t, err, ErrKeyNotFound)
+
+	require.NoError(t, nodes[leaderIndex].BatchWrite([]Command{{
+		Op:    OpPut,
+		Key:   []byte("batch-forward-key"),
+		Value: []byte("batch-forward-value"),
+	}}, 42))
+	value, err = nodes[follower].Get([]byte("batch-forward-key"))
+	require.NoError(t, err)
+	require.Equal(t, []byte("batch-forward-value"), value)
+
+	require.ErrorIs(t, nodes[follower].AddNode(99, "localhost:19999"), ErrNotLeader)
+	require.ErrorIs(t, nodes[follower].RemoveNode(99), ErrNotLeader)
+
+	_, err = nodes[follower].rpcCall(nodes[follower].config.RPCAddress, rpcOpPut, []byte("x"), []byte("y"))
+	require.ErrorIs(t, err, ErrNotLeader)
+	_, err = nodes[leaderIndex].rpcCall(nodes[leaderIndex].config.RPCAddress, 99, []byte("x"), nil)
+	require.Error(t, err)
+
+	conn, err := net.Dial("tcp", nodes[leaderIndex].config.RPCAddress)
+	require.NoError(t, err)
+	require.NoError(t, writeRPCRequest(conn, []byte("wrong-secret"), rpcOpGet, []byte("x"), nil))
+	status, _, err := readRPCResponse(conn)
+	require.NoError(t, err)
+	require.Equal(t, rpcStatusUnauthorized, status)
+	require.NoError(t, conn.Close())
+
+	leaderStats := nodes[leaderIndex].Stats()
+	require.Greater(t, leaderStats.RPCRequests, uint64(0))
+	require.Greater(t, leaderStats.RPCErrors, uint64(0))
+	followerStats := nodes[follower].Stats()
+	require.Greater(t, followerStats.ForwardedOps, uint64(0))
+	require.Greater(t, followerStats.RPCErrors, uint64(0))
+}
+
+type failingRPCWriter struct{}
+
+func (failingRPCWriter) Write([]byte) (int, error) {
+	return 0, errors.New("write failed")
+}
+
+func TestClusterRPCCodec(t *testing.T) {
+	var buf bytes.Buffer
+	require.NoError(t, writeRPCRequest(&buf, []byte("token"), rpcOpPut, []byte("key"), []byte("value")))
+	token, op, key, value, err := readRPCRequest(&buf)
+	require.NoError(t, err)
+	require.Equal(t, []byte("token"), token)
+	require.Equal(t, rpcOpPut, op)
+	require.Equal(t, []byte("key"), key)
+	require.Equal(t, []byte("value"), value)
+
+	buf.Reset()
+	require.NoError(t, writeRPCResponse(&buf, rpcStatusOK, []byte("payload")))
+	status, payload, err := readRPCResponse(&buf)
+	require.NoError(t, err)
+	require.Equal(t, rpcStatusOK, status)
+	require.Equal(t, []byte("payload"), payload)
+
+	require.Equal(t, rpcStatusNotFound, rpcStatusForError(ErrKeyNotFound))
+	require.Equal(t, rpcStatusNotLeader, rpcStatusForError(ErrNotLeader))
+	require.Equal(t, rpcStatusError, rpcStatusForError(errors.New("boom")))
+
+	require.Error(t, writeRPCRequest(failingRPCWriter{}, nil, rpcOpPut, nil, nil))
+	require.Error(t, writeRPCResponse(failingRPCWriter{}, rpcStatusOK, nil))
+	require.Error(t, writeRPCRequest(&bytes.Buffer{}, make([]byte, 65536), rpcOpPut, nil, nil))
+
+	badVersion := make([]byte, 12)
+	badVersion[0] = 99
+	_, _, _, _, err = readRPCRequest(bytes.NewReader(badVersion))
+	require.Error(t, err)
+
+	tooLarge := make([]byte, 12)
+	tooLarge[0] = clusterRPCVersion
+	binary.BigEndian.PutUint32(tooLarge[4:8], uint32(maxRPCValueSize+1))
+	_, _, _, _, err = readRPCRequest(bytes.NewReader(tooLarge))
+	require.Error(t, err)
+
+	_, _, _, _, err = readRPCRequest(bytes.NewReader([]byte{clusterRPCVersion}))
+	require.Error(t, err)
+
+	badResponse := make([]byte, 6)
+	badResponse[0] = 99
+	_, _, err = readRPCResponse(bytes.NewReader(badResponse))
+	require.Error(t, err)
+
+	largeResponse := make([]byte, 6)
+	largeResponse[0] = clusterRPCVersion
+	binary.BigEndian.PutUint32(largeResponse[2:6], uint32(maxRPCValueSize+1))
+	_, _, err = readRPCResponse(bytes.NewReader(largeResponse))
+	require.Error(t, err)
+}
+
+func TestClusterDBErrorPaths(t *testing.T) {
+	empty := &ClusterDB{}
+	require.ErrorIs(t, empty.putLocal([]byte("k"), []byte("v")), ErrNodeNotStarted)
+	require.ErrorIs(t, empty.deleteLocal([]byte("k")), ErrNodeNotStarted)
+	_, err := empty.getLocal([]byte("k"))
+	require.ErrorIs(t, err, ErrNodeNotStarted)
+	require.ErrorIs(t, empty.BatchWrite(nil, 1), ErrNodeNotStarted)
+	_, err = empty.GetClusterMembership()
+	require.ErrorIs(t, err, ErrNodeNotStarted)
+	require.ErrorIs(t, empty.AddNode(2, "localhost:1"), ErrNodeNotStarted)
+	require.ErrorIs(t, empty.RemoveNode(2), ErrNodeNotStarted)
+	_, err = empty.GetLeaderID()
+	require.ErrorIs(t, err, ErrNodeNotStarted)
+	require.False(t, empty.IsLeader())
+	require.ErrorIs(t, empty.Close(), ErrClusterClosed)
+
+	badRPC := &ClusterDB{config: ClusterOptions{RPCAddress: "not-an-address"}}
+	require.Error(t, badRPC.startRPC())
+
+	opts := ClusterOptions{}
+	opts.applyDefaults()
+	require.Equal(t, 5*time.Second, opts.RPCTimeout)
+
+	_, err = OpenCluster(ClusterOptions{}, DefaultOptions)
+	require.Error(t, err)
 }

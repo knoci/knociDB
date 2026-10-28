@@ -1,0 +1,21 @@
+# Go build/test artifacts
+.gocache/
+.gotmp/
+coverage.out
+coverage.txt
+coverage.html
+*.test
+*.prof
+
+# Logs
+*.log
+
+# Editor/IDE
+.idea/
+.vscode/
+
+# Local databases and snapshots
+/data/
+*.ZST
+*.SEG
+*.VLOG

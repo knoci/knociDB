@@ -7,7 +7,6 @@ import (
 	"sync"
 
 	"github.com/bwmarrin/snowflake"
-	"github.com/knoci/knocidb/diskhash"
 )
 
 // Batch 是数据库的批量操作。
@@ -266,23 +265,11 @@ func (b *Batch) Get(key []byte) ([]byte, error) {
 	}
 
 	// 从索引获取
-	var value []byte
-	var matchKey func(diskhash.Slot) (bool, error)
-	if b.db.options.IndexType == Hash {
-		matchKey = MatchKeyFunc(b.db, key, nil, &value)
-	}
-
-	position, err := b.db.index.Get(key, matchKey)
+	position, err := b.db.index.Get(key)
 	if err != nil {
 		return nil, err
 	}
 
-	if b.db.options.IndexType == Hash {
-		if value == nil {
-			return nil, ErrKeyNotFound
-		}
-		return value, nil
-	}
 	if position == nil {
 		return nil, ErrKeyNotFound
 	}
@@ -374,17 +361,9 @@ func (b *Batch) Exist(key []byte) (bool, error) {
 	}
 
 	// 检查键是否存在于索引中
-	var value []byte
-	var matchKeyFunc func(diskhash.Slot) (bool, error)
-	if b.db.options.IndexType == Hash {
-		matchKeyFunc = MatchKeyFunc(b.db, key, nil, &value)
-	}
-	pos, err := b.db.index.Get(key, matchKeyFunc)
+	pos, err := b.db.index.Get(key)
 	if err != nil {
 		return false, err
-	}
-	if b.db.options.IndexType == Hash {
-		return value != nil, nil
 	}
 	return pos != nil, nil
 }

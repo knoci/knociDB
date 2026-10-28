@@ -75,7 +75,7 @@ Commands: `HELP`, `GET key`, `PUT key value`, `DEL key [key...]`, `SCAN start en
 - Scan (server-stream):
   - Request: `uint32 start_len | start | uint32 end_len | end`
   - Response: `uint32 key_len | key | value`
-  - Only valid with `IndexType=BTree`; Hash returns `FailedPrecondition`
+  - Uses the only supported index, B+Tree
 
 ## Error Mapping
 

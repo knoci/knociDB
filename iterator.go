@@ -262,9 +262,6 @@ func (mi *Iterator) Close() error {
 // 调用者有责任在不再使用迭代器时调用Close，否则会导致资源泄漏
 // 迭代器不是线程安全的，不可从多个goroutine并发使用同一个迭代器
 func (db *DB) NewIterator(options IteratorOptions) (*Iterator, error) {
-	if db.options.IndexType == Hash {
-		return nil, ErrDBIteratorUnsupportedTypeHASH
-	}
 	db.mu.RLock()
 	success := false
 	defer func() {

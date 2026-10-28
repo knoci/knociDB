@@ -126,39 +126,6 @@ func TestRegressionCompactChunkBoundary(t *testing.T) {
 	}
 }
 
-func TestRegressionHashIndexDiscard(t *testing.T) {
-	db := openRegressionDB(t, func(opt *Options) {
-		opt.IndexType = Hash
-	})
-	defer db.Close()
-
-	if err := db.Put([]byte("k"), []byte("v1")); err != nil {
-		t.Fatal(err)
-	}
-	db.flushMemtable(db.activeMem)
-	if err := db.Put([]byte("k"), []byte("v2")); err != nil {
-		t.Fatal(err)
-	}
-	db.flushMemtable(db.activeMem)
-	if db.vlog.discardNumber == 0 {
-		t.Fatal("hash index did not record old uuid as discarded")
-	}
-	if v, err := db.Get([]byte("k")); err != nil || !bytes.Equal(v, []byte("v2")) {
-		t.Fatalf("unexpected get: %q %v", v, err)
-	}
-
-	if err := db.Delete([]byte("k")); err != nil {
-		t.Fatal(err)
-	}
-	db.flushMemtable(db.activeMem)
-	if err := db.CompactWithDiscardtable(); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := db.Get([]byte("k")); !errors.Is(err, ErrKeyNotFound) {
-		t.Fatalf("deleted hash key resurrected, err=%v", err)
-	}
-}
-
 func TestRegressionEmptyValue(t *testing.T) {
 	db := openRegressionDB(t, nil)
 	defer db.Close()
@@ -338,36 +305,5 @@ func TestRegressionRecoverCompactionTemp(t *testing.T) {
 	v, err := db2.Get([]byte("k"))
 	if err != nil || !bytes.Equal(v, []byte("v")) {
 		t.Fatalf("recover temp: %q %v", v, err)
-	}
-}
-func TestRegressionHashBloomRestart(t *testing.T) {
-	dir := t.TempDir()
-	opt := DefaultOptions
-	opt.DirPath = dir
-	opt.SnapshotPath = dir + "/snapshots"
-	opt.MemtableSize = 1 << 20
-	opt.EnableBloomFilter = true
-	opt.IndexType = Hash
-
-	db, err := Open(opt)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := db.Put([]byte("hk"), []byte("hv")); err != nil {
-		t.Fatal(err)
-	}
-	db.flushMemtable(db.activeMem)
-	if err := db.Close(); err != nil {
-		t.Fatal(err)
-	}
-
-	db2, err := Open(opt)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db2.Close()
-	v, err := db2.Get([]byte("hk"))
-	if err != nil || !bytes.Equal(v, []byte("hv")) {
-		t.Fatalf("hash bloom restart: %q %v", v, err)
 	}
 }

@@ -83,7 +83,7 @@ The server returns an error for unsupported commands instead of pretending to su
 
 ## Notes
 
-- knociDB must use the BTree index (Options.IndexType = knocidb.BTree) because hash/set/zset/list scans use ordered iteration.
+- knociDB now only provides the B+Tree index; hash/set/zset/list scans use its ordered iteration.
 - Redis keys are stored under the r1: prefix. Hash fields, set members and list positions are separate knociDB keys; list elements use an 8-byte sequence number.
 - TTL is stored in per-key metadata and a background sweeper removes expired keys (default every 1s).
 - This is a library-level example, not a production Redis replacement.

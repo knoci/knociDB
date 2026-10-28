@@ -69,6 +69,28 @@ func (t *ttlStore) sync() error {
 	return t.db.Sync()
 }
 
+func (t *ttlStore) writeTo(path string) error {
+	if t == nil || t.db == nil {
+		return nil
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	if err := t.db.View(func(tx *bolt.Tx) error {
+		_, err := tx.WriteTo(f)
+		return err
+	}); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return err
+	}
+	return f.Close()
+}
+
 func encodeExpireAt(expireAt int64) []byte {
 	out := make([]byte, 8)
 	binary.BigEndian.PutUint64(out, uint64(expireAt))

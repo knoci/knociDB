@@ -8,13 +8,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Set up Go
-        uses: actions/setup-go@v4
+        uses: actions/setup-go@v5
         with:
-          go-version: '1.23.3'
+          go-version-file: go.mod
+          cache: true
       - name: Build
         run: go build -v ./...
+      - name: Vet
+        run: go vet ./...
       - name: Run coverage
-        run: go test -coverprofile=coverage.txt .
+        run: go test -count=1 -coverprofile=coverage.txt -timeout 15m ./...
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v5
         with:

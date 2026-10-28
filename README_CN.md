@@ -12,9 +12,11 @@
 ## 特性
 - ⚡ **高性能**键值存储
 - 🔄 **批量操作**具有ACD保证
-- 🌲 **B+树**和**哈希索引**支持
-- 🌐 基于Raft的**分布式部署**
+- 🌲 **B+树索引**支持（已移除遗留 diskhash 索引）
+- 🌐 **ClusterDB** 单 Raft Group、Leader-aware 转发、可选 RPC 鉴权
 - 💾 **S3 对象存储**读取和加载 wal
+- 📸 **异步快照** B+Tree-only 后台快照、原子归档与 manifest
+- 📋 **原子 DB manifest** 文件清单与 generation 跟踪
 - 🔌 **gRPC 支持** 客户端流式批量、服务端流式扫描、可选鉴权与 TLS
 - 🧩 **Redis 兼容子集** string/hash/list/set/zset、TTL、SCAN、Pub/Sub、集群协议
 

@@ -8,6 +8,7 @@ import (
 	"log"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/lni/dragonboat/v4"
@@ -25,6 +26,8 @@ var (
 	ErrNodeNotStarted = errors.New("cluster not started")
 	// ErrClusterClosed 表示节点已关闭
 	ErrClusterClosed = errors.New("cluster is closed")
+	// ErrClusterUnauthorized 表示内部 RPC 鉴权失败。
+	ErrClusterUnauthorized = errors.New("cluster rpc unauthorized")
 )
 
 // ClusterDB 管理单 Raft Group 集群节点和共识操作。
@@ -40,10 +43,15 @@ type ClusterDB struct {
 
 	rpcListener net.Listener
 	rpcWG       sync.WaitGroup
+
+	rpcRequests  atomic.Uint64
+	rpcErrors    atomic.Uint64
+	forwardedOps atomic.Uint64
 }
 
 // OpenCluster 打开一个单 Raft Group 的集群节点。
 func OpenCluster(config ClusterOptions, dboption Options) (*ClusterDB, error) {
+	config.applyDefaults()
 	if err := ValidateClusterOptions(&config); err != nil {
 		return nil, err
 	}
@@ -189,12 +197,36 @@ func (rdb *ClusterDB) leaderMonitor() {
 	}
 }
 
+// ClusterStats 是 ClusterDB 的运行状态快照。
+type ClusterStats struct {
+	NodeID       uint64
+	LeaderID     uint64
+	IsLeader     bool
+	RPCRequests  uint64
+	RPCErrors    uint64
+	ForwardedOps uint64
+}
+
+// Stats 返回当前节点的轻量运行状态，可用于监控和健康检查。
+func (rdb *ClusterDB) Stats() ClusterStats {
+	rdb.mu.RLock()
+	defer rdb.mu.RUnlock()
+	return ClusterStats{
+		NodeID:       rdb.config.NodeID,
+		LeaderID:     rdb.leaderID,
+		IsLeader:     rdb.state && rdb.nodeHost != nil && rdb.leaderID != 0 && rdb.leaderID == rdb.config.NodeID,
+		RPCRequests:  rdb.rpcRequests.Load(),
+		RPCErrors:    rdb.rpcErrors.Load(),
+		ForwardedOps: rdb.forwardedOps.Load(),
+	}
+}
+
 // IsLeader 检查当前节点是否是Leader
 func (rdb *ClusterDB) IsLeader() bool {
 	rdb.mu.RLock()
 	defer rdb.mu.RUnlock()
 
-	return rdb.leaderID == rdb.config.NodeID
+	return rdb.state && rdb.nodeHost != nil && rdb.leaderID != 0 && rdb.leaderID == rdb.config.NodeID
 }
 
 // GetLeaderID 获取当前Leader的NodeID

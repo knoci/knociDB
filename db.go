@@ -15,7 +15,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/knoci/knocidb/diskhash"
 	"github.com/knoci/knocidb/wal"
 
 	"github.com/dgraph-io/badger/v4/y"
@@ -61,6 +60,13 @@ type DB struct {
 	ttl     *ttlStore
 	ttlStop chan struct{}
 	ttlWG   sync.WaitGroup
+
+	snapshotMu      sync.Mutex
+	snapshotWG      sync.WaitGroup
+	snapshotsClosed bool
+	snapshotRunning bool
+
+	manifestGeneration uint64
 }
 
 // Open 使用指定的选项打开数据库。
@@ -145,7 +151,6 @@ func Open(options Options) (*DB, error) {
 
 	// 打开索引
 	index, err := openIndex(indexOptions{
-		indexType:       options.IndexType,
 		dirPath:         options.DirPath,
 		partitionNum:    options.PartitionNum,
 		keyHashFunction: options.KeyHashFunction,
@@ -196,22 +201,27 @@ func Open(options Options) (*DB, error) {
 		memtableMap[table.options.tableID] = table
 	}
 
+	manifestGeneration, manifestErr := readDBManifest(options.DirPath)
+	if manifestErr != nil {
+		log.Printf("read manifest failed: %v", manifestErr)
+	}
 	db := &DB{
-		activeMem:        memtables[len(memtables)-1],
-		immuMems:         memtables[:len(memtables)-1],
-		index:            index,
-		vlog:             vlog,
-		bloomManager:     bloomManager,
-		fileLock:         fileLock,
-		flushChan:        make(chan *memtable, options.MemtableNums-1),
-		compactChan:      make(chan discardState, 1),
-		closeflushChan:   make(chan struct{}),
-		closeCompactChan: make(chan struct{}),
-		diskIO:           diskIO,
-		options:          options,
-		batchPool:        sync.Pool{New: makeBatch},
-		memtables:        memtableMap,
-		ttl:              ttl,
+		activeMem:          memtables[len(memtables)-1],
+		immuMems:           memtables[:len(memtables)-1],
+		index:              index,
+		vlog:               vlog,
+		bloomManager:       bloomManager,
+		fileLock:           fileLock,
+		flushChan:          make(chan *memtable, options.MemtableNums-1),
+		compactChan:        make(chan discardState, 1),
+		closeflushChan:     make(chan struct{}),
+		closeCompactChan:   make(chan struct{}),
+		diskIO:             diskIO,
+		options:            options,
+		batchPool:          sync.Pool{New: makeBatch},
+		memtables:          memtableMap,
+		ttl:                ttl,
+		manifestGeneration: manifestGeneration,
 	}
 
 	if tier != nil {
@@ -242,6 +252,10 @@ func Open(options Options) (*DB, error) {
 	// 异步启动刷新内存表的协程，
 	// 当活跃内存表已满时，带有新写入的内存表将被刷新到磁盘。
 	go db.listenMemtableFlush()
+
+	if err := db.writeDBManifest(); err != nil {
+		log.Printf("write manifest failed: %v", err)
+	}
 
 	if options.AutoCompactSupport {
 		// 异步启动自动压缩协程，
@@ -281,24 +295,6 @@ func (db *DB) rebuildBloomFilters() error {
 			return nil
 		}); err != nil {
 			return err
-		}
-	case *HashTable:
-		// 哈希索引没有有序游标；扫描 ValueLog 中所有 key 更保守（可能多，但不会漏）。
-		for _, walFile := range db.vlog.walFiles {
-			reader := walFile.NewReader()
-			for {
-				chunk, _, err := reader.Next()
-				if err != nil {
-					if errors.Is(err, io.EOF) {
-						break
-					}
-					return err
-				}
-				record := decodeValueLogRecord(chunk)
-				if record != nil {
-					db.bloomManager.AddKey(record.key)
-				}
-			}
 		}
 	default:
 		return fmt.Errorf("unsupported index type for bloom rebuild")
@@ -383,6 +379,12 @@ func (db *DB) Close() error {
 }
 
 func (db *DB) closeInternal() error {
+	// 先拒绝新快照并等待进行中的快照，避免关闭仍在读取的文件。
+	db.snapshotMu.Lock()
+	db.snapshotsClosed = true
+	db.snapshotMu.Unlock()
+	db.snapshotWG.Wait()
+
 	// 无论中途哪个资源关闭失败，都必须释放文件锁，否则同目录无法再次打开。
 	defer func() {
 		if db.fileLock != nil {
@@ -468,6 +470,11 @@ func (db *DB) closeInternal() error {
 		if err := db.bloomManager.SaveAll(); err != nil {
 			return err
 		}
+	}
+
+	// 固化文件清单后再关闭 VLOG。
+	if err = db.writeDBManifest(); err != nil {
+		return err
 	}
 
 	// 关闭值日志
@@ -710,21 +717,6 @@ func (db *DB) flushMemtable(table *memtable) {
 		return
 	}
 
-	// Hash 索引的 PutBatch 不返回旧位置，需要先回查（MatchKeyFunc 会顺带读出旧 UUID）。
-	var hashOldPositions []*KeyPosition
-	if db.options.IndexType == Hash {
-		for _, kp := range keyPos {
-			old, err := db.currentKeyPosition(kp.key)
-			if err != nil {
-				log.Println("lookup old key position failed:", err)
-				continue
-			}
-			if old != nil {
-				hashOldPositions = append(hashOldPositions, old)
-			}
-		}
-	}
-
 	// 先加布隆，再写索引：避免“索引已可见、布隆还没加”期间读到假阴性。
 	// 如果索引写失败，布隆最多多几个 key（假阳性），不会漏 key。
 	if db.bloomManager != nil {
@@ -734,54 +726,22 @@ func (db *DB) flushMemtable(table *memtable) {
 	}
 
 	// 将所有键和位置写入索引。
-	var putMatchKeys []diskhash.MatchKeyFunc
-	if db.options.IndexType == Hash && len(keyPos) > 0 {
-		putMatchKeys = make([]diskhash.MatchKeyFunc, len(keyPos))
-		for i := range putMatchKeys {
-			putMatchKeys[i] = MatchKeyFunc(db, keyPos[i].key, nil, nil)
-		}
-	}
-
-	oldKeyPostions, err := db.index.PutBatch(keyPos, putMatchKeys...)
+	oldKeyPostions, err := db.index.PutBatch(keyPos)
 	if err != nil {
 		log.Println("index PutBatch failed:", err)
 		return
 	}
-	oldKeyPostions = append(oldKeyPostions, hashOldPositions...)
 
 	// 将旧键 uuid 加入废弃表（覆盖写的旧版本）。
 	for _, oldKeyPostion := range oldKeyPostions {
 		db.vlog.setDiscard(oldKeyPostion.partition, oldKeyPostion.uid)
 	}
 
-	// 删除键：先查旧位置（Hash 索引不会返回），再删索引，最后把旧 uuid 加入废弃表。
-	var hashDeletePositions []*KeyPosition
-	if db.options.IndexType == Hash {
-		for _, key := range deletedKeys {
-			old, err := db.currentKeyPosition(key)
-			if err != nil {
-				log.Println("lookup deleted key position failed:", err)
-				continue
-			}
-			if old != nil {
-				hashDeletePositions = append(hashDeletePositions, old)
-			}
-		}
-	}
-
-	var deleteMatchKeys []diskhash.MatchKeyFunc
-	if db.options.IndexType == Hash && len(deletedKeys) > 0 {
-		deleteMatchKeys = make([]diskhash.MatchKeyFunc, len(deletedKeys))
-		for i := range deleteMatchKeys {
-			deleteMatchKeys[i] = MatchKeyFunc(db, deletedKeys[i], nil, nil)
-		}
-	}
-
-	if oldKeyPostions, err = db.index.DeleteBatch(deletedKeys, deleteMatchKeys...); err != nil {
+	// 删除键：删除索引，最后把旧 uuid 加入废弃表。
+	if oldKeyPostions, err = db.index.DeleteBatch(deletedKeys); err != nil {
 		log.Println("index DeleteBatch failed:", err)
 		return
 	}
-	oldKeyPostions = append(oldKeyPostions, hashDeletePositions...)
 
 	// 删除的 key 也必须进入废弃表，否则增量压缩会把它当有效记录重新插回索引。
 	for _, oldKeyPostion := range oldKeyPostions {
@@ -802,7 +762,6 @@ func (db *DB) flushMemtable(table *memtable) {
 
 	// 删除内存中保存的旧内存表
 	db.mu.Lock()
-	defer db.mu.Unlock()
 	oldTableID := table.options.tableID
 	if table == db.activeMem {
 		options := db.activeMem.options
@@ -823,16 +782,14 @@ func (db *DB) flushMemtable(table *memtable) {
 	}
 	delete(db.memtables, oldTableID)
 	db.sendThresholdState()
+	db.mu.Unlock()
+	if err := db.writeDBManifest(); err != nil {
+		log.Printf("write manifest after flush failed: %v", err)
+	}
 }
 
 // currentKeyPosition 返回 key 当前在索引中的位置。
-// Hash 索引的 Get 通过 MatchKeyFunc 回表，顺带把旧 UUID 填进 KeyPosition。
 func (db *DB) currentKeyPosition(key []byte) (*KeyPosition, error) {
-	if db.options.IndexType == Hash {
-		var keyPos *KeyPosition
-		_, err := db.index.Get(key, MatchKeyFunc(db, key, &keyPos, nil))
-		return keyPos, err
-	}
 	return db.index.Get(key)
 }
 
@@ -1056,19 +1013,10 @@ func (db *DB) Compact() error {
 				if record == nil {
 					continue
 				}
-				var hashTableKeyPos *KeyPosition
-				var matchKey func(diskhash.Slot) (bool, error)
-				if db.options.IndexType == Hash {
-					matchKey = MatchKeyFunc(db, record.key, &hashTableKeyPos, nil)
-				}
-				keyPos, err := db.index.Get(record.key, matchKey)
+				keyPos, err := db.index.Get(record.key)
 				if err != nil {
 					_ = newVlogFile.Delete()
 					return err
-				}
-
-				if db.options.IndexType == Hash {
-					keyPos = hashTableKeyPos
 				}
 
 				if keyPos == nil {
@@ -1128,6 +1076,11 @@ func (db *DB) Compact() error {
 	db.mu.Lock()
 	db.vlog.cleanDiscardTable()
 	db.mu.Unlock()
+	if err == nil {
+		if manifestErr := db.writeDBManifest(); manifestErr != nil {
+			log.Printf("write manifest after compact failed: %v", manifestErr)
+		}
+	}
 	return err
 }
 
@@ -1198,21 +1151,10 @@ func (db *DB) CompactWithDiscardtable() error {
 				// 因为废弃表可能在重启/崩溃后不完整。索引不存在或位置不匹配的记录一律丢弃，
 				// 这样增量压缩也不会把已删除的 key 重新插回索引。
 				if !db.vlog.isDiscard(part, record.uid) {
-					var keyPos *KeyPosition
-					if db.options.IndexType == Hash {
-						var hashTableKeyPos *KeyPosition
-						matchKey := MatchKeyFunc(db, record.key, &hashTableKeyPos, nil)
-						if _, err = db.index.Get(record.key, matchKey); err != nil {
-							_ = newVlogFile.Delete()
-							return err
-						}
-						keyPos = hashTableKeyPos
-					} else {
-						keyPos, err = db.index.Get(record.key)
-						if err != nil {
-							_ = newVlogFile.Delete()
-							return err
-						}
+					keyPos, err := db.index.Get(record.key)
+					if err != nil {
+						_ = newVlogFile.Delete()
+						return err
 					}
 
 					if keyPos != nil && keyPos.partition == uint32(part) &&
@@ -1269,6 +1211,11 @@ func (db *DB) CompactWithDiscardtable() error {
 	db.mu.Lock()
 	db.vlog.cleanDiscardTable()
 	db.mu.Unlock()
+	if err == nil {
+		if manifestErr := db.writeDBManifest(); manifestErr != nil {
+			log.Printf("write manifest after compact failed: %v", manifestErr)
+		}
+	}
 	return err
 }
 
@@ -1290,13 +1237,7 @@ func (db *DB) rewriteValidRecords(walFile *wal.WAL, validRecords []*ValueLogReco
 			position:  walChunkPosition,
 		}
 	}
-	matchKeys := make([]diskhash.MatchKeyFunc, len(positions))
-	if db.options.IndexType == Hash {
-		for i := range matchKeys {
-			matchKeys[i] = MatchKeyFunc(db, positions[i].key, nil, nil)
-		}
-	}
-	_, err = db.index.PutBatch(positions, matchKeys...)
+	_, err = db.index.PutBatch(positions)
 	return err
 }
 
@@ -1353,7 +1294,7 @@ func loadDiscardEntryMeta(discardMetaPath string) (uint32, uint32, error) {
 
 // 持久化废弃数量和总条目数量.
 func storeDiscardEntryMeta(discardMetaPath string, discardNumber uint32, totalNumber uint32) error {
-	file, err := os.OpenFile(discardMetaPath, os.O_RDWR|os.O_TRUNC, 0666)
+	file, err := os.OpenFile(discardMetaPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0666)
 	if err != nil {
 		return err
 	}

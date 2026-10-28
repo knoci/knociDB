@@ -1,6 +1,7 @@
 package knocidb
 
 import (
+	"crypto/subtle"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -17,10 +18,11 @@ const (
 	rpcOpDelete byte = 2
 	rpcOpGet    byte = 3
 
-	rpcStatusOK        byte = 0
-	rpcStatusNotFound  byte = 1
-	rpcStatusNotLeader byte = 2
-	rpcStatusError     byte = 3
+	rpcStatusOK           byte = 0
+	rpcStatusNotFound     byte = 1
+	rpcStatusNotLeader    byte = 2
+	rpcStatusError        byte = 3
+	rpcStatusUnauthorized byte = 4
 
 	maxRPCValueSize = 64 << 20
 )
@@ -124,42 +126,64 @@ func (c *ClusterDB) acceptRPC(lis net.Listener) {
 	}
 }
 
+func (c *ClusterDB) rpcAuthorized(token []byte) bool {
+	secret := []byte(c.config.RPCSecret)
+	if len(secret) == 0 {
+		return true
+	}
+	return len(token) == len(secret) && subtle.ConstantTimeCompare(token, secret) == 1
+}
+
+func (c *ClusterDB) rpcTimeout() time.Duration {
+	if c.config.RPCTimeout <= 0 {
+		return 5 * time.Second
+	}
+	return c.config.RPCTimeout
+}
+
 func (c *ClusterDB) handleRPC(conn net.Conn) {
 	defer conn.Close()
-	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
-	op, key, value, err := readRPCRequest(conn)
+	c.rpcRequests.Add(1)
+	_ = conn.SetDeadline(time.Now().Add(c.rpcTimeout()))
+	fail := func(status byte, message string) {
+		c.rpcErrors.Add(1)
+		_ = writeRPCResponse(conn, status, []byte(message))
+	}
+	token, op, key, value, err := readRPCRequest(conn)
 	if err != nil {
-		_ = writeRPCResponse(conn, rpcStatusError, []byte(err.Error()))
+		fail(rpcStatusError, err.Error())
+		return
+	}
+	if !c.rpcAuthorized(token) {
+		fail(rpcStatusUnauthorized, "unauthorized")
 		return
 	}
 	if !c.isLeaderNow() {
-		_ = writeRPCResponse(conn, rpcStatusNotLeader, []byte("not leader"))
+		fail(rpcStatusNotLeader, "not leader")
 		return
 	}
 	switch op {
 	case rpcOpPut:
-		err = c.putLocal(key, value)
-		if err != nil {
-			_ = writeRPCResponse(conn, rpcStatusForError(err), []byte(err.Error()))
+		if err := c.putLocal(key, value); err != nil {
+			fail(rpcStatusForError(err), err.Error())
 			return
 		}
 		_ = writeRPCResponse(conn, rpcStatusOK, nil)
 	case rpcOpDelete:
-		err = c.deleteLocal(key)
-		if err != nil {
-			_ = writeRPCResponse(conn, rpcStatusForError(err), []byte(err.Error()))
+		if err := c.deleteLocal(key); err != nil {
+			fail(rpcStatusForError(err), err.Error())
 			return
 		}
 		_ = writeRPCResponse(conn, rpcStatusOK, nil)
 	case rpcOpGet:
 		got, err := c.getLocal(key)
 		if err != nil {
-			_ = writeRPCResponse(conn, rpcStatusForError(err), []byte(err.Error()))
+			fail(rpcStatusForError(err), err.Error())
 			return
 		}
 		_ = writeRPCResponse(conn, rpcStatusOK, got)
 	default:
-		_ = writeRPCResponse(conn, rpcStatusError, []byte("unknown rpc op"))
+		fail(rpcStatusError, "unknown rpc op")
 	}
 }
 
@@ -177,17 +201,26 @@ func (c *ClusterDB) forwardGet(addr string, key []byte) ([]byte, error) {
 }
 
 func (c *ClusterDB) rpcCall(addr string, op byte, key, value []byte) ([]byte, error) {
-	conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
+	c.forwardedOps.Add(1)
+	timeout := c.rpcTimeout()
+	dialTimeout := 2 * time.Second
+	if timeout < dialTimeout {
+		dialTimeout = timeout
+	}
+	conn, err := net.DialTimeout("tcp", addr, dialTimeout)
 	if err != nil {
+		c.rpcErrors.Add(1)
 		return nil, err
 	}
 	defer conn.Close()
-	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
-	if err := writeRPCRequest(conn, op, key, value); err != nil {
+	_ = conn.SetDeadline(time.Now().Add(timeout))
+	if err := writeRPCRequest(conn, []byte(c.config.RPCSecret), op, key, value); err != nil {
+		c.rpcErrors.Add(1)
 		return nil, err
 	}
 	status, payload, err := readRPCResponse(conn)
 	if err != nil {
+		c.rpcErrors.Add(1)
 		return nil, err
 	}
 	switch status {
@@ -197,7 +230,11 @@ func (c *ClusterDB) rpcCall(addr string, op byte, key, value []byte) ([]byte, er
 		return nil, ErrKeyNotFound
 	case rpcStatusNotLeader:
 		return nil, ErrNotLeader
+	case rpcStatusUnauthorized:
+		c.rpcErrors.Add(1)
+		return nil, ErrClusterUnauthorized
 	default:
+		c.rpcErrors.Add(1)
 		return nil, errors.New(string(payload))
 	}
 }
@@ -213,16 +250,20 @@ func rpcStatusForError(err error) byte {
 	}
 }
 
-func writeRPCRequest(w io.Writer, op byte, key, value []byte) error {
-	if len(key) > maxRPCValueSize || len(value) > maxRPCValueSize {
+func writeRPCRequest(w io.Writer, token []byte, op byte, key, value []byte) error {
+	if len(token) > 65535 || len(key) > maxRPCValueSize || len(value) > maxRPCValueSize {
 		return fmt.Errorf("cluster rpc payload too large")
 	}
-	hdr := make([]byte, 10)
+	hdr := make([]byte, 12)
 	hdr[0] = clusterRPCVersion
 	hdr[1] = op
-	binary.BigEndian.PutUint32(hdr[2:6], uint32(len(key)))
-	binary.BigEndian.PutUint32(hdr[6:10], uint32(len(value)))
+	binary.BigEndian.PutUint16(hdr[2:4], uint16(len(token)))
+	binary.BigEndian.PutUint32(hdr[4:8], uint32(len(key)))
+	binary.BigEndian.PutUint32(hdr[8:12], uint32(len(value)))
 	if _, err := w.Write(hdr); err != nil {
+		return err
+	}
+	if _, err := w.Write(token); err != nil {
 		return err
 	}
 	if _, err := w.Write(key); err != nil {
@@ -234,28 +275,33 @@ func writeRPCRequest(w io.Writer, op byte, key, value []byte) error {
 	return nil
 }
 
-func readRPCRequest(r io.Reader) (byte, []byte, []byte, error) {
-	hdr := make([]byte, 10)
+func readRPCRequest(r io.Reader) ([]byte, byte, []byte, []byte, error) {
+	hdr := make([]byte, 12)
 	if _, err := io.ReadFull(r, hdr); err != nil {
-		return 0, nil, nil, err
+		return nil, 0, nil, nil, err
 	}
 	if hdr[0] != clusterRPCVersion {
-		return 0, nil, nil, fmt.Errorf("unsupported cluster rpc version")
+		return nil, 0, nil, nil, fmt.Errorf("unsupported cluster rpc version")
 	}
-	keyLen := binary.BigEndian.Uint32(hdr[2:6])
-	valueLen := binary.BigEndian.Uint32(hdr[6:10])
+	tokenLen := binary.BigEndian.Uint16(hdr[2:4])
+	keyLen := binary.BigEndian.Uint32(hdr[4:8])
+	valueLen := binary.BigEndian.Uint32(hdr[8:12])
 	if keyLen > maxRPCValueSize || valueLen > maxRPCValueSize {
-		return 0, nil, nil, fmt.Errorf("cluster rpc payload too large")
+		return nil, 0, nil, nil, fmt.Errorf("cluster rpc payload too large")
+	}
+	token := make([]byte, tokenLen)
+	if _, err := io.ReadFull(r, token); err != nil {
+		return nil, 0, nil, nil, err
 	}
 	key := make([]byte, keyLen)
 	if _, err := io.ReadFull(r, key); err != nil {
-		return 0, nil, nil, err
+		return nil, 0, nil, nil, err
 	}
 	value := make([]byte, valueLen)
 	if _, err := io.ReadFull(r, value); err != nil {
-		return 0, nil, nil, err
+		return nil, 0, nil, nil, err
 	}
-	return hdr[1], key, value, nil
+	return token, hdr[1], key, value, nil
 }
 
 func writeRPCResponse(w io.Writer, status byte, payload []byte) error {

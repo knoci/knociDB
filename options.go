@@ -41,9 +41,6 @@ type Options struct {
 	// ValueLogFileSize 单个值日志文件的大小 默认值为 1GB
 	ValueLogFileSize int64
 
-	// indexType 索引类型 默认值为 bptree
-	IndexType IndexType
-
 	// 在读取指定内存容量的条目后将条目写入磁盘
 	CompactBatchCapacity int
 
@@ -141,7 +138,6 @@ var DefaultOptions = Options{
 	PartitionNum:                   3,
 	KeyHashFunction:                xxhash.Sum64,
 	ValueLogFileSize:               1 * GB,
-	IndexType:                      BTree,
 	CompactBatchCapacity:           1 << 30,
 	AdvisedCompactionRate:          0.3,
 	ForceCompactionRate:            0.5,
@@ -199,6 +195,11 @@ type ClusterOptions struct {
 	RPCAddress string
 	// PeerRPC 是 NodeID -> 内部转发 RPC 地址的映射。
 	PeerRPC map[uint64]string
+	// RPCSecret 是内部转发 RPC 的共享密钥；为空表示不鉴权。
+	// 密钥以明文传输，生产环境应部署在私网/VPN 中，并等待后续 mTLS 支持。
+	RPCSecret string
+	// RPCTimeout 是内部转发 RPC 的超时时间，默认 5s。
+	RPCTimeout time.Duration
 }
 
 // GetNodeHostOptions 返回Dragonboat节点主机配置
@@ -243,9 +244,16 @@ func DefaultClusterOptions(nodeID, clusterID uint64, raftAddress, dataDir string
 		HeartbeatRTTMs:          1,
 		SnapshotIntervalSeconds: 3600, // 默认每小时创建一次快照
 		Sync:                    true,
+		RPCTimeout:              5 * time.Second,
 	}
 	opt.InitialMembers[nodeID] = raftAddress
 	return opt
+}
+
+func (c *ClusterOptions) applyDefaults() {
+	if c.RPCTimeout <= 0 {
+		c.RPCTimeout = 5 * time.Second
+	}
 }
 
 // ValidateOptions 验证配置是否有效

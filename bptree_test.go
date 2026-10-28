@@ -25,14 +25,12 @@ func Test_openIndexBoltDB(t *testing.T) {
 	}{
 		{"normal_1",
 			indexOptions{
-				indexType:       BTree,
 				dirPath:         filepath.Join(os.TempDir(), "bptree-open-1"),
 				partitionNum:    1,
 				keyHashFunction: xxhash.Sum64,
 			},
 			&BPTree{
 				options: indexOptions{
-					indexType:       BTree,
 					dirPath:         filepath.Join(os.TempDir(), "bptree-open-1"),
 					partitionNum:    1,
 					keyHashFunction: xxhash.Sum64,
@@ -43,14 +41,12 @@ func Test_openIndexBoltDB(t *testing.T) {
 		},
 		{"normal_3",
 			indexOptions{
-				indexType:       BTree,
 				dirPath:         filepath.Join(os.TempDir(), "bptree-open-3"),
 				partitionNum:    3,
 				keyHashFunction: xxhash.Sum64,
 			},
 			&BPTree{
 				options: indexOptions{
-					indexType:       BTree,
 					dirPath:         filepath.Join(os.TempDir(), "bptree-open-3"),
 					partitionNum:    3,
 					keyHashFunction: xxhash.Sum64,
@@ -72,7 +68,6 @@ func Test_openIndexBoltDB(t *testing.T) {
 				t.Errorf("openIndexBoltDB() error = %v, wantErr %v", err, tt.wantErr)
 				return
 			}
-			assert.Equal(t, tt.want.options.indexType, got.options.indexType)
 			assert.Equal(t, tt.want.options.dirPath, got.options.dirPath)
 			assert.Equal(t, tt.want.options.partitionNum, got.options.partitionNum)
 			assert.Equal(t, len(tt.want.trees), len(got.trees))
@@ -90,7 +85,6 @@ func TestBPTree_Get_3(t *testing.T) {
 
 func testbptreeGet(t *testing.T, partitionNum int) {
 	options := indexOptions{
-		indexType:       BTree,
 		dirPath:         filepath.Join(os.TempDir(), "bptree-get-"+strconv.Itoa(partitionNum)),
 		partitionNum:    partitionNum,
 		keyHashFunction: xxhash.Sum64,
@@ -147,7 +141,6 @@ func TestBPTree_PutBatch_3(t *testing.T) {
 
 func testbptreePutbatch(t *testing.T, partitionNum int) {
 	options := indexOptions{
-		indexType:       BTree,
 		dirPath:         filepath.Join(os.TempDir(), "bptree-putBatch-"+strconv.Itoa(partitionNum)),
 		partitionNum:    partitionNum,
 		keyHashFunction: xxhash.Sum64,
@@ -204,7 +197,6 @@ func testbptreePutbatch(t *testing.T, partitionNum int) {
 func TestBPtreePutbatchOldUUID(t *testing.T) {
 	partitionNum := 3
 	options := indexOptions{
-		indexType:       BTree,
 		dirPath:         filepath.Join(os.TempDir(), "bptree-putBatch-olduuid"+strconv.Itoa(partitionNum)),
 		partitionNum:    partitionNum,
 		keyHashFunction: xxhash.Sum64,
@@ -297,7 +289,6 @@ func TestBPTree_DeleteBatch_3(t *testing.T) {
 
 func testbptreeDeletebatch(t *testing.T, partitionNum int) {
 	options := indexOptions{
-		indexType:       BTree,
 		dirPath:         filepath.Join(os.TempDir(), "bptree-deleteBatch-"+strconv.Itoa(partitionNum)),
 		partitionNum:    partitionNum,
 		keyHashFunction: xxhash.Sum64,
@@ -352,7 +343,6 @@ func TestBPTree_Close_3(t *testing.T) {
 
 func testbptreeClose(t *testing.T, partitionNum int) {
 	options := indexOptions{
-		indexType:       BTree,
 		dirPath:         filepath.Join(os.TempDir(), "bptree-close-"+strconv.Itoa(partitionNum)),
 		partitionNum:    partitionNum,
 		keyHashFunction: xxhash.Sum64,
@@ -381,7 +371,6 @@ func TestBPTree_Sync_3(t *testing.T) {
 
 func testbptreeSync(t *testing.T, partitionNum int) {
 	options := indexOptions{
-		indexType:       BTree,
 		dirPath:         filepath.Join(os.TempDir(), "bptree-sync-"+strconv.Itoa(partitionNum)),
 		partitionNum:    partitionNum,
 		keyHashFunction: xxhash.Sum64,
@@ -401,7 +390,6 @@ func testbptreeSync(t *testing.T, partitionNum int) {
 
 func Test_bptreeIterator(t *testing.T) {
 	options := indexOptions{
-		indexType:       BTree,
 		dirPath:         t.TempDir(),
 		partitionNum:    1,
 		keyHashFunction: xxhash.Sum64,

@@ -1,23 +1,21 @@
 package knocidb
 
-import "github.com/knoci/knocidb/diskhash"
-
 const (
 	// indexFileExt 是索引文件的扩展名
 	indexFileExt = "INDEX.%d"
 )
 
 // Index 是索引实现的接口。
-// 索引是一个键值存储，将键映射到块位置。
+// 当前只保留 B+Tree 索引；diskhash 已废弃。
 type Index interface {
 	// PutBatch 将批量记录写入索引
-	PutBatch(keyPositions []*KeyPosition, matchKeyFunc ...diskhash.MatchKeyFunc) ([]*KeyPosition, error)
+	PutBatch(keyPositions []*KeyPosition) ([]*KeyPosition, error)
 
 	// Get 通过键获取块位置
-	Get(key []byte, matchKeyFunc ...diskhash.MatchKeyFunc) (*KeyPosition, error)
+	Get(key []byte) (*KeyPosition, error)
 
 	// DeleteBatch 从索引中删除批量记录
-	DeleteBatch(keys [][]byte, matchKeyFunc ...diskhash.MatchKeyFunc) ([]*KeyPosition, error)
+	DeleteBatch(keys [][]byte) ([]*KeyPosition, error)
 
 	// Sync 将索引数据同步到磁盘
 	Sync() error
@@ -26,33 +24,12 @@ type Index interface {
 	Close() error
 }
 
-// openIndex 根据索引类型打开指定的索引
-// 目前，我们支持两种索引类型：BTree 和 Hash，
-// 它们都是基于磁盘的索引。
+// openIndex 打开 B+Tree 索引。
 func openIndex(options indexOptions) (Index, error) {
-	switch options.indexType {
-	case BTree:
-
-		return openBTreeIndex(options)
-	case Hash:
-		return openHashIndex(options)
-	default:
-		panic("unknown index type")
-	}
+	return openBTreeIndex(options)
 }
 
-type IndexType int8
-
-const (
-	// BTree 是 BoltDB 索引类型
-	BTree IndexType = iota
-	// Hash 是 diskhash 索引类型
-	Hash
-)
-
 type indexOptions struct {
-	indexType IndexType
-
 	dirPath string // 索引目录路径
 
 	partitionNum int // 用于分片的索引分区数量

@@ -17,7 +17,6 @@ require (
 	github.com/klauspost/compress v1.18.0
 	github.com/lni/dragonboat/v4 v4.0.0-20240618143154-6a1623140f27
 	github.com/shirou/gopsutil v3.21.11+incompatible
-	github.com/spaolacci/murmur3 v1.1.0
 	github.com/spf13/viper v1.20.0-alpha.6
 	github.com/stretchr/testify v1.10.0
 	github.com/valyala/bytebufferpool v1.0.0

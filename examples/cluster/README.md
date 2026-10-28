@@ -40,6 +40,7 @@ On Windows, use `.\cluster-example` instead of `./cluster-example`.
 - `--cluster`: Cluster ID (default is 1)
 - `--addr`: Dragonboat Raft address (format: host:port)
 - `--rpc`: Internal forwarding RPC address (optional)
+- `--rpc-secret`: Shared secret for forwarding RPC; empty disables auth
 - `--dir`: Data directory
 - `--join`: Whether to join an existing cluster as a new node
 - `--peers`: List of cluster members (format: id1=host1:port1,id2=host2:port2,...)

@@ -23,6 +23,7 @@ var (
 	clusterID      = flag.Uint64("cluster", defaultClusterID, "Cluster ID")
 	clusterAddress = flag.String("addr", "localhost:8001", "Cluster Raft address")
 	rpcAddress     = flag.String("rpc", "", "Internal forwarding RPC address")
+	rpcSecret      = flag.String("rpc-secret", "", "Shared secret for forwarding RPC")
 	dataDir        = flag.String("dir", "./node", "Data directory")
 	join           = flag.Bool("join", false, "Join existing cluster")
 	peersStr       = flag.String("peers", "", "Cluster members, format: id1=host1:port1,id2=host2:port2")
@@ -214,6 +215,7 @@ func main() {
 	config.InitialMembers = peers
 	config.RPCAddress = *rpcAddress
 	config.PeerRPC = rpcPeers
+	config.RPCSecret = *rpcSecret
 	config.Sync = *sync
 
 	// 打开ClusterDB

@@ -9,7 +9,6 @@ import (
 	"path/filepath"
 
 	"github.com/google/uuid"
-	"github.com/knoci/knocidb/diskhash"
 	"github.com/knoci/knocidb/wal"
 	"go.etcd.io/bbolt"
 	"golang.org/x/sync/errgroup"
@@ -34,7 +33,7 @@ type BPTree struct {
 // openBTreeIndex 打开一个 BoltDB(磁盘 B 树)索引。
 // 实际上，它为每个分区打开一个 BoltDB。
 // 分区数量由索引选项指定。
-func openBTreeIndex(options indexOptions, _ ...diskhash.MatchKeyFunc) (*BPTree, error) {
+func openBTreeIndex(options indexOptions) (*BPTree, error) {
 	trees := make([]*bbolt.DB, options.partitionNum)
 
 	for i := 0; i < options.partitionNum; i++ {
@@ -69,7 +68,7 @@ func openBTreeIndex(options indexOptions, _ ...diskhash.MatchKeyFunc) (*BPTree, 
 }
 
 // Get 获取指定键的位置
-func (bt *BPTree) Get(key []byte, _ ...diskhash.MatchKeyFunc) (*KeyPosition, error) {
+func (bt *BPTree) Get(key []byte) (*KeyPosition, error) {
 	if len(key) == 0 {
 		return nil, ErrKeyIsEmpty
 	}
@@ -98,7 +97,7 @@ func (bt *BPTree) Get(key []byte, _ ...diskhash.MatchKeyFunc) (*KeyPosition, err
 }
 
 // PutBatch 将指定的键位置批量写入索引
-func (bt *BPTree) PutBatch(positions []*KeyPosition, _ ...diskhash.MatchKeyFunc) ([]*KeyPosition, error) {
+func (bt *BPTree) PutBatch(positions []*KeyPosition) ([]*KeyPosition, error) {
 	if len(positions) == 0 {
 		return nil, nil
 	}
@@ -180,7 +179,7 @@ func (bt *BPTree) PutBatch(positions []*KeyPosition, _ ...diskhash.MatchKeyFunc)
 }
 
 // DeleteBatch 批量删除索引中的指定键。
-func (bt *BPTree) DeleteBatch(keys [][]byte, _ ...diskhash.MatchKeyFunc) ([]*KeyPosition, error) {
+func (bt *BPTree) DeleteBatch(keys [][]byte) ([]*KeyPosition, error) {
 	if len(keys) == 0 {
 		return nil, nil
 	}

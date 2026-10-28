@@ -158,35 +158,6 @@ func TestGRPCTokenAuth(t *testing.T) {
 	_ = db.Close()
 }
 
-func TestGRPCScanHashIndex(t *testing.T) {
-	dir := filepath.Join(os.TempDir(), "knocidb_grpc_hash_scan")
-	_ = os.RemoveAll(dir)
-	opts := knocidb.DefaultOptions
-	opts.DirPath = dir
-	opts.IndexType = knocidb.Hash
-	db, err := knocidb.Open(opts)
-	if err != nil {
-		t.Fatalf("open: %v", err)
-	}
-	s, lis, err := Start("127.0.0.1:0", db)
-	if err != nil {
-		t.Fatalf("start: %v", err)
-	}
-	defer s.GracefulStop()
-	cli, err := Dial(lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
-	if err != nil {
-		t.Fatalf("dial: %v", err)
-	}
-	defer cli.Close()
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-	err = cli.Scan(ctx, []byte("a"), []byte("z"), func(k, v []byte) bool { return true })
-	if status.Code(err) != codes.FailedPrecondition {
-		t.Fatalf("expect failed precondition, got %v", err)
-	}
-	_ = db.Close()
-}
-
 func TestGRPCInvalidPayloads(t *testing.T) {
 	dir := filepath.Join(os.TempDir(), "knocidb_grpc_invalid")
 	_ = os.RemoveAll(dir)

@@ -17,8 +17,6 @@ var (
 	ErrWrongType = errors.New("WRONGTYPE Operation against a key holding the wrong kind of value")
 	// ErrNotInteger 对应 Redis 的整数解析错误。
 	ErrNotInteger = errors.New("ERR value is not an integer or out of range")
-	// ErrNeedBTree 表示 Redis 数据类型层依赖有序迭代。
-	ErrNeedBTree = errors.New("redis data layer requires knociDB BTree index")
 )
 
 // Store 是 Redis 数据结构层。
@@ -36,13 +34,9 @@ type Store struct {
 }
 
 // NewStore 在 knociDB 上创建 Redis 数据类型层。
-// 必须使用 BTree 索引，因为 HGETALL/SMEMBERS/LRANGE 需要有序前缀扫描。
 func NewStore(db *knocidb.DB) (*Store, error) {
 	if db == nil {
 		return nil, fmt.Errorf("nil knociDB")
-	}
-	if db.GetOptions().IndexType != knocidb.BTree {
-		return nil, ErrNeedBTree
 	}
 	return &Store{db: db}, nil
 }
