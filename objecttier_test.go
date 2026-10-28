@@ -443,3 +443,29 @@ func TestThreeNodeClusterObjectTierLeaderFailover(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, []byte("after"), value)
 }
+
+func TestAsyncSnapshotObjectTierUpload(t *testing.T) {
+	fake := newFakeObjectStore()
+	options := DefaultOptions
+	options.DirPath = t.TempDir()
+	options.SnapshotPath = t.TempDir()
+	options.ObjectTier = ObjectTierOptions{Enabled: true, Store: fake, Prefix: "async"}
+	db, err := Open(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := db.Put([]byte("obj-key"), []byte("obj-value")); err != nil {
+		t.Fatal(err)
+	}
+	task, err := db.StartSnapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := task.Wait(); err != nil {
+		t.Fatal(err)
+	}
+	if len(fake.keys()) == 0 {
+		t.Fatal("snapshot was not uploaded")
+	}
+}
