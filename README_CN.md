@@ -13,6 +13,7 @@
 - ⚡ **高性能**键值存储
 - 🔄 **批量操作**具有ACD保证
 - 🌲 **B+树索引**支持（已移除遗留 diskhash 索引）
+- ⚙️ **分片 memtable** 与分区写锁（默认 5 个分区）
 - 🌐 **ClusterDB** 单 Raft Group、Leader-aware 转发、可选 RPC 鉴权
 - 💾 **S3 对象存储**读取和加载 wal
 - 📸 **异步快照** B+Tree-only 后台快照、原子归档与 manifest

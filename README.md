@@ -13,6 +13,7 @@
 - ⚡ **High-performance** key-value storage
 - 🔄 **Batch operations** with ACD guarantees
 - 🌲 **B+Tree index** support (legacy diskhash index removed)
+- ⚙️ **Sharded memtables** and partition-level write locks (default 5)
 - 🌐 **ClusterDB** single-Raft group with leader-aware forwarding and optional RPC auth
 - 💾 **S3 Object Storage** read and load wal
 - 📸 **Async snapshots** B+Tree-only background snapshot with atomic archive + manifest

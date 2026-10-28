@@ -87,6 +87,7 @@ type Iterator struct {
 	itrs       []*singleIter       // 用于重建堆
 	versionMap map[int]*singleIter // 映射 version->singleIter
 	db         *DB
+	shards     []*shard
 	locked     bool
 }
 
@@ -121,10 +122,7 @@ func (mi *Iterator) Seek(key []byte) {
 func (mi *Iterator) cleanKey(oldKey []byte, version int) {
 	defer func() {
 		if r := recover(); r != nil {
-			if mi.locked {
-				mi.locked = false
-				mi.db.mu.RUnlock()
-			}
+			mi.unlock()
 		}
 	}()
 	for i := 0; i < len(mi.itrs); i++ {
@@ -180,10 +178,7 @@ func (mi *Iterator) Key() []byte {
 func (mi *Iterator) Value() []byte {
 	defer func() {
 		if r := recover(); r != nil {
-			if mi.locked {
-				mi.locked = false
-				mi.db.mu.RUnlock()
-			}
+			mi.unlock()
 		}
 	}()
 	topIter := mi.h[0]
@@ -250,11 +245,18 @@ func (mi *Iterator) Close() error {
 			return err
 		}
 	}
-	if mi.locked {
-		mi.locked = false
-		mi.db.mu.RUnlock()
-	}
+	mi.unlock()
 	return nil
+}
+
+func (mi *Iterator) unlock() {
+	if !mi.locked {
+		return
+	}
+	mi.locked = false
+	for i := len(mi.shards) - 1; i >= 0; i-- {
+		mi.shards[i].mu.RUnlock()
+	}
 }
 
 // NewIterator 返回一个新的迭代器
@@ -262,21 +264,28 @@ func (mi *Iterator) Close() error {
 // 调用者有责任在不再使用迭代器时调用Close，否则会导致资源泄漏
 // 迭代器不是线程安全的，不可从多个goroutine并发使用同一个迭代器
 func (db *DB) NewIterator(options IteratorOptions) (*Iterator, error) {
-	db.mu.RLock()
+	shards := append([]*shard(nil), db.shards...)
+	for _, s := range shards {
+		s.mu.RLock()
+	}
 	success := false
 	defer func() {
 		if r := recover(); r != nil {
 			if !success {
-				db.mu.RUnlock()
+				for i := len(shards) - 1; i >= 0; i-- {
+					shards[i].mu.RUnlock()
+				}
 			}
 			panic(r)
 		}
 		if !success {
-			db.mu.RUnlock()
+			for i := len(shards) - 1; i >= 0; i-- {
+				shards[i].mu.RUnlock()
+			}
 		}
 	}()
 
-	itrs := make([]*singleIter, 0, db.options.PartitionNum+len(db.immuMems)+1)
+	itrs := make([]*singleIter, 0, len(db.getMemTables())+db.options.PartitionNum)
 	itrsM := make(map[int]*singleIter)
 	version := 0
 	index, ok := db.index.(*BPTree)
@@ -309,8 +318,7 @@ func (db *DB) NewIterator(options IteratorOptions) (*Iterator, error) {
 		itrsM[version] = itrs[len(itrs)-1]
 		version++
 	}
-	memtableList := make([]*memtable, len(db.immuMems)+1)
-	copy(memtableList, append(db.immuMems, db.activeMem))
+	memtableList := db.getMemTables()
 	for i := 0; i < len(memtableList); i++ {
 		itr := newMemtableIterator(options, memtableList[i])
 		itr.Rewind()
@@ -339,6 +347,7 @@ func (db *DB) NewIterator(options IteratorOptions) (*Iterator, error) {
 		itrs:       itrs,
 		versionMap: itrsM,
 		db:         db,
+		shards:     shards,
 		locked:     true,
 	}, nil
 }

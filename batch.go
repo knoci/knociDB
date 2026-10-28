@@ -2,6 +2,7 @@ package knocidb
 
 import (
 	"fmt"
+	"sort"
 	"time"
 
 	"sync"
@@ -19,7 +20,7 @@ import (
 // Batch 不是事务，它不保证隔离性。
 // 但它可以保证原子性、一致性和持久性（如果 Sync 选项为 true）。
 //
-// 必须调用 Commit 方法来提交批处理，否则数据库将被锁定。
+// 必须调用 Commit 方法提交写入；Batch 不持有全局数据库锁。
 type Batch struct {
 	db            *DB
 	pendingWrites map[string]*LogRecord
@@ -28,7 +29,6 @@ type Batch struct {
 	mu            sync.RWMutex
 	committed     bool
 	batchID       *snowflake.Node
-	locked        bool
 }
 
 // NewBatch 创建一个新的 Batch 实例。
@@ -47,7 +47,6 @@ func (db *DB) NewBatch(options BatchOptions) *Batch {
 		}
 		batch.batchID = node
 	}
-	batch.lock()
 	return batch
 }
 
@@ -75,7 +74,6 @@ func (b *Batch) init(rdonly, sync bool, disableWal bool, db *DB) *Batch {
 			b.pendingTTL = make(map[string]int64)
 		}
 	}
-	b.lock()
 	return b
 }
 
@@ -90,29 +88,20 @@ func (b *Batch) reset() {
 	b.committed = false
 }
 
-func (b *Batch) lock() {
-	if b.options.ReadOnly {
-		b.db.mu.RLock()
-	} else {
-		b.db.mu.Lock()
-	}
-	b.locked = true
-}
+// Close 保留给调用方显式释放 Batch；当前 Batch 不持有全局锁。
+func (b *Batch) Close() {}
 
-func (b *Batch) unlock() {
-	if !b.locked {
-		return
-	}
-	b.locked = false
-	if b.options.ReadOnly {
-		b.db.mu.RUnlock()
-	} else {
-		b.db.mu.Unlock()
+func (b *Batch) lockShards(shards []*shard) {
+	for _, s := range shards {
+		s.mu.Lock()
 	}
 }
 
-// Close 释放 Batch 持有的数据库锁
-func (b *Batch) Close() { b.unlock() }
+func (b *Batch) unlockShards(shards []*shard) {
+	for i := len(shards) - 1; i >= 0; i-- {
+		shards[i].mu.Unlock()
+	}
+}
 
 // Put 向批处理添加一个键值对以进行写入。
 func (b *Batch) Put(key []byte, value []byte) error {
@@ -241,8 +230,15 @@ func (b *Batch) Get(key []byte) ([]byte, error) {
 		return nil, ErrKeyNotFound
 	}
 
+	s := b.db.shardFor(key)
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if b.db.closed {
+		return nil, ErrDBClosed
+	}
+
 	// 从内存表获取
-	tables := b.db.getMemTables()
+	tables := s.memTables()
 	for _, table := range tables {
 		deleted, empty, value := table.getWithState(key)
 		if deleted {
@@ -340,8 +336,15 @@ func (b *Batch) Exist(key []byte) (bool, error) {
 		return false, nil
 	}
 
+	s := b.db.shardFor(key)
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if b.db.closed {
+		return false, ErrDBClosed
+	}
+
 	// 从内存表获取
-	tables := b.db.getMemTables()
+	tables := s.memTables()
 	for _, table := range tables {
 		deleted, empty, value := table.getWithState(key)
 		if deleted {
@@ -374,7 +377,6 @@ func (b *Batch) Exist(key []byte) (bool, error) {
 // 然后写入一条记录以表示批处理的结束，以保证原子性。
 // 最后，它将写入索引。
 func (b *Batch) Commit() error {
-	defer b.unlock()
 	if b.db.closed {
 		return ErrDBClosed
 	}
@@ -408,14 +410,41 @@ func (b *Batch) Commit() error {
 	}
 
 	if len(b.pendingWrites) > 0 {
-		// 等待内存表空间
-		if err := b.db.waitMemtableSpace(); err != nil {
-			return err
+		byShard := make(map[uint32]map[string]*LogRecord)
+		for key, record := range b.pendingWrites {
+			s := b.db.shardFor([]byte(key))
+			if byShard[s.id] == nil {
+				byShard[s.id] = make(map[string]*LogRecord)
+			}
+			byShard[s.id][key] = record
 		}
+		shards := make([]*shard, 0, len(byShard))
+		for id := range byShard {
+			shards = append(shards, b.db.shards[id])
+		}
+		sort.Slice(shards, func(i, j int) bool { return shards[i].id < shards[j].id })
+		b.lockShards(shards)
+		defer b.unlockShards(shards)
+		if b.db.closed {
+			return ErrDBClosed
+		}
+
 		batchID := b.batchID.Generate()
-		// 调用内存表的批量写入
-		if err := b.db.activeMem.putBatch(b.pendingWrites, batchID, b.options.WriteOptions); err != nil {
-			return err
+		for _, s := range shards {
+			if err := b.db.waitMemtableSpace(s); err != nil {
+				return err
+			}
+			if err := s.active.prepareBatch(byShard[s.id], batchID, b.options.WriteOptions); err != nil {
+				return err
+			}
+		}
+		if !b.options.DisableWal {
+			if err := b.db.commitLog.append(uint64(batchID), b.options.Sync); err != nil {
+				return err
+			}
+		}
+		for _, s := range shards {
+			s.active.applyBatch(byShard[s.id])
 		}
 	}
 

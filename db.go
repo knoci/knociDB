@@ -30,8 +30,9 @@ const (
 )
 
 type DB struct {
-	activeMem        *memtable           // 用于写入的活跃内存表
-	immuMems         []*memtable         // 不可变内存表，等待刷新到磁盘
+	activeMem        *memtable           // shard 0 的活跃内存表（兼容字段）
+	immuMems         []*memtable         // shard 0 的不可变内存表（兼容字段）
+	shards           []*shard            // 本地并发分区
 	index            Index               // 多分区索引，用于存储键和块位置
 	vlog             *valueLog           // 值日志
 	bloomManager     *BloomFilterManager // 布隆过滤器管理器
@@ -56,6 +57,7 @@ type DB struct {
 
 	// 记录打开过的 memtable，Close 时兜底关闭，避免 flush 竞态遗留 WAL 句柄。
 	memtables map[uint32]*memtable
+	commitLog *commitLog
 
 	ttl     *ttlStore
 	ttlStop chan struct{}
@@ -144,9 +146,24 @@ func Open(options Options) (*DB, error) {
 	}
 
 	// 打开所有内存表
-	memtables, err := openMemtables(options)
+	commitLog, committed, legacy, err := openCommitLog(options.DirPath, options.Sync)
 	if err != nil {
 		return nil, err
+	}
+	memtables, seen, err := openMemtables(options, committed, legacy)
+	if err != nil {
+		_ = commitLog.close()
+		return nil, err
+	}
+	if legacy {
+		// 旧版本 DB 没有 COMMIT 文件：把现有 WAL 批次补记为已提交，
+		// 避免升级后第一次重启丢失旧数据。
+		for id := range seen {
+			if err := commitLog.append(id, true); err != nil {
+				_ = commitLog.close()
+				return nil, err
+			}
+		}
 	}
 
 	// 打开索引
@@ -197,8 +214,22 @@ func Open(options Options) (*DB, error) {
 	}
 
 	memtableMap := make(map[uint32]*memtable, len(memtables))
+	shards := make([]*shard, options.PartitionNum)
+	for i := range shards {
+		shards[i] = &shard{id: uint32(i)}
+	}
 	for _, table := range memtables {
 		memtableMap[table.options.tableID] = table
+		if int(table.shardID) < len(shards) {
+			shards[table.shardID].immu = append(shards[table.shardID].immu, table)
+		}
+	}
+	for _, s := range shards {
+		if len(s.immu) == 0 {
+			return nil, fmt.Errorf("shard %d has no memtable", s.id)
+		}
+		s.active = s.immu[len(s.immu)-1]
+		s.immu = s.immu[:len(s.immu)-1]
 	}
 
 	manifestGeneration, manifestErr := readDBManifest(options.DirPath)
@@ -206,8 +237,9 @@ func Open(options Options) (*DB, error) {
 		log.Printf("read manifest failed: %v", manifestErr)
 	}
 	db := &DB{
-		activeMem:          memtables[len(memtables)-1],
-		immuMems:           memtables[:len(memtables)-1],
+		shards:             shards,
+		activeMem:          shards[0].active,
+		immuMems:           shards[0].immu,
 		index:              index,
 		vlog:               vlog,
 		bloomManager:       bloomManager,
@@ -220,6 +252,7 @@ func Open(options Options) (*DB, error) {
 		options:            options,
 		batchPool:          sync.Pool{New: makeBatch},
 		memtables:          memtableMap,
+		commitLog:          commitLog,
 		ttl:                ttl,
 		manifestGeneration: manifestGeneration,
 	}
@@ -243,8 +276,8 @@ func Open(options Options) (*DB, error) {
 	}
 
 	// 如果在打开数据库时有一些不可变内存表，将它们刷新到磁盘
-	if len(db.immuMems) > 0 {
-		for _, table := range db.immuMems {
+	for _, s := range db.shards {
+		for _, table := range s.immu {
 			db.flushMemtable(table)
 		}
 	}
@@ -433,22 +466,17 @@ func (db *DB) closeInternal() error {
 		_ = db.objectTier.Close()
 	}
 
+	shards := db.lockAllShards()
+	defer db.unlockAllShards(shards)
+	db.closed = true
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
-	// 关闭所有打开过的内存表。注册表包含已从 immuMems 移除、但可能仍有句柄的 WAL。
+	// 关闭所有打开过的内存表；注册表包含所有 shard 的 active/immu 表。
 	for _, table := range db.memtables {
 		if err := table.close(); err != nil {
 			return err
 		}
-	}
-	for _, table := range db.immuMems {
-		if err := table.close(); err != nil {
-			return err
-		}
-	}
-	if err := db.activeMem.close(); err != nil {
-		return err
 	}
 	// 关闭索引
 	if err := db.index.Close(); err != nil {
@@ -477,7 +505,10 @@ func (db *DB) closeInternal() error {
 		return err
 	}
 
-	// 关闭值日志
+	// 关闭提交日志和值日志
+	if err = db.commitLog.close(); err != nil {
+		return err
+	}
 	if err = db.vlog.close(); err != nil {
 		return err
 	}
@@ -486,17 +517,16 @@ func (db *DB) closeInternal() error {
 
 // Sync 将所有数据文件同步到底层存储。
 func (db *DB) Sync() error {
-	db.mu.Lock()
-	defer db.mu.Unlock()
-
-	// 同步所有内存表的WAL
-	for _, table := range db.immuMems {
-		if err := table.sync(); err != nil {
-			return err
+	// 同步所有 shard 内存表的 WAL
+	for _, s := range db.shards {
+		s.mu.RLock()
+		for _, table := range s.memTables() {
+			if err := table.sync(); err != nil {
+				s.mu.RUnlock()
+				return err
+			}
 		}
-	}
-	if err := db.activeMem.sync(); err != nil {
-		return err
+		s.mu.RUnlock()
 	}
 	// 同步索引
 	if err := db.index.Sync(); err != nil {
@@ -505,6 +535,12 @@ func (db *DB) Sync() error {
 	// 同步值日志
 	if err := db.vlog.sync(); err != nil {
 		return err
+	}
+	// 同步提交日志，确保快照/恢复看到完整 committed 集合。
+	if db.commitLog != nil {
+		if err := db.commitLog.Sync(); err != nil {
+			return err
+		}
 	}
 	// 同步 TTL 旁路索引
 	if db.ttl != nil {
@@ -538,7 +574,6 @@ func (db *DB) PutWithOptions(key []byte, value []byte, options WriteOptions) err
 	// 因为数据将被写入WAL，并且WAL文件将根据DB选项同步到磁盘。
 	batch.init(false, false, false, db).withPendingWrites()
 	if err := batch.Put(key, value); err != nil {
-		batch.unlock()
 		return err
 	}
 	return batch.Commit()
@@ -584,7 +619,6 @@ func (db *DB) DeleteWithOptions(key []byte, options WriteOptions) error {
 	// 并且WAL文件将根据DB选项同步到磁盘。
 	batch.init(false, false, false, db).withPendingWrites()
 	if err := batch.Delete(key); err != nil {
-		batch.unlock()
 		return err
 	}
 	return batch.Commit()
@@ -635,13 +669,9 @@ func validateOptions(options *Options) error {
 // 必须在持有db.mu锁的情况下调用。
 func (db *DB) getMemTables() []*memtable {
 	var tables []*memtable
-	tables = append(tables, db.activeMem)
-
-	last := len(db.immuMems) - 1
-	for i := range db.immuMems {
-		tables = append(tables, db.immuMems[last-i])
+	for _, s := range db.shards {
+		tables = append(tables, s.memTables()...)
 	}
-
 	return tables
 }
 
@@ -649,24 +679,27 @@ func (db *DB) getMemTables() []*memtable {
 // 如果活跃内存表已满，它将由后台协程刷新到磁盘。
 // 但如果刷新速度慢于写入速度，内存表中可能没有空间。
 // 因此写入操作将等待内存表中的空间，超时时间由 WaitMemSpaceTimeout 指定。
-func (db *DB) waitMemtableSpace() error {
-	if !db.activeMem.isFull() {
+func (db *DB) waitMemtableSpace(s *shard) error {
+	if !s.active.isFull() {
 		return nil
 	}
 
 	timer := time.NewTimer(db.options.WaitMemSpaceTimeout)
 	defer timer.Stop()
 	select {
-	case db.flushChan <- db.activeMem:
-		db.immuMems = append(db.immuMems, db.activeMem)
-		options := db.activeMem.options
-		options.tableID++
-		// 打开一个新的内存表用于写入
+	case db.flushChan <- s.active:
+		s.immu = append(s.immu, s.active)
+		options := s.active.options
+		options.tableID = makeTableID(s.id, (options.tableID&0xffff)+1)
 		table, err := openMemtable(options)
 		if err != nil {
 			return err
 		}
-		db.activeMem = table
+		s.active = table
+		if s.id == 0 {
+			db.activeMem = table
+			db.immuMems = s.immu
+		}
 		db.memtables[table.options.tableID] = table
 	case <-timer.C:
 		return ErrWaitMemtableSpaceTimeOut
@@ -761,28 +794,35 @@ func (db *DB) flushMemtable(table *memtable) {
 	}
 
 	// 删除内存中保存的旧内存表
-	db.mu.Lock()
+	s := db.shards[table.shardID]
+	s.mu.Lock()
 	oldTableID := table.options.tableID
-	if table == db.activeMem {
-		options := db.activeMem.options
-		options.tableID++
-		// 打开一个新的内存表用于写入
+	if table == s.active {
+		options := s.active.options
+		options.tableID = makeTableID(s.id, (options.tableID&0xffff)+1)
 		table, err = openMemtable(options)
 		if err != nil {
-			panic("flush activate memtable wrong")
+			panic("flush active memtable failed")
 		}
-		db.activeMem = table
+		s.active = table
+		if s.id == 0 {
+			db.activeMem = table
+		}
 		db.memtables[table.options.tableID] = table
 	} else {
-		if len(db.immuMems) == 1 {
-			db.immuMems = db.immuMems[:0]
-		} else {
-			db.immuMems = db.immuMems[1:]
+		for i, t := range s.immu {
+			if t == table {
+				s.immu = append(s.immu[:i], s.immu[i+1:]...)
+				break
+			}
+		}
+		if s.id == 0 {
+			db.immuMems = s.immu
 		}
 	}
 	delete(db.memtables, oldTableID)
+	s.mu.Unlock()
 	db.sendThresholdState()
-	db.mu.Unlock()
 	if err := db.writeDBManifest(); err != nil {
 		log.Printf("write manifest after flush failed: %v", err)
 	}
@@ -1041,18 +1081,18 @@ func (db *DB) Compact() error {
 				}
 			}
 
-			// 用新文件替换 wal。读者在 Get 期间持有 db.mu.RLock，这里用写锁切换，
-			// 避免读者拿到旧指针后文件已被删除。
-			db.mu.Lock()
+			// 用新文件替换 wal。读者持有对应 shard 的读锁，
+			// 这里锁住所有 shard，避免读者拿到旧指针后文件已被删除。
+			shards := db.lockAllShards()
 			// 先关闭新文件句柄并 rename；旧段仍保持打开，rename 不会覆盖旧段名。
 			_ = newVlogFile.Close()
 			if err := newVlogFile.RenameFileExt(fmt.Sprintf(valueLogFileExt, part)); err != nil {
-				db.mu.Unlock()
+				db.unlockAllShards(shards)
 				return err
 			}
 			reopened, err := openVlogFile(part, valueLogFileExt, 1)
 			if err != nil {
-				db.mu.Unlock()
+				db.unlockAllShards(shards)
 				return err
 			}
 			// reopened 同时打开旧段和新段；此时再关闭旧 WAL，并删除旧段。
@@ -1062,7 +1102,7 @@ func (db *DB) Compact() error {
 			_ = reopened.DeleteSegmentsBelow(wal.SegmentID(newID))
 			db.vlog.walFiles[part] = reopened
 			db.vlog.dpTables[part].clean()
-			db.mu.Unlock()
+			db.unlockAllShards(shards)
 
 			return nil
 		})
@@ -1177,17 +1217,17 @@ func (db *DB) CompactWithDiscardtable() error {
 				}
 			}
 
-			// 同 Compact：切换文件指针时持有写锁，避免并发读者读到已删除的旧文件。
-			db.mu.Lock()
+			// 同 Compact：切换文件指针时锁住所有 shard，避免并发读者读到已删除的旧文件。
+			shards := db.lockAllShards()
 			// 先关闭新文件句柄并 rename；旧段仍保持打开，rename 不会覆盖旧段名。
 			_ = newVlogFile.Close()
 			if err := newVlogFile.RenameFileExt(fmt.Sprintf(valueLogFileExt, part)); err != nil {
-				db.mu.Unlock()
+				db.unlockAllShards(shards)
 				return err
 			}
 			reopened, err := openVlogFile(part, valueLogFileExt, 1)
 			if err != nil {
-				db.mu.Unlock()
+				db.unlockAllShards(shards)
 				return err
 			}
 			// reopened 同时打开旧段和新段；此时再关闭旧 WAL，并删除旧段。
@@ -1197,7 +1237,7 @@ func (db *DB) CompactWithDiscardtable() error {
 			_ = reopened.DeleteSegmentsBelow(wal.SegmentID(newID))
 			db.vlog.walFiles[part] = reopened
 			db.vlog.dpTables[part].clean()
-			db.mu.Unlock()
+			db.unlockAllShards(shards)
 			return nil
 		})
 	}

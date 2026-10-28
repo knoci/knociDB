@@ -32,7 +32,7 @@ type Options struct {
 	// BytesPerSync 指定在调用 fsync 之前要写入的字节数
 	BytesPerSync uint32
 
-	// PartitionNum 指定用于索引和值日志的分区数
+	// PartitionNum 指定索引、值日志、memtable 和写锁的分区数（默认 5）
 	PartitionNum int
 
 	// KeyHashFunction 指定用于分片的哈希函数 用于确定键属于哪个分区 默认值为 xxhash
@@ -135,7 +135,7 @@ var DefaultOptions = Options{
 	MemtableNums:                   15,
 	Sync:                           false,
 	BytesPerSync:                   0,
-	PartitionNum:                   3,
+	PartitionNum:                   5,
 	KeyHashFunction:                xxhash.Sum64,
 	ValueLogFileSize:               1 * GB,
 	CompactBatchCapacity:           1 << 30,

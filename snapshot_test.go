@@ -235,7 +235,6 @@ func TestAsyncSnapshotRoundTrip(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-
 	task, err := db.StartSnapshot()
 	if err != nil {
 		_ = db.Close()
@@ -251,7 +250,6 @@ func TestAsyncSnapshotRoundTrip(t *testing.T) {
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
-
 	restoreDir := filepath.Join(base, "restore")
 	if err := importSnapshotToDir(task.Path(), restoreDir); err != nil {
 		t.Fatal(err)

@@ -104,7 +104,7 @@ func (fakeIndexForSnapshot) Close() error                                    { r
 
 func TestSnapshotInternalErrors(t *testing.T) {
 	db := &DB{index: fakeIndexForSnapshot{}}
-	if err := db.copySnapshotFiles(t.TempDir()); !errors.Is(err, ErrSnapshotUnsupportedIndex) {
+	if err := db.copySnapshotFiles(t.TempDir(), nil); !errors.Is(err, ErrSnapshotUnsupportedIndex) {
 		t.Fatalf("want unsupported index, got %v", err)
 	}
 	if _, err := buildSnapshotManifest(filepath.Join(t.TempDir(), "missing"), t.TempDir()); err == nil {

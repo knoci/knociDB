@@ -34,27 +34,29 @@ type (
 		wal     *wal.WAL           // 预写日志
 		skl     *arenaskl.Skiplist // 跳表
 		options memtableOptions
+		shardID uint32
 	}
 
 	// memtableOptions 表示内存表的配置选项
 	memtableOptions struct {
 		dirPath         string // 预写日志 WAL 文件存储的位置
 		tableID         uint32 // 内存表的唯一 ID，用于生成 WAL 文件名
+		shardID         uint32 // 所属本地并发分区
 		memSize         uint32 // 内存表的最大大小
 		walBytesPerSync uint32 // 通过 BytesPerSync 参数将 WAL 文件刷新到磁盘
 		walSync         bool   // WAL 在每次写入后立即刷新
 	}
 )
 
-// 打开WAL获取所有memtable
-func openMemtables(options Options) ([]*memtable, error) {
+// openMemtables 扫描并打开每个分区的 WAL。
+// applyAll 为 true 时兼容旧 WAL（没有 commit log）；否则只回放已提交批次。
+func openMemtables(options Options, committed map[uint64]struct{}, applyAll bool) ([]*memtable, map[uint64]struct{}, error) {
 	entries, err := os.ReadDir(options.DirPath)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
-	// 获取所有内存表 ID
-	var tableIDs []int
+	byShard := make(map[uint32][]int)
 	for _, entry := range entries {
 		if entry.IsDir() {
 			continue
@@ -65,46 +67,59 @@ func openMemtables(options Options) ([]*memtable, error) {
 		if err != nil {
 			continue
 		}
-		tableIDs = append(tableIDs, id)
-	}
-
-	// 默认表
-	if len(tableIDs) == 0 {
-		tableIDs = append(tableIDs, initialTableID)
-	}
-
-	sort.Ints(tableIDs)
-	tables := make([]*memtable, len(tableIDs))
-	for i, table := range tableIDs {
-		table, errOpenMemtable := openMemtable(memtableOptions{
-			dirPath:         options.DirPath,
-			tableID:         uint32(table),
-			memSize:         options.MemtableSize,
-			walSync:         options.Sync,
-			walBytesPerSync: options.BytesPerSync,
-		})
-		if errOpenMemtable != nil {
-			return nil, errOpenMemtable
+		shardID := tableShardID(uint32(id))
+		if int(shardID) >= options.PartitionNum {
+			continue
 		}
-		tables[i] = table
+		byShard[shardID] = append(byShard[shardID], id)
 	}
-	return tables, nil
+
+	partitionNum := options.PartitionNum
+	if partitionNum <= 0 {
+		partitionNum = 1
+	}
+	tables := make([]*memtable, 0, partitionNum)
+	seen := make(map[uint64]struct{})
+	for shardID := 0; shardID < partitionNum; shardID++ {
+		ids := byShard[uint32(shardID)]
+		if len(ids) == 0 {
+			ids = []int{int(makeTableID(uint32(shardID), initialTableID))}
+		}
+		sort.Ints(ids)
+		for _, id := range ids {
+			table, err := openMemtableWithCommitted(memtableOptions{
+				dirPath:         options.DirPath,
+				tableID:         uint32(id),
+				shardID:         uint32(shardID),
+				memSize:         options.MemtableSize,
+				walSync:         options.Sync,
+				walBytesPerSync: options.BytesPerSync,
+			}, committed, applyAll, seen)
+			if err != nil {
+				return nil, nil, err
+			}
+			tables = append(tables, table)
+		}
+	}
+	return tables, seen, nil
 }
 
-// memtable持有一个wal(预写日志)，所以当打开一个memtable时，
-// 实际上是打开相应的wal文件。并从wal加载所有条目以重建跳表的内容。
+// openMemtable 打开一个内存表并回放全部已完成的批次（测试/旧格式入口）。
 func openMemtable(options memtableOptions) (*memtable, error) {
-	// 初始化跳表
+	return openMemtableWithCommitted(options, nil, true, nil)
+}
+
+func openMemtableWithCommitted(options memtableOptions, committed map[uint64]struct{}, applyAll bool, seen map[uint64]struct{}) (*memtable, error) {
 	skl := arenaskl.NewSkiplist(int64(float64(options.memSize) * 1.5))
 	table := &memtable{
 		options: options,
 		skl:     skl,
+		shardID: options.shardID,
 	}
 
-	// 打开预写日志文件
 	walFile, err := wal.Open(wal.Options{
 		DirPath:        options.dirPath,
-		SegmentSize:    math.MaxInt, // 无限制，确保一个wal文件只包含一个段文件
+		SegmentSize:    math.MaxInt,
 		SegmentFileExt: fmt.Sprintf(walFileExt, options.tableID),
 		Sync:           options.walSync,
 		BytesPerSync:   options.walBytesPerSync,
@@ -114,7 +129,6 @@ func openMemtable(options memtableOptions) (*memtable, error) {
 	}
 	table.wal = walFile
 
-	// 从wal加载所有条目,以重建跳表的内容
 	indexRecords := make(map[uint64][]*LogRecord)
 	reader := table.wal.NewReader()
 	for {
@@ -134,67 +148,66 @@ func openMemtable(options memtableOptions) (*memtable, error) {
 			if errParseBytes != nil {
 				return nil, errParseBytes
 			}
-			// 批次处理
-			for _, idxRecord := range indexRecords[uint64(batchID)] {
-				table.skl.Put(y.KeyWithTs(idxRecord.Key, 0),
-					y.ValueStruct{Value: idxRecord.Value, Meta: idxRecord.Type})
+			_, committedBatch := committed[uint64(batchID)]
+			if seen != nil {
+				seen[uint64(batchID)] = struct{}{}
+			}
+			if applyAll || committedBatch {
+				for _, idxRecord := range indexRecords[uint64(batchID)] {
+					table.skl.Put(y.KeyWithTs(idxRecord.Key, 0),
+						y.ValueStruct{Value: idxRecord.Value, Meta: idxRecord.Type})
+				}
 			}
 			delete(indexRecords, uint64(batchID))
 		} else {
 			indexRecords[record.BatchID] = append(indexRecords[record.BatchID], record)
 		}
 	}
-
-	// 成功打开并读取WAL文件，返回内存表
 	return table, nil
 }
 
-// putBatch 将一批LogRecord写入内存表。
-func (mt *memtable) putBatch(pendingWrites map[string]*LogRecord, batchID snowflake.ID, options WriteOptions) error {
-	// 统一空 value 的表示，无论是否写 WAL 都要生效
+// prepareBatch 把批次写入 WAL，但不修改 skiplist。
+func (mt *memtable) prepareBatch(pendingWrites map[string]*LogRecord, batchID snowflake.ID, options WriteOptions) error {
 	for _, record := range pendingWrites {
 		if record.Type == LogRecordNormal && record.Value != nil && len(record.Value) == 0 {
 			record.Type = LogRecordNormalEmpty
 		}
 	}
-
-	// 如果WAL未禁用，首先写入WAL以确保持久性和原子性
-	if !options.DisableWal {
-		// 将记录添加到wal.pendingWrites，这相当于wal的一个写缓冲区
-		for _, record := range pendingWrites {
-			record.BatchID = uint64(batchID)
-			encRecord := encodeLogRecord(record)
-			mt.wal.PendingWrites(encRecord)
-		}
-
-		// 添加一条记录表示批处理的结束
-		endRecord := encodeLogRecord(&LogRecord{
-			Key:  batchID.Bytes(),
-			Type: LogRecordBatchFinished,
-		})
-		mt.wal.PendingWrites(endRecord)
-
-		// 写入wal.pendingWrites
-		if _, err := mt.wal.WriteAll(); err != nil {
-			return err
-		}
-		// 如有必要，刷新WAL：
-		// - 本次写入显式要求 Sync
-		// - 或者数据库全局开启了 Sync（walSync=true）
-		if options.Sync || mt.options.walSync {
-			if err := mt.wal.Sync(); err != nil {
-				return err
-			}
-		}
+	if options.DisableWal {
+		return nil
 	}
-	// 上锁，多线程
+	for _, record := range pendingWrites {
+		record.BatchID = uint64(batchID)
+		mt.wal.PendingWrites(encodeLogRecord(record))
+	}
+	mt.wal.PendingWrites(encodeLogRecord(&LogRecord{
+		Key:  batchID.Bytes(),
+		Type: LogRecordBatchFinished,
+	}))
+	if _, err := mt.wal.WriteAll(); err != nil {
+		return err
+	}
+	if options.Sync || mt.options.walSync {
+		return mt.wal.Sync()
+	}
+	return nil
+}
+
+// applyBatch 把已经写入 WAL 的批次应用到 skiplist。
+func (mt *memtable) applyBatch(pendingWrites map[string]*LogRecord) {
 	mt.mu.Lock()
-	// 写入内存中的跳表
 	for key, record := range pendingWrites {
 		mt.skl.Put(y.KeyWithTs([]byte(key), 0), y.ValueStruct{Value: record.Value, Meta: record.Type})
 	}
 	mt.mu.Unlock()
+}
 
+// putBatch 是 prepareBatch + applyBatch 的兼容入口。
+func (mt *memtable) putBatch(pendingWrites map[string]*LogRecord, batchID snowflake.ID, options WriteOptions) error {
+	if err := mt.prepareBatch(pendingWrites, batchID, options); err != nil {
+		return err
+	}
+	mt.applyBatch(pendingWrites)
 	return nil
 }
 

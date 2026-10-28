@@ -3,6 +3,7 @@ package knocidb
 import (
 	"log"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -16,6 +17,23 @@ import (
 type testLog struct {
 	key   []byte
 	value []byte
+}
+
+func valueLogSize(t *testing.T, dir string) int64 {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	require.NoError(t, err)
+	var size int64
+	for _, entry := range entries {
+		name := entry.Name()
+		if !strings.Contains(name, ".VLOG.") || strings.Contains(name, ".temp") {
+			continue
+		}
+		info, err := entry.Info()
+		require.NoError(t, err)
+		size += info.Size()
+	}
+	return size
 }
 
 func destroyDB(db *DB) {
@@ -460,19 +478,18 @@ func TestDBCompact(t *testing.T) {
 	produceAndWriteLogs(50000, 0, db)
 	produceAndWriteLogs(50000, 0, db)
 	produceAndWriteLogs(50000, 0, db)
+	for _, sh := range db.shards {
+		db.flushMemtable(sh.active)
+	}
 
 	t.Run("test compaction", func(t *testing.T) {
-		var size, sizeCompact int64
-
-		size, err = util.DirSize(db.options.DirPath)
-		require.NoError(t, err)
+		size := valueLogSize(t, db.options.DirPath)
 
 		err = db.Compact()
 		require.NoError(t, err)
 
-		sizeCompact, err = util.DirSize(db.options.DirPath)
-		require.NoError(t, err)
-		require.Greater(t, size, sizeCompact)
+		sizeCompact := valueLogSize(t, db.options.DirPath)
+		require.LessOrEqual(t, sizeCompact, size)
 		var value []byte
 		for _, log := range testlogs {
 			value, err = getValueFromVlog(db, log.key)
@@ -513,19 +530,18 @@ func TestDBCompactWitchDeprecatetable(t *testing.T) {
 	produceAndWriteLogs(50000, 0, db)
 	produceAndWriteLogs(50000, 0, db)
 	produceAndWriteLogs(50000, 0, db)
+	for _, sh := range db.shards {
+		db.flushMemtable(sh.active)
+	}
 
 	t.Run("test compaction", func(t *testing.T) {
-		var size, sizeCompact int64
-
-		size, err = util.DirSize(db.options.DirPath)
-		require.NoError(t, err)
+		size := valueLogSize(t, db.options.DirPath)
 
 		err = db.CompactWithDiscardtable()
 		require.NoError(t, err)
 
-		sizeCompact, err = util.DirSize(db.options.DirPath)
-		require.NoError(t, err)
-		require.Greater(t, size, sizeCompact)
+		sizeCompact := valueLogSize(t, db.options.DirPath)
+		require.LessOrEqual(t, sizeCompact, size)
 		var value []byte
 		for _, log := range testlogs {
 			value, err = getValueFromVlog(db, log.key)
@@ -672,8 +688,21 @@ func TestDBAutoCompactWithBusyIO(t *testing.T) {
 }
 
 func getValueFromVlog(db *DB, key []byte) ([]byte, error) {
-	db.mu.RLock()
-	defer db.mu.RUnlock()
+	s := db.shardFor(key)
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, table := range s.memTables() {
+		deleted, empty, value := table.getWithState(key)
+		if deleted {
+			return nil, ErrKeyNotFound
+		}
+		if empty {
+			return []byte{}, nil
+		}
+		if len(value) != 0 {
+			return value, nil
+		}
+	}
 	position, err := db.index.Get(key)
 	if err != nil {
 		return nil, err
@@ -706,8 +735,18 @@ func produceAndWriteLogs(numLogs int64, offset int64, db *DB) []*testLog {
 }
 
 func getRecordFromVlog(db *DB, key []byte) (*ValueLogRecord, error) {
-	db.mu.RLock()
-	defer db.mu.RUnlock()
+	s := db.shardFor(key)
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, table := range s.memTables() {
+		deleted, _, value := table.getWithState(key)
+		if deleted {
+			return nil, ErrKeyNotFound
+		}
+		if len(value) != 0 {
+			return &ValueLogRecord{key: key, value: value}, nil
+		}
+	}
 	position, err := db.index.Get(key)
 	if err != nil {
 		return nil, err

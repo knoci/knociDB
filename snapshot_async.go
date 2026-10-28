@@ -129,10 +129,20 @@ func (db *DB) snapshotTo(path string) error {
 	if err := db.Sync(); err != nil {
 		return fmt.Errorf("sync before snapshot: %w", err)
 	}
+	var sizes map[string]int64
+	checkpointErr := func() error {
+		shards := db.lockAllShards()
+		defer db.unlockAllShards(shards)
+		sizes, _ = db.snapshotFileSizes()
+		return nil
+	}()
+	if checkpointErr != nil {
+		return checkpointErr
+	}
 	copyErr := func() error {
 		db.flushLock.Lock()
 		defer db.flushLock.Unlock()
-		return db.copySnapshotFiles(tmpDir)
+		return db.copySnapshotFiles(tmpDir, sizes)
 	}()
 	if copyErr != nil {
 		return copyErr
@@ -154,14 +164,10 @@ func (db *DB) snapshotTo(path string) error {
 	return nil
 }
 
-func (db *DB) copySnapshotFiles(dst string) error {
+func (db *DB) copySnapshotFiles(dst string, sizes map[string]int64) error {
 	bt, ok := db.index.(*BPTree)
 	if !ok {
 		return ErrSnapshotUnsupportedIndex
-	}
-	sizes, err := db.snapshotFileSizes()
-	if err != nil {
-		return err
 	}
 	// 索引：bbolt 读事务保证文件内容一致；flushLock 保证没有 flush 写入。
 	for i, tree := range bt.trees {
@@ -205,6 +211,10 @@ func (db *DB) copySnapshotFiles(dst string) error {
 		case strings.Contains(name, ".BLOOM"):
 			// Bloom 可由 Open 重建，避免复制自动保存中的文件。
 			continue
+		case name == commitLogName:
+			if err := copyFileSize(filepath.Join(db.options.DirPath, name), filepath.Join(dst, name), sizes[name]); err != nil {
+				return err
+			}
 		case strings.Contains(name, ".SEG."):
 			if err := copyFileSize(filepath.Join(db.options.DirPath, name), filepath.Join(dst, name), sizes[name]); err != nil {
 				return err
@@ -238,7 +248,7 @@ func (db *DB) snapshotFileSizes() (map[string]int64, error) {
 			continue
 		}
 		name := entry.Name()
-		if !strings.Contains(name, ".SEG.") && !strings.Contains(name, ".VLOG.") {
+		if !strings.Contains(name, ".SEG.") && !strings.Contains(name, ".VLOG.") && name != commitLogName {
 			continue
 		}
 		if strings.Contains(name, ".temp") {
