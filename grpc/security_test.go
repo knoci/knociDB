@@ -2,6 +2,8 @@ package knocigrpc
 
 import (
 	"context"
+
+	"github.com/knoci/knocidb"
 	"testing"
 
 	"google.golang.org/grpc"
@@ -102,4 +104,32 @@ func TestTokenCredentials(t *testing.T) {
 	if creds.RequireTransportSecurity() {
 		t.Fatal("token credentials should not require TLS by themselves")
 	}
+}
+
+func TestStartSecureWithoutTLS(t *testing.T) {
+	dbOpts := knocidb.DefaultOptions
+	dbOpts.DirPath = t.TempDir()
+	db, err := knocidb.Open(dbOpts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	srv, lis, err := StartSecure("127.0.0.1:0", db, ServerSecurityOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if srv == nil || lis == nil {
+		t.Fatal("nil server or listener")
+	}
+	srv.GracefulStop()
+
+	srv, lis, err = StartSecure("127.0.0.1:0", db, ServerSecurityOptions{EnableAuth: true, AuthToken: "token"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if srv == nil || lis == nil {
+		t.Fatal("nil auth server or listener")
+	}
+	srv.GracefulStop()
 }

@@ -2,6 +2,7 @@ package knocidb
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -90,5 +91,26 @@ func TestCopyFileSizeErrors(t *testing.T) {
 	}
 	if err := copyFileSize(src, filepath.Join(dir, "dst3"), 10); err == nil {
 		t.Fatal("short source should fail")
+	}
+}
+
+type fakeIndexForSnapshot struct{}
+
+func (fakeIndexForSnapshot) PutBatch([]*KeyPosition) ([]*KeyPosition, error) { return nil, nil }
+func (fakeIndexForSnapshot) Get([]byte) (*KeyPosition, error)                { return nil, nil }
+func (fakeIndexForSnapshot) DeleteBatch([][]byte) ([]*KeyPosition, error)    { return nil, nil }
+func (fakeIndexForSnapshot) Sync() error                                     { return nil }
+func (fakeIndexForSnapshot) Close() error                                    { return nil }
+
+func TestSnapshotInternalErrors(t *testing.T) {
+	db := &DB{index: fakeIndexForSnapshot{}}
+	if err := db.copySnapshotFiles(t.TempDir()); !errors.Is(err, ErrSnapshotUnsupportedIndex) {
+		t.Fatalf("want unsupported index, got %v", err)
+	}
+	if _, err := buildSnapshotManifest(filepath.Join(t.TempDir(), "missing"), t.TempDir()); err == nil {
+		t.Fatal("missing archive should fail")
+	}
+	if err := writeSnapshotArchive(filepath.Join(t.TempDir(), "missing"), filepath.Join(t.TempDir(), "snap.ZST")); err == nil {
+		t.Fatal("missing source should fail")
 	}
 }

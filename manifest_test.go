@@ -98,3 +98,37 @@ func TestDBManifestCorruptIsRegenerated(t *testing.T) {
 		t.Fatalf("manifest was not regenerated: %v", err)
 	}
 }
+
+func TestReadDBManifestErrors(t *testing.T) {
+	dir := t.TempDir()
+	if gen, err := readDBManifest(dir); err != nil || gen != 0 {
+		t.Fatalf("missing manifest: %d %v", gen, err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, dbManifestName), []byte("{"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readDBManifest(dir); err == nil {
+		t.Fatal("malformed manifest should fail")
+	}
+	data, _ := json.Marshal(dbManifest{Version: 999, Generation: 3})
+	if err := os.WriteFile(filepath.Join(dir, dbManifestName), data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readDBManifest(dir); err == nil {
+		t.Fatal("unsupported manifest version should fail")
+	}
+	data, _ = json.Marshal(dbManifest{Version: dbManifestVersion, Generation: 7})
+	if err := os.WriteFile(filepath.Join(dir, dbManifestName), data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if gen, err := readDBManifest(dir); err != nil || gen != 7 {
+		t.Fatalf("valid manifest: %d %v", gen, err)
+	}
+}
+
+func TestWriteDBManifestError(t *testing.T) {
+	db := &DB{options: Options{DirPath: filepath.Join(t.TempDir(), "missing")}}
+	if err := db.writeDBManifest(); err == nil {
+		t.Fatal("missing DB dir should fail")
+	}
+}

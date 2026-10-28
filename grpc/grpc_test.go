@@ -239,3 +239,30 @@ func TestGRPCDBClosed(t *testing.T) {
 		t.Fatalf("expect unavailable, got %v", err)
 	}
 }
+
+func TestGRPCServerErrorPaths(t *testing.T) {
+	opts := knocidb.DefaultOptions
+	opts.DirPath = t.TempDir()
+	db, err := knocidb.Open(opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	s := NewServer(db)
+
+	if _, err := s.Get(context.Background(), &wrapperspb.BytesValue{}); status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("empty get should be InvalidArgument: %v", err)
+	}
+	if _, err := s.Get(context.Background(), &wrapperspb.BytesValue{Value: []byte("missing")}); status.Code(err) != codes.NotFound {
+		t.Fatalf("missing get should be NotFound: %v", err)
+	}
+	if _, err := s.Delete(context.Background(), &wrapperspb.BytesValue{}); status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("empty delete should be InvalidArgument: %v", err)
+	}
+	if _, err := s.Delete(context.Background(), &wrapperspb.BytesValue{Value: []byte("missing")}); err != nil {
+		t.Fatalf("missing delete should be idempotent: %v", err)
+	}
+	if _, err := s.Put(context.Background(), &wrapperspb.BytesValue{Value: []byte{}}); status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("invalid put should be InvalidArgument: %v", err)
+	}
+}
