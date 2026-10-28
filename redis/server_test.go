@@ -159,3 +159,60 @@ func TestServerAuthAndHello(t *testing.T) {
 	require.True(t, ok)
 	require.Contains(t, hello, "knocidb")
 }
+
+func TestServerExtendedCommands(t *testing.T) {
+	_, _, conn := newTestServer(t)
+
+	require.Equal(t, int64(1), do(t, conn, "INCR", "counter"))
+	require.Equal(t, int64(3), do(t, conn, "INCRBY", "counter", "2"))
+	require.Equal(t, int64(2), do(t, conn, "DECR", "counter"))
+	require.Equal(t, int64(1), do(t, conn, "DECRBY", "counter", "1"))
+	require.Equal(t, int64(1), do(t, conn, "APPEND", "text", "a"))
+	require.Equal(t, int64(2), do(t, conn, "APPEND", "text", "b"))
+	require.Equal(t, int64(2), do(t, conn, "STRLEN", "text"))
+
+	require.Equal(t, "OK", do(t, conn, "SET", "opt", "v1", "EX", "60"))
+	require.Nil(t, do(t, conn, "SET", "opt", "v2", "NX"))
+	require.Equal(t, "OK", do(t, conn, "SET", "opt", "v3", "XX"))
+	require.Equal(t, "v3", do(t, conn, "GET", "opt"))
+	require.Equal(t, int64(0), do(t, conn, "PERSIST", "opt"))
+
+	require.Equal(t, int64(2), do(t, conn, "HSET", "h", "a", "1", "b", "2"))
+	require.Equal(t, []any{"a", "b"}, do(t, conn, "HKEYS", "h"))
+	require.Equal(t, []any{"1", "2"}, do(t, conn, "HVALS", "h"))
+	require.Equal(t, int64(1), do(t, conn, "HEXISTS", "h", "a"))
+	require.Equal(t, int64(2), do(t, conn, "HLEN", "h"))
+	require.Equal(t, int64(1), do(t, conn, "HDEL", "h", "a"))
+
+	require.Equal(t, int64(1), do(t, conn, "LPUSH", "list", "a"))
+	require.Equal(t, int64(2), do(t, conn, "RPUSH", "list", "b"))
+	require.Equal(t, int64(2), do(t, conn, "LLEN", "list"))
+	require.Equal(t, "a", do(t, conn, "LPOP", "list"))
+	require.Equal(t, "b", do(t, conn, "RPOP", "list"))
+
+	require.Equal(t, int64(2), do(t, conn, "SADD", "set", "a", "b"))
+	require.Equal(t, int64(2), do(t, conn, "SCARD", "set"))
+	require.Equal(t, int64(1), do(t, conn, "SISMEMBER", "set", "a"))
+	require.Equal(t, int64(1), do(t, conn, "SREM", "set", "a"))
+
+	require.Equal(t, int64(2), do(t, conn, "ZADD", "z", "1", "a", "2", "b"))
+	require.Equal(t, int64(2), do(t, conn, "ZCARD", "z"))
+	require.Equal(t, "1", do(t, conn, "ZSCORE", "z", "a"))
+	require.Equal(t, int64(0), do(t, conn, "ZRANK", "z", "a"))
+	require.Equal(t, int64(0), do(t, conn, "ZREVRANK", "z", "b"))
+	require.Equal(t, []any{"a", "b"}, do(t, conn, "ZRANGE", "z", "0", "-1"))
+	require.Equal(t, []any{"b", "a"}, do(t, conn, "ZREVRANGE", "z", "0", "-1"))
+	require.Equal(t, int64(1), do(t, conn, "ZCOUNT", "z", "1", "1"))
+	require.Equal(t, "1.5", do(t, conn, "ZINCRBY", "z", "0.5", "a"))
+	require.Equal(t, int64(1), do(t, conn, "ZREM", "z", "b"))
+
+	require.NotNil(t, do(t, conn, "KEYS", "*"))
+	require.NotNil(t, do(t, conn, "SCAN", "0"))
+	require.NotNil(t, do(t, conn, "DBSIZE"))
+	require.Equal(t, "string", do(t, conn, "TYPE", "opt"))
+	require.NotNil(t, do(t, conn, "INFO"))
+	require.Equal(t, "OK", do(t, conn, "CLIENT", "SETNAME", "test"))
+	require.Nil(t, do(t, conn, "CLIENT", "GETNAME"))
+	require.Equal(t, "OK", do(t, conn, "SELECT", "0"))
+	require.NotNil(t, do(t, conn, "COMMAND"))
+}

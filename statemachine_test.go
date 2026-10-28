@@ -1,7 +1,10 @@
 package knocidb
 
 import (
+	"bytes"
+	"encoding/binary"
 	"encoding/json"
+	"hash/crc32"
 	"io"
 	"os"
 	"path/filepath"
@@ -308,4 +311,36 @@ type brokenReader struct{}
 
 func (r *brokenReader) Read(p []byte) (n int, err error) {
 	return 0, io.ErrClosedPipe
+}
+
+func TestRecoverFromSnapshotErrors(t *testing.T) {
+	s := &KVStateMachine{db: &DB{}}
+	if err := s.RecoverFromSnapshot(bytes.NewReader(nil), nil, nil); err == nil {
+		t.Fatal("empty snapshot should fail")
+	}
+
+	lenBuf := make([]byte, 4)
+	binary.LittleEndian.PutUint32(lenBuf, 4)
+	if err := s.RecoverFromSnapshot(bytes.NewReader(lenBuf), nil, nil); err == nil {
+		t.Fatal("truncated metadata should fail")
+	}
+
+	metadata := []byte("{}")
+	body := make([]byte, 0, 4+len(metadata)+4)
+	body = append(body, lenBuf...)
+	body = append(body, metadata...)
+	body = append(body, 0, 0, 0, 0) // wrong checksum
+	if err := s.RecoverFromSnapshot(bytes.NewReader(body), nil, nil); err == nil {
+		t.Fatal("bad checksum should fail")
+	}
+
+	var checksum [4]byte
+	binary.LittleEndian.PutUint32(checksum[:], crc32.ChecksumIEEE(metadata))
+	body = body[:0]
+	body = append(body, lenBuf...)
+	body = append(body, metadata...)
+	body = append(body, checksum[:]...)
+	if err := s.RecoverFromSnapshot(bytes.NewReader(body), nil, nil); err == nil {
+		t.Fatal("empty snapshot path should fail")
+	}
 }

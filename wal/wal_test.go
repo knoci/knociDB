@@ -323,3 +323,33 @@ func TestWAL_RenameFileExt(t *testing.T) {
 		assert.Nil(t, err)
 	}
 }
+
+func TestWAL_DeleteSegmentsBelow(t *testing.T) {
+	dir := t.TempDir()
+	opts := Options{
+		DirPath:        dir,
+		SegmentFileExt: ".T",
+		SegmentSize:    64 * 1024,
+	}
+	w, err := Open(opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+	if _, err := w.Write([]byte("first")); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.OpenNewActiveSegment(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write([]byte("second")); err != nil {
+		t.Fatal(err)
+	}
+	active := w.ActiveSegmentID()
+	if err := w.DeleteSegmentsBelow(active); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(SegmentFileName(dir, ".T", active-1)); !os.IsNotExist(err) {
+		t.Fatalf("old segment still exists: %v", err)
+	}
+}

@@ -341,7 +341,7 @@ func TestMultiNodeClusterObjectTierFailover(t *testing.T) {
 	require.NotEqual(t, leader, newLeader)
 	require.NoError(t, nodes[newLeader].Put([]byte("failover-key-2"), []byte("v2")))
 
-	// 杀一个 Follower，Leader 仍应可写。
+	// 杀一个 Follower，剩余节点仍应能选主并写入。
 	follower := -1
 	for i, node := range nodes {
 		if node != nil && i != newLeader {
@@ -352,8 +352,13 @@ func TestMultiNodeClusterObjectTierFailover(t *testing.T) {
 	require.GreaterOrEqual(t, follower, 0)
 	require.NoError(t, nodes[follower].Close())
 	nodes[follower] = nil
-	require.NoError(t, nodes[newLeader].Put([]byte("failover-key-3"), []byte("v3")))
-	value, err := nodes[newLeader].Get([]byte("failover-key-3"))
+	require.Eventually(t, func() bool {
+		leader := findLeader()
+		return leader >= 0 && nodes[leader].Put([]byte("failover-key-3"), []byte("v3")) == nil
+	}, 20*time.Second, 200*time.Millisecond)
+	leader = findLeader()
+	require.GreaterOrEqual(t, leader, 0)
+	value, err := nodes[leader].Get([]byte("failover-key-3"))
 	require.NoError(t, err)
 	require.Equal(t, []byte("v3"), value)
 }

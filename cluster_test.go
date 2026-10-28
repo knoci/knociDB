@@ -555,3 +555,13 @@ func TestClusterDBErrorPaths(t *testing.T) {
 	_, err = OpenCluster(ClusterOptions{}, DefaultOptions)
 	require.Error(t, err)
 }
+
+func TestClusterMembershipErrorPaths(t *testing.T) {
+	empty := &ClusterDB{}
+	if err := empty.AddNode(1, "127.0.0.1:1"); !errors.Is(err, ErrNodeNotStarted) {
+		t.Fatalf("AddNode empty = %v", err)
+	}
+	if err := empty.RemoveNode(1); !errors.Is(err, ErrNodeNotStarted) {
+		t.Fatalf("RemoveNode empty = %v", err)
+	}
+}

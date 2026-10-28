@@ -1,0 +1,12 @@
+coverage:
+  status:
+    project:
+      default:
+        target: 70%
+        threshold: 1%
+ignore:
+  - "examples/**"
+  - "**/*.pb.go"
+  - "docs/**"
+  # Cloud object-storage adapters are covered by opt-in integration tests.
+  - "wal/storage*.go"

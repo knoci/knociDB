@@ -788,11 +788,6 @@ func (db *DB) flushMemtable(table *memtable) {
 	}
 }
 
-// currentKeyPosition 返回 key 当前在索引中的位置。
-func (db *DB) currentKeyPosition(key []byte) (*KeyPosition, error) {
-	return db.index.Get(key)
-}
-
 func (db *DB) sendThresholdState() {
 	if db.options.AutoCompactSupport {
 		// 检查废弃表大小

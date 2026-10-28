@@ -317,3 +317,29 @@ func TestIteratorClose(t *testing.T) {
 		t.Errorf("Expected no error on close, got %v", err)
 	}
 }
+
+func TestIteratorValueIntegration(t *testing.T) {
+	options := DefaultOptions
+	options.DirPath = t.TempDir()
+	options.SnapshotPath = t.TempDir()
+	db, err := Open(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := db.Put([]byte("key"), []byte("value")); err != nil {
+		t.Fatal(err)
+	}
+	it, err := db.NewIterator(IteratorOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer it.Close()
+	it.Rewind()
+	if !it.Valid() {
+		t.Fatal("iterator should be valid")
+	}
+	if got := string(it.Value()); got != "value" {
+		t.Fatalf("Value = %q", got)
+	}
+}

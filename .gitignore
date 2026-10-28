@@ -3,7 +3,10 @@
 .gotmp/
 coverage.out
 coverage.txt
+coverage*.txt
+coverage
 coverage.html
+*.out
 *.test
 *.prof
 

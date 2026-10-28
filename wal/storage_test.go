@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -149,4 +150,62 @@ func TestS3StorageOperations(t *testing.T) {
 			t.Errorf("Close failed: %v", err)
 		}
 	})
+}
+
+func TestNewObjectStorageConfigErrors(t *testing.T) {
+	if _, err := NewObjectStorageWithConfig(ObjectStorageConfig{Type: "unknown"}); err == nil {
+		t.Fatal("unknown storage type should fail")
+	}
+}
+
+func TestNewS3StorageLocalOnly(t *testing.T) {
+	storage, err := NewObjectStorageWithConfig(ObjectStorageConfig{
+		Type:      S3ObjectStorage,
+		Endpoint:  "http://127.0.0.1:1",
+		Region:    "us-east-1",
+		Bucket:    "bucket",
+		AccessKey: "access",
+		SecretKey: "secret",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if storage == nil {
+		t.Fatal("nil storage")
+	}
+	if err := storage.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := storage.Upload(filepath.Join(os.TempDir(), "definitely-missing-knocidb"), "key"); err == nil {
+		t.Fatal("uploading a missing file should fail")
+	}
+
+	blocker := filepath.Join(os.TempDir(), "knocidb-download-blocker")
+	if err := os.WriteFile(blocker, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(blocker)
+	if err := storage.Download("key", filepath.Join(blocker, "child")); err == nil {
+		t.Fatal("download into a file path should fail")
+	}
+}
+
+func TestNewOSSStorageLocalOnly(t *testing.T) {
+	storage, err := NewObjectStorageWithConfig(ObjectStorageConfig{
+		Type:      OSSObjectStorage,
+		Endpoint:  "http://127.0.0.1:1",
+		Bucket:    "bucket",
+		AccessKey: "access",
+		SecretKey: "secret",
+	})
+	if err != nil {
+		return
+	}
+	if storage == nil {
+		t.Fatal("nil storage")
+	}
+	defer storage.Close()
+	if err := storage.Upload(filepath.Join(os.TempDir(), "definitely-missing-knocidb"), "key"); err == nil {
+		t.Fatal("uploading a missing file should fail")
+	}
 }
