@@ -109,7 +109,52 @@ $ go run main.go --dir ./redis_data --addr 127.0.0.1:6379
 $ redis-cli -p 6379
 ```
 
+## Performance
+
+knociDB delivers strong read throughput and efficient large-value bulk loads: tests show about **2.1× LevelDB random reads** and **9.8× sequential reads**. Single-key writes are not the fastest in every case, but batch writes are fast, and the engine supports WAL crash recovery, atomic batches, a B+Tree index, an object tier, and sharded multi-Raft.
+
+**📖 Throughput**
+
+| Engine        | Sequential write | Random write | Random read | Sequential read |
+| ------------- | ---------------: | -----------: | ----------: | --------------: |
+| 🟢 **knociDB** |           228.6k |       172.2k | 🥇 **1.27M** |     🥇 **3.07M** |
+| LevelDB       |           294.0k |       205.4k |        610k |            313k |
+| LotusDB       |           289.8k |       213.3k |        543k |            145k |
+| BadgerDB      |           141.5k |       116.8k |        205k |            304k |
+| BoltDB        |            35.6k |        35.9k |        763k |           1.51M |
+
+**📦 Large-value bulk load**
+
+| Engine        | Batch write |
+| ------------- | ----------: |
+| 🟢 **knociDB** |   **96.2k** |
+| BadgerDB      |       89.1k |
+| BoltDB        |      103.7k |
+| LevelDB       |       62.7k |
+
+<sub><i><span style="color:#777">Windows, Go 1.24.4, single thread, no fsync. Throughput: 100k keys × 1 KB, 50k random reads/writes (median of three runs). Bulk load: 20k keys × 16 KB, batches of 100 (best of three runs). Results are workload-specific; BoltDB uses per-key Update for throughput and batch transactions for bulk load.</span></i></sub>
+
+**💡 Feature comparison**
+
+| Feature             | knociDB           | BadgerDB       | RocksDB | BoltDB | LevelDB | LotusDB        |
+| ------------------- | ----------------- | -------------- | ------- | ------ | ------- | -------------- |
+| Storage design      | B+Tree + ValueLog | LSM + ValueLog | LSM     | B+Tree | LSM     | LSM + ValueLog |
+| Pure Go             | ✅                 | ✅              | ❌       | ✅      | ✅       | ✅              |
+| Embeddable          | ✅                 | ✅              | ✅       | ✅      | ✅       | ✅              |
+| Sorted KV iteration | ✅                 | ✅              | ✅       | ✅      | ✅       | ✅              |
+| Atomic batch        | ✅                 | ✅              | ✅       | ✅      | ✅       | ➖              |
+| ACID transactions   | ❌                 | ✅              | ✅       | ✅      | ❌       | ❌              |
+| TTL                 | ✅                 | ✅              | ➖       | ❌      | ❌       | ➖              |
+| Snapshots           | ✅                 | ✅              | ✅       | ✅      | ✅       | ➖              |
+| Key-value-version   | ❌                 | ✅              | ❌       | ❌      | ❌       | ❌              |
+| Sharded multi-Raft  | ✅                 | ❌              | ❌       | ❌      | ❌       | ❌              |
+| Object/cold tier    | ✅                 | ❌              | ❌       | ❌      | ❌       | ❌              |
+| Redis + gRPC        | ✅                 | ❌              | ❌       | ❌      | ❌       | ❌              |
+
+<sub><i><span style="color:#777">✅ supported · ❌ not supported · ➖ limited or not first-class</span></i></sub>
+
 ## Info
+
 📚 See the `docs/` directory for detailed documentation.
 
 ## Acknowledgments

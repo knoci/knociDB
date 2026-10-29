@@ -38,6 +38,9 @@ type WAL struct {
 	pendingWrites     [][]byte
 	pendingSize       int64
 	pendingWritesLock sync.Mutex
+	syncMu            sync.Mutex
+	writeSeq          uint64
+	durableSeq        uint64
 	closeC            chan struct{}
 	syncTicker        *time.Ticker
 	objectStorage     ObjectStorage // 对象存储接口
@@ -207,6 +210,7 @@ func (wal *WAL) OpenNewActiveSegment() error {
 	}
 	wal.olderSegments[wal.activeSegment.id] = wal.activeSegment
 	wal.activeSegment = segment
+	wal.durableSeq = wal.writeSeq
 	return nil
 }
 
@@ -407,6 +411,7 @@ func (wal *WAL) WriteAll() ([]*ChunkPosition, error) {
 	if err != nil {
 		return nil, err
 	}
+	wal.writeSeq++
 
 	return positions, nil
 }
@@ -432,7 +437,8 @@ func (wal *WAL) Write(data []byte) (*ChunkPosition, error) {
 		return nil, err
 	}
 
-	// 更新 bytesWrite 字段。
+	// 更新 group sync 使用的写序列。
+	wal.writeSeq++
 	wal.bytesWrite += position.ChunkSize
 
 	// 如果开启了Sync。
@@ -579,9 +585,22 @@ func (wal *WAL) Delete() error {
 // Sync 将活动段文件同步到稳定存储（如磁盘）。
 func (wal *WAL) Sync() error {
 	wal.mu.Lock()
-	defer wal.mu.Unlock()
+	target := wal.writeSeq
+	wal.mu.Unlock()
 
-	return wal.activeSegment.Sync()
+	wal.syncMu.Lock()
+	defer wal.syncMu.Unlock()
+
+	wal.mu.Lock()
+	defer wal.mu.Unlock()
+	if wal.durableSeq >= target {
+		return nil
+	}
+	if err := wal.activeSegment.Sync(); err != nil {
+		return err
+	}
+	wal.durableSeq = wal.writeSeq
+	return nil
 }
 
 // RenameFileExt 重命名所有段文件的扩展名。

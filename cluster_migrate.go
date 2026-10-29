@@ -7,10 +7,9 @@ import (
 	"time"
 )
 
-// MigrateShard moves one voting replica of a fixed shard to another node.
-// The target must already be reachable as a Raft node (normally started with
-// JoinCluster=true). The source replica is removed only after the target is
-// promoted; failures attempt to restore the original membership.
+// MigrateShard 把一个固定分片的 voting 副本迁移到另一个节点。
+// 目标节点必须已经以 Raft 节点身份可达（通常以 JoinCluster=true 启动）。
+// 只有目标 promote 成功后才移除源副本；失败时尝试恢复原成员关系。
 func (c *ClusterDB) MigrateShard(shardID uint32, fromNode, toNode uint64, toAddress string) error {
 	if fromNode == toNode {
 		return fmt.Errorf("source and target replica are identical")
@@ -49,9 +48,8 @@ func (c *ClusterDB) MigrateShard(shardID uint32, fromNode, toNode uint64, toAddr
 		return fmt.Errorf("promote learner: %w", err)
 	}
 	if err := c.RemoveShardReplica(shardID, fromNode); err != nil {
-		// If the source is still a voter, remove the new target to roll back.
-		// If the removal already applied, Dragonboat keeps the source in its
-		// Removed set, so re-adding it is not a valid rollback.
+		// 如果源仍是 voter，移除新目标以回滚。
+		// 如果移除已经生效，Dragonboat 会把源放入 Removed 集合，此时不能重新加回。
 		if after, mErr := c.ShardMembership(shardID); mErr == nil && containsID(after.Voters, fromNode) {
 			_ = c.RemoveShardReplica(shardID, toNode)
 		}

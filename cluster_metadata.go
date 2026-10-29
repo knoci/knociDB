@@ -11,16 +11,15 @@ import (
 	"github.com/lni/dragonboat/v4/statemachine"
 )
 
-// ShardMapStateMachine stores the fixed shard-map metadata (count + epoch).
-// It is replicated by the metadata Raft group; the map itself is immutable in
-// this version, so updates only advance the epoch.
+// ShardMapStateMachine 保存固定分片元数据（分片数与 epoch）。
+// 它由 metadata Raft group 复制；当前版本分片表不可变，更新只推进 epoch。
 type ShardMapStateMachine struct {
 	mu         sync.RWMutex
 	epoch      uint64
 	shardCount int
 }
 
-// ShardMapMeta is the JSON payload used by ShardMapStateMachine.
+// ShardMapMeta 是 ShardMapStateMachine 使用的 JSON 载荷。
 type ShardMapMeta struct {
 	Epoch      uint64 `json:"epoch"`
 	ShardCount int    `json:"shard_count"`

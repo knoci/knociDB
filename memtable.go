@@ -155,7 +155,8 @@ func openMemtableWithCommitted(options memtableOptions, committed map[uint64]str
 			if seen != nil {
 				seen[uint64(batchID)] = struct{}{}
 			}
-			if applyAll || committedBatch {
+			singleShard := len(record.Value) == 1 && record.Value[0] == 1
+			if applyAll || committedBatch || singleShard {
 				for _, idxRecord := range indexRecords[uint64(batchID)] {
 					table.skl.Put(y.KeyWithTs(idxRecord.Key, 0),
 						y.ValueStruct{Value: idxRecord.Value, Meta: idxRecord.Type})
@@ -169,8 +170,38 @@ func openMemtableWithCommitted(options memtableOptions, committed map[uint64]str
 	return table, nil
 }
 
+func (mt *memtable) prepareRecord(record *LogRecord, batchID snowflake.ID, shardCount int, options WriteOptions) error {
+	if record.Type == LogRecordNormal && record.Value != nil && len(record.Value) == 0 {
+		record.Type = LogRecordNormalEmpty
+	}
+	if options.DisableWal {
+		return nil
+	}
+	mt.batchIDs[uint64(batchID)] = struct{}{}
+	record.BatchID = uint64(batchID)
+	mt.wal.PendingWrites(encodeLogRecord(record))
+	finished := &LogRecord{Key: batchID.Bytes(), Type: LogRecordBatchFinished}
+	if shardCount > 0 && shardCount <= 255 {
+		finished.Value = []byte{byte(shardCount)}
+	}
+	mt.wal.PendingWrites(encodeLogRecord(finished))
+	if _, err := mt.wal.WriteAll(); err != nil {
+		return err
+	}
+	if options.Sync || mt.options.walSync {
+		return mt.wal.Sync()
+	}
+	return nil
+}
+
+func (mt *memtable) applyRecord(record *LogRecord) {
+	mt.mu.Lock()
+	mt.skl.Put(y.KeyWithTs([]byte(record.Key), 0), y.ValueStruct{Value: record.Value, Meta: record.Type})
+	mt.mu.Unlock()
+}
+
 // prepareBatch 把批次写入 WAL，但不修改 skiplist。
-func (mt *memtable) prepareBatch(pendingWrites map[string]*LogRecord, batchID snowflake.ID, options WriteOptions) error {
+func (mt *memtable) prepareBatch(pendingWrites map[string]*LogRecord, batchID snowflake.ID, options WriteOptions, shardCount int) error {
 	for _, record := range pendingWrites {
 		if record.Type == LogRecordNormal && record.Value != nil && len(record.Value) == 0 {
 			record.Type = LogRecordNormalEmpty
@@ -184,10 +215,14 @@ func (mt *memtable) prepareBatch(pendingWrites map[string]*LogRecord, batchID sn
 		record.BatchID = uint64(batchID)
 		mt.wal.PendingWrites(encodeLogRecord(record))
 	}
-	mt.wal.PendingWrites(encodeLogRecord(&LogRecord{
+	finished := &LogRecord{
 		Key:  batchID.Bytes(),
 		Type: LogRecordBatchFinished,
-	}))
+	}
+	if shardCount > 0 && shardCount <= 255 {
+		finished.Value = []byte{byte(shardCount)}
+	}
+	mt.wal.PendingWrites(encodeLogRecord(finished))
 	if _, err := mt.wal.WriteAll(); err != nil {
 		return err
 	}
@@ -208,7 +243,7 @@ func (mt *memtable) applyBatch(pendingWrites map[string]*LogRecord) {
 
 // putBatch 是 prepareBatch + applyBatch 的兼容入口。
 func (mt *memtable) putBatch(pendingWrites map[string]*LogRecord, batchID snowflake.ID, options WriteOptions) error {
-	if err := mt.prepareBatch(pendingWrites, batchID, options); err != nil {
+	if err := mt.prepareBatch(pendingWrites, batchID, options, 0); err != nil {
 		return err
 	}
 	mt.applyBatch(pendingWrites)

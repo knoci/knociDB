@@ -395,6 +395,31 @@ func (b *Batch) Commit() error {
 		return ErrBatchCommitted
 	}
 
+	// 单条且无 TTL 的写入只需一个分片锁和一次 WAL 准备，
+	// 不需要构建分组/排序 map。
+	if len(b.pendingWrites) == 1 && len(b.pendingTTL) == 0 {
+		var key string
+		var record *LogRecord
+		for key, record = range b.pendingWrites {
+		}
+		s := b.db.shardFor([]byte(key))
+		b.lockShards([]*shard{s})
+		defer b.unlockShards([]*shard{s})
+		if b.db.closed {
+			return ErrDBClosed
+		}
+		batchID := b.batchID.Generate()
+		if err := b.db.waitMemtableSpace(s); err != nil {
+			return err
+		}
+		if err := s.active.prepareRecord(record, batchID, 1, b.options.WriteOptions); err != nil {
+			return err
+		}
+		s.active.applyRecord(record)
+		b.committed = true
+		return nil
+	}
+
 	// 写入数据之前先落“设置 TTL”；崩溃时最多留下一个指向不存在 key 的 TTL。
 	sets := make(map[string]int64)
 	deletes := make(map[string]int64)
@@ -436,11 +461,11 @@ func (b *Batch) Commit() error {
 			if err := b.db.waitMemtableSpace(s); err != nil {
 				return err
 			}
-			if err := s.active.prepareBatch(byShard[s.id], batchID, b.options.WriteOptions); err != nil {
+			if err := s.active.prepareBatch(byShard[s.id], batchID, b.options.WriteOptions, len(shards)); err != nil {
 				return err
 			}
 		}
-		if !b.options.DisableWal {
+		if !b.options.DisableWal && len(shards) > 1 {
 			b.db.addBatchRefs(uint64(batchID), len(shards))
 			if err := b.db.commitLog.append(uint64(batchID), b.options.Sync); err != nil {
 				return err

@@ -15,21 +15,20 @@ type clusterShard struct {
 	sm      *KVStateMachine
 }
 
-// ShardInfo describes one fixed Raft group in a ClusterDB.
+// ShardInfo 描述 ClusterDB 中的一个固定 Raft group。
 type ShardInfo struct {
 	ID       uint32
 	GroupID  uint64
 	LeaderID uint64
 }
 
-// GroupIDForShard maps a fixed shard index to its Dragonboat group ID.
-// Shard 0 keeps ClusterID for compatibility; subsequent shards use ClusterID+i.
+// GroupIDForShard 把固定分片索引映射为 Dragonboat group ID。
+// shard 0 保留 ClusterID 以兼容单分片模式，后续分片使用 ClusterID+i。
 func (c *ClusterOptions) GroupIDForShard(shard uint32) uint64 {
 	return c.ClusterID + uint64(shard)
 }
 
-// MetadataGroupID returns the replicated shard-map group ID; 0 means no
-// separate metadata group (single-shard layout).
+// MetadataGroupID 返回分片元数据 group ID；0 表示没有独立 metadata group（单分片布局）。
 func (c *ClusterOptions) MetadataGroupID() uint64 {
 	if c.ShardCount <= 1 {
 		return 0
@@ -95,8 +94,8 @@ func (c *ClusterDB) dbForShard(shard uint32) (*DB, error) {
 	return c.shards[shard].db, nil
 }
 
-// Scan returns an iterator over shard 0 for the single-shard layout.
-// Cross-shard scans are rejected until a merge iterator is implemented.
+// Scan 在单分片布局下返回 shard 0 的迭代器。
+// 跨分片扫描尚未实现合并迭代器，因此直接返回错误。
 func (c *ClusterDB) Scan(start, end []byte) (*Iterator, error) {
 	if c.config.ShardCount != 1 {
 		return nil, ErrCrossShardScan
@@ -128,13 +127,13 @@ func (c *ClusterDB) groupIDs() []uint64 {
 	return groups
 }
 
-// Member is one node in the cluster membership.
+// Member 表示集群成员中的一个节点。
 type Member struct {
 	NodeID  uint64
 	Address string
 }
 
-// Members returns the membership of the first Raft group.
+// Members 返回第一个 Raft group 的成员信息。
 func (c *ClusterDB) Members() ([]Member, error) {
 	membership, err := c.GetClusterMembership()
 	if err != nil {
@@ -152,7 +151,7 @@ func (c *ClusterDB) Members() ([]Member, error) {
 	return out, nil
 }
 
-// ShardMembership is the voter/non-voter view of one fixed shard group.
+// ShardMembership 描述一个固定分片 group 的 voter/non-voter 视图。
 type ShardMembership struct {
 	ShardID   uint32
 	GroupID   uint64
@@ -162,7 +161,7 @@ type ShardMembership struct {
 	Addresses map[uint64]string
 }
 
-// ShardMembership returns the membership of one shard's Raft group.
+// ShardMembership 返回指定分片 Raft group 的成员信息。
 func (c *ClusterDB) ShardMembership(shardID uint32) (*ShardMembership, error) {
 	c.mu.RLock()
 	if c.nodeHost == nil || !c.state || int(shardID) >= c.config.ShardCount {
@@ -240,7 +239,7 @@ func (c *ClusterDB) RemoveShardReplica(shardID uint32, nodeID uint64) error {
 	return c.changeShardMembership(shardID, nodeID, "", false, false)
 }
 
-// Shards returns the fixed shard layout and the last known leader of each group.
+// Shards 返回固定分片布局以及各 group 最近一次已知的 leader。
 func (c *ClusterDB) Shards() []ShardInfo {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -258,7 +257,7 @@ func (c *ClusterDB) Shards() []ShardInfo {
 	return out
 }
 
-// LeaderOf returns the leader node ID for the group that owns key.
+// LeaderOf 返回 key 所属分片 group 的 leader 节点 ID。
 func (c *ClusterDB) LeaderOf(key []byte) (uint64, error) {
 	c.mu.RLock()
 	if c.nodeHost == nil || !c.state {

@@ -257,7 +257,7 @@ func TestLegacyWALCommitLogMigration(t *testing.T) {
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
-	// The seeded commit log must keep the migrated WAL batches readable.
+	// 补写后的 commit log 必须保证迁移后的 WAL 批次仍可恢复。
 	db, err = Open(options)
 	if err != nil {
 		t.Fatal(err)
@@ -440,7 +440,7 @@ func TestIteratorBlocksCompactionNotWrites(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	// Make sure the values are in the value log before compaction.
+	// 压缩前确保 value 已进入 value log。
 	for _, sh := range db.shards {
 		db.flushMemtable(sh.active)
 	}
@@ -455,7 +455,7 @@ func TestIteratorBlocksCompactionNotWrites(t *testing.T) {
 		t.Fatalf("compaction must wait for the iterator, got %v", err)
 	case <-time.After(200 * time.Millisecond):
 	}
-	// Writes are not blocked by the iterator or the pending compaction.
+	// 写入不应被迭代器或待执行的压缩阻塞。
 	if err := db.Put([]byte("after-iterator"), []byte("ok")); err != nil {
 		t.Fatal(err)
 	}
@@ -506,5 +506,42 @@ func TestBatchIDsAreUnique(t *testing.T) {
 	}
 	if len(seen) != count {
 		t.Fatalf("got %d unique batch IDs, want %d", len(seen), count)
+	}
+}
+
+func TestSingleShardBatchRecoveryWithoutCommit(t *testing.T) {
+	dir := t.TempDir()
+	options := DefaultOptions
+	options.DirPath = dir
+	options.SnapshotPath = t.TempDir()
+	db, err := Open(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := []byte("single-shard-no-commit")
+	if err := db.Put(key, []byte("value")); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(filepath.Join(dir, "COMMIT"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Size() != 0 {
+		t.Fatalf("single-shard batch wrote %d bytes to COMMIT", info.Size())
+	}
+	db, err = Open(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	got, err := db.Get(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "value" {
+		t.Fatalf("got %q", got)
 	}
 }

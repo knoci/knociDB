@@ -2,7 +2,7 @@ package knocidb
 
 import "fmt"
 
-// ShardMove describes one replica migration produced by PlanRebalance.
+// ShardMove 描述 PlanRebalance 产生的一次副本迁移。
 type ShardMove struct {
 	ShardID   uint32
 	FromNode  uint64
@@ -10,8 +10,7 @@ type ShardMove struct {
 	ToAddress string
 }
 
-// PlanRebalance returns at most one move that reduces the maximum voter
-// imbalance across shards. It does not change membership.
+// PlanRebalance 返回最多一个可降低分片间 voter 数量差异的迁移，不修改成员关系。
 func (c *ClusterDB) PlanRebalance() ([]ShardMove, error) {
 	if c.config.ShardCount <= 0 {
 		return nil, ErrNodeNotStarted
@@ -69,8 +68,8 @@ func (c *ClusterDB) PlanRebalance() ([]ShardMove, error) {
 	return []ShardMove{*best}, nil
 }
 
-// RebalanceAll executes up to maxMoves planned moves. It stops when no move
-// remains or a move fails. A non-positive limit defaults to 8.
+// RebalanceAll 最多执行 maxMoves 次迁移；没有可迁移项或失败时停止。
+// 非正数上限按 8 处理。
 func (c *ClusterDB) RebalanceAll(maxMoves int) ([]ShardMove, error) {
 	if maxMoves <= 0 {
 		maxMoves = 8
@@ -92,9 +91,9 @@ func (c *ClusterDB) RebalanceAll(maxMoves int) ([]ShardMove, error) {
 	return applied, nil
 }
 
-// Rebalance executes one planned move on the current node. The caller must be
-// the leader of the selected shard; repeated calls can be used to converge.
-// ExecuteShardMove runs a previously planned move on this node.
+// Rebalance 在当前节点执行一次计划迁移；调用方必须是目标分片的 leader，
+// 可重复调用来逐步收敛。
+// ExecuteShardMove 执行一个已经计算好的迁移。
 func (c *ClusterDB) ExecuteShardMove(move ShardMove) error {
 	leader, err := c.leaderForShard(move.ShardID)
 	if err != nil {

@@ -12,14 +12,11 @@ import (
 )
 
 func TestExportAndImportSnapshot(t *testing.T) {
-	dir := "testdata/snapdb"
-	snapDir := "testdata/snapshots"
-	os.RemoveAll(dir)
-	os.RemoveAll(snapDir)
+	base := t.TempDir()
+	dir := filepath.Join(base, "snapdb")
+	snapDir := filepath.Join(base, "snapshots")
 	os.MkdirAll(dir, 0755)
 	os.MkdirAll(snapDir, 0755)
-	defer os.RemoveAll(dir)
-	defer os.RemoveAll(snapDir)
 
 	db, err := Open(Options{
 		DirPath:      dir,
@@ -75,6 +72,9 @@ func TestExportAndImportSnapshot(t *testing.T) {
 		t.Fatal("no snapshot file found")
 	}
 
+	if err := db.Close(); err != nil {
+		t.Fatalf("close db before import failed: %v", err)
+	}
 	if err := os.RemoveAll(dir); err != nil {
 		t.Fatalf("remove db dir failed: %v", err)
 	}
@@ -103,7 +103,9 @@ func TestExportAndImportSnapshot(t *testing.T) {
 		t.Fatalf("import snapshot failed: %v", err)
 	}
 
-	db = nil
+	if err := db.Close(); err != nil {
+		t.Fatalf("close imported db failed: %v", err)
+	}
 
 	db, err = Open(Options{
 		DirPath:      dir,
@@ -157,14 +159,11 @@ func TestExportAndImportSnapshot(t *testing.T) {
 }
 
 func TestSnapshotCleanup(t *testing.T) {
-	dir := "testdata/snapdb2"
-	snapDir := "testdata/snapshots2"
-	os.RemoveAll(dir)
-	os.RemoveAll(snapDir)
+	base := t.TempDir()
+	dir := filepath.Join(base, "snapdb2")
+	snapDir := filepath.Join(base, "snapshots2")
 	os.MkdirAll(dir, 0755)
 	os.MkdirAll(snapDir, 0755)
-	defer os.RemoveAll(dir)
-	defer os.RemoveAll(snapDir)
 	db, err := Open(Options{
 		DirPath:      dir,
 		SnapshotPath: snapDir,
