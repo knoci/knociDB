@@ -12,11 +12,9 @@
 ## 特性
 - ⚡ **高性能**键值存储
 - 🔄 **批量操作**具有ACD保证
-- 🌲 **B+树索引**支持（已移除遗留 diskhash 索引）
-- ⚙️ **分片 memtable** 与分区写锁（默认 5 个分区）
-- 🌐 **ClusterDB** 单 Raft Group、Leader-aware 转发、可选 RPC 鉴权
-- 💾 **S3 对象存储**读取和加载 wal
-- 📸 **异步快照** B+Tree-only 后台快照、原子归档与 manifest
+- 🌲 **B+树索引**支持
+- 🌐 **分片 ClusterDB** 多 Raft Group、key 哈希路由、Leader-aware 转发
+- 💾 **对象冷层** 快照 + VLOG 冷段（S3/R2/COS/OSS）
 - 📋 **原子 DB manifest** 文件清单与 generation 跟踪
 - 🔌 **gRPC 支持** 客户端流式批量、服务端流式扫描、可选鉴权与 TLS
 - 🧩 **Redis 兼容子集** string/hash/list/set/zset、TTL、SCAN、Pub/Sub、集群协议
@@ -86,6 +84,8 @@ func main() {
 $ cd examples/cluster
 $ go build -o cluster-example main.go
 ```
+
+在 `OpenCluster` 前设置 `config.ShardCount` 即可创建多个固定 Raft Group。
 🔆 如果您想体验knociDB的更多功能，在`examples/cmd_client`中有一个命令行实现客户端，您可以通过该文件中的README文档获取使用cmd_client的具体方法。
 ```bash
 $ cd examples/cmd_client

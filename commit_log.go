@@ -11,12 +11,16 @@ import (
 	"sync"
 )
 
+// COMMIT 记录跨 shard 批次的提交点；恢复时只回放已提交批次的 WAL。
+// 文件是 append-only，flush 后由 maybePruneCommitLog 按活跃 WAL 重写。
 const commitLogName = "COMMIT"
 
 type commitLog struct {
-	file *os.File
-	mu   sync.Mutex
-	sync bool
+	path    string
+	file    *os.File
+	mu      sync.Mutex
+	sync    bool
+	records int
 }
 
 type commitRecord struct {
@@ -85,22 +89,134 @@ func openCommitLog(dir string, syncWrites bool) (*commitLog, map[uint64]struct{}
 		_ = f.Close()
 		return nil, nil, false, err
 	}
-	cl := &commitLog{file: f, sync: syncWrites}
+	cl := &commitLog{path: path, file: f, sync: syncWrites, records: len(committed)}
 	return cl, committed, legacy, nil
 }
 
+const commitLogPruneThreshold = 4096
+
+func (db *DB) maybePruneCommitLog() {
+	if db.commitLog == nil || db.commitLog.recordCount() < commitLogPruneThreshold {
+		return
+	}
+	db.flushLock.Lock()
+	defer db.flushLock.Unlock()
+	if db.commitLog.recordCount() < commitLogPruneThreshold {
+		return
+	}
+	if err := db.commitLog.rewrite(db.batchRefSnapshot()); err != nil {
+		// 裁剪失败不影响写入；下次 flush 再试。
+		return
+	}
+}
+
+func (db *DB) addBatchRefs(id uint64, n int) {
+	db.batchRefMu.Lock()
+	db.batchRefs[id] += n
+	db.batchRefMu.Unlock()
+}
+
+func (db *DB) releaseBatchRefs(ids map[uint64]struct{}) {
+	db.batchRefMu.Lock()
+	for id := range ids {
+		if db.batchRefs[id] <= 1 {
+			delete(db.batchRefs, id)
+		} else {
+			db.batchRefs[id]--
+		}
+	}
+	db.batchRefMu.Unlock()
+}
+
+func (db *DB) batchRefSnapshot() map[uint64]struct{} {
+	db.batchRefMu.Lock()
+	defer db.batchRefMu.Unlock()
+	ids := make(map[uint64]struct{}, len(db.batchRefs))
+	for id := range db.batchRefs {
+		ids[id] = struct{}{}
+	}
+	return ids
+}
+
 func (c *commitLog) append(id uint64, syncWrite bool) error {
-	if c == nil || c.file == nil {
+	if c == nil {
 		return nil
+	}
+	if c.file == nil {
+		return fmt.Errorf("commit log is not open")
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if _, err := c.file.Write(encodeCommitRecord(id)); err != nil {
 		return err
 	}
+	c.records++
 	if c.sync || syncWrite {
 		return c.file.Sync()
 	}
+	return nil
+}
+
+func (c *commitLog) recordCount() int {
+	if c == nil {
+		return 0
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.records
+}
+
+func (c *commitLog) rewrite(ids map[uint64]struct{}) error {
+	if c == nil {
+		return nil
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	tmpPath := c.path + ".tmp"
+	f, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	var writeErr error
+	for id := range ids {
+		if _, writeErr = f.Write(encodeCommitRecord(id)); writeErr != nil {
+			break
+		}
+	}
+	if writeErr == nil {
+		writeErr = f.Sync()
+	}
+	if closeErr := f.Close(); writeErr == nil {
+		writeErr = closeErr
+	}
+	if writeErr != nil {
+		_ = os.Remove(tmpPath)
+		return writeErr
+	}
+	if c.file != nil {
+		_ = c.file.Sync()
+		_ = c.file.Close()
+		c.file = nil
+	}
+	if err := os.Rename(tmpPath, c.path); err != nil {
+		// Keep the old path usable for the next append attempt.
+		if reopened, openErr := os.OpenFile(c.path, os.O_RDWR, 0o600); openErr == nil {
+			_, _ = reopened.Seek(0, io.SeekEnd)
+			c.file = reopened
+		}
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	reopened, err := os.OpenFile(c.path, os.O_RDWR, 0o600)
+	if err != nil {
+		return err
+	}
+	if _, err := reopened.Seek(0, io.SeekEnd); err != nil {
+		_ = reopened.Close()
+		return err
+	}
+	c.file = reopened
+	c.records = len(ids)
 	return nil
 }
 

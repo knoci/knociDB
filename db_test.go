@@ -473,6 +473,9 @@ func TestDBCompact(t *testing.T) {
 	}
 
 	produceAndWriteLogs(100000, 0, db)
+	for _, sh := range db.shards {
+		db.flushMemtable(sh.active)
+	}
 	// overwrite half. background busy flushing.
 	produceAndWriteLogs(50000, 0, db)
 	produceAndWriteLogs(50000, 0, db)
@@ -489,7 +492,7 @@ func TestDBCompact(t *testing.T) {
 		require.NoError(t, err)
 
 		sizeCompact := valueLogSize(t, db.options.DirPath)
-		require.LessOrEqual(t, sizeCompact, size)
+		require.Greater(t, size, sizeCompact)
 		var value []byte
 		for _, log := range testlogs {
 			value, err = getValueFromVlog(db, log.key)
@@ -525,6 +528,9 @@ func TestDBCompactWitchDeprecatetable(t *testing.T) {
 	}
 
 	produceAndWriteLogs(100000, 0, db)
+	for _, sh := range db.shards {
+		db.flushMemtable(sh.active)
+	}
 	// overwrite half. background busy flushing.
 	produceAndWriteLogs(50000, 0, db)
 	produceAndWriteLogs(50000, 0, db)
@@ -541,7 +547,7 @@ func TestDBCompactWitchDeprecatetable(t *testing.T) {
 		require.NoError(t, err)
 
 		sizeCompact := valueLogSize(t, db.options.DirPath)
-		require.LessOrEqual(t, sizeCompact, size)
+		require.Greater(t, size, sizeCompact)
 		var value []byte
 		for _, log := range testlogs {
 			value, err = getValueFromVlog(db, log.key)

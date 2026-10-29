@@ -31,6 +31,14 @@ type Batch struct {
 	batchID       *snowflake.Node
 }
 
+var globalBatchIDNode = func() *snowflake.Node {
+	node, err := snowflake.NewNode(1)
+	if err != nil {
+		panic(fmt.Sprintf("snowflake.NewNode(1) failed: %v", err))
+	}
+	return node
+}()
+
 // NewBatch 创建一个新的 Batch 实例。
 func (db *DB) NewBatch(options BatchOptions) *Batch {
 	batch := &Batch{
@@ -41,23 +49,15 @@ func (db *DB) NewBatch(options BatchOptions) *Batch {
 	if !options.ReadOnly {
 		batch.pendingWrites = make(map[string]*LogRecord)
 		batch.pendingTTL = make(map[string]int64)
-		node, err := snowflake.NewNode(1)
-		if err != nil {
-			panic(fmt.Sprintf("snowflake.NewNode(1) failed: %v", err))
-		}
-		batch.batchID = node
+		batch.batchID = globalBatchIDNode
 	}
 	return batch
 }
 
 func makeBatch() interface{} {
-	node, err := snowflake.NewNode(1)
-	if err != nil {
-		panic(fmt.Sprintf("snowflake.NewNode(1) failed: %v", err))
-	}
 	return &Batch{
 		options: DefaultBatchOptions,
-		batchID: node,
+		batchID: globalBatchIDNode,
 	}
 }
 
@@ -260,6 +260,9 @@ func (b *Batch) Get(key []byte) ([]byte, error) {
 		}
 	}
 
+	b.db.vlogGuard.RLock()
+	defer b.db.vlogGuard.RUnlock()
+
 	// 从索引获取
 	position, err := b.db.index.Get(key)
 	if err != nil {
@@ -373,9 +376,8 @@ func (b *Batch) Exist(key []byte) (bool, error) {
 
 // Commit 提交批处理，如果批处理是只读的或为空，它将直接返回。
 //
-// 它将遍历 pendingWrites 并将数据写入数据库，
-// 然后写入一条记录以表示批处理的结束，以保证原子性。
-// 最后，它将写入索引。
+// 它按 shard 分组写入 WAL，追加跨 shard 的 COMMIT 标记，
+// 全部 WAL 成功后再应用到各 shard 的 memtable；索引在 flush 时写入。
 func (b *Batch) Commit() error {
 	if b.db.closed {
 		return ErrDBClosed
@@ -439,6 +441,7 @@ func (b *Batch) Commit() error {
 			}
 		}
 		if !b.options.DisableWal {
+			b.db.addBatchRefs(uint64(batchID), len(shards))
 			if err := b.db.commitLog.append(uint64(batchID), b.options.Sync); err != nil {
 				return err
 			}

@@ -11,4 +11,7 @@ var (
 	ErrDBClosed                 = errors.New("the database is closed")
 	ErrDBDirectoryISEmpty       = errors.New("the database directory path can not be empty")
 	ErrWaitMemtableSpaceTimeOut = errors.New("wait memtable space timeout, try again later")
+	ErrUnsupportedIndex         = errors.New("unsupported index type")
+	ErrCrossShardBatch          = errors.New("batch spans multiple shards")
+	ErrCrossShardScan           = errors.New("cross-shard scan is not supported")
 )

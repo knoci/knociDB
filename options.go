@@ -200,6 +200,13 @@ type ClusterOptions struct {
 	RPCSecret string
 	// RPCTimeout 是内部转发 RPC 的超时时间，默认 5s。
 	RPCTimeout time.Duration
+
+	// ShardCount 是固定预分片的 Raft Group 数量，默认 1。
+	ShardCount int
+	// ShardMapEpoch 是静态 shard map 的版本号，默认 1。
+	ShardMapEpoch uint64
+	// IsLearner 让本节点以 non-voting 成员启动，等待 leader 提升。
+	IsLearner bool
 }
 
 // GetNodeHostOptions 返回Dragonboat节点主机配置
@@ -223,6 +230,7 @@ func (c *ClusterOptions) GetRaftConfig() config.Config {
 		CheckQuorum:             true,
 		SnapshotEntries:         c.SnapshotIntervalSeconds,
 		CompactionOverhead:      5,
+		IsNonVoting:             c.IsLearner,
 		SnapshotCompressionType: config.Snappy,
 		EntryCompressionType:    config.Snappy,
 		DisableAutoCompactions:  false,
@@ -245,6 +253,8 @@ func DefaultClusterOptions(nodeID, clusterID uint64, raftAddress, dataDir string
 		SnapshotIntervalSeconds: 3600, // 默认每小时创建一次快照
 		Sync:                    true,
 		RPCTimeout:              5 * time.Second,
+		ShardCount:              1,
+		ShardMapEpoch:           1,
 	}
 	opt.InitialMembers[nodeID] = raftAddress
 	return opt
@@ -253,6 +263,12 @@ func DefaultClusterOptions(nodeID, clusterID uint64, raftAddress, dataDir string
 func (c *ClusterOptions) applyDefaults() {
 	if c.RPCTimeout <= 0 {
 		c.RPCTimeout = 5 * time.Second
+	}
+	if c.ShardCount <= 0 {
+		c.ShardCount = 1
+	}
+	if c.ShardMapEpoch == 0 {
+		c.ShardMapEpoch = 1
 	}
 }
 
@@ -269,6 +285,18 @@ func ValidateClusterOptions(opt *ClusterOptions) error {
 	}
 	if opt.DataDir == "" {
 		return fmt.Errorf("DataDir can not be nil")
+	}
+	if opt.ShardCount == 0 {
+		opt.ShardCount = 1
+	}
+	if opt.ShardCount < 0 {
+		return fmt.Errorf("ShardCount must not be negative")
+	}
+	if opt.ClusterID+uint64(opt.ShardCount-1) < opt.ClusterID {
+		return fmt.Errorf("ClusterID + ShardCount overflows")
+	}
+	if opt.ShardCount > 1 && opt.ClusterID+uint64(opt.ShardCount) < opt.ClusterID {
+		return fmt.Errorf("metadata group ID overflows")
 	}
 	if !opt.JoinCluster && len(opt.InitialMembers) == 0 {
 		return fmt.Errorf("InitialMembers should have at least one member")

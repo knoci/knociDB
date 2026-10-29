@@ -469,3 +469,39 @@ func TestAsyncSnapshotObjectTierUpload(t *testing.T) {
 		t.Fatal("snapshot was not uploaded")
 	}
 }
+
+func TestObjectTierSnapshotAfterShardedBatch(t *testing.T) {
+	base := t.TempDir()
+	dbDir := filepath.Join(base, "db")
+	require.NoError(t, os.MkdirAll(dbDir, os.ModePerm))
+	fake := newFakeObjectStore()
+	options := DefaultOptions
+	options.DirPath = dbDir
+	options.SnapshotPath = filepath.Join(base, "snapshots")
+	options.ObjectTier = ObjectTierOptions{
+		Enabled:  true,
+		Store:    fake,
+		Prefix:   "sharded",
+		Provider: "s3",
+	}
+	db, err := Open(options)
+	require.NoError(t, err)
+	batch := db.NewBatch(DefaultBatchOptions)
+	for i := 0; i < 50; i++ {
+		key := []byte(fmt.Sprintf("obj-shard-%03d", i))
+		require.NoError(t, batch.Put(key, key))
+	}
+	require.NoError(t, batch.Commit())
+	require.NoError(t, db.ExportSnapshot())
+	require.NoError(t, os.RemoveAll(dbDir))
+
+	restored, err := Open(options)
+	require.NoError(t, err)
+	defer restored.Close()
+	for i := 0; i < 50; i++ {
+		key := []byte(fmt.Sprintf("obj-shard-%03d", i))
+		value, err := restored.Get(key)
+		require.NoError(t, err)
+		require.Equal(t, key, value)
+	}
+}

@@ -1,12 +1,15 @@
 package knocidb
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
 	"testing"
 	"time"
+
+	smachine "github.com/lni/dragonboat/v4/statemachine"
 )
 
 func TestDefaultPartitionCount(t *testing.T) {
@@ -265,5 +268,243 @@ func TestLegacyWALCommitLogMigration(t *testing.T) {
 		if _, err := db.Get(key); err != nil {
 			t.Fatalf("seeded get %s: %v", key, err)
 		}
+	}
+}
+
+func TestIteratorSnapshotDoesNotBlockWrites(t *testing.T) {
+	options := DefaultOptions
+	options.DirPath = t.TempDir()
+	options.SnapshotPath = t.TempDir()
+	db, err := Open(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := db.Put([]byte("snapshot-key"), []byte("v1")); err != nil {
+		t.Fatal(err)
+	}
+	it, err := db.NewIterator(IteratorOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer it.Close()
+
+	done := make(chan error, 1)
+	go func() { done <- db.Put([]byte("snapshot-key"), []byte("v2")) }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("an open iterator must not block writes")
+	}
+
+	var got string
+	for it.Rewind(); it.Valid(); it.Next() {
+		if string(it.Key()) == "snapshot-key" {
+			got = string(it.Value())
+		}
+	}
+	if got != "v1" {
+		t.Fatalf("iterator saw %q, want snapshot value v1", got)
+	}
+	value, err := db.Get([]byte("snapshot-key"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(value) != "v2" {
+		t.Fatalf("committed write not visible: %q", value)
+	}
+}
+
+func TestCommitLogRewrite(t *testing.T) {
+	dir := t.TempDir()
+	options := DefaultOptions
+	options.DirPath = dir
+	options.SnapshotPath = t.TempDir()
+	db, err := Open(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 100; i++ {
+		key := []byte(fmt.Sprintf("rewrite-%03d", i))
+		if err := db.Put(key, key); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ids := db.batchRefSnapshot()
+	if err := db.commitLog.rewrite(ids); err != nil {
+		t.Fatal(err)
+	}
+	if got := db.commitLog.recordCount(); got != len(ids) {
+		t.Fatalf("commit records = %d, want %d", got, len(ids))
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err = Open(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	for i := 0; i < 100; i++ {
+		key := []byte(fmt.Sprintf("rewrite-%03d", i))
+		if _, err := db.Get(key); err != nil {
+			t.Fatalf("get %s: %v", key, err)
+		}
+	}
+}
+
+func TestCommitLogPruning(t *testing.T) {
+	dir := t.TempDir()
+	options := DefaultOptions
+	options.DirPath = dir
+	options.SnapshotPath = t.TempDir()
+	db, err := Open(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const count = commitLogPruneThreshold + 100
+	for i := 0; i < count; i++ {
+		key := []byte(fmt.Sprintf("prune-%05d", i))
+		if err := db.Put(key, key); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, sh := range db.shards {
+		db.flushMemtable(sh.active)
+	}
+	db.maybePruneCommitLog()
+	if got := db.commitLog.recordCount(); got != 0 {
+		t.Fatalf("commit log still has %d records after all WALs flushed", got)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err = Open(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	for i := 0; i < count; i++ {
+		key := []byte(fmt.Sprintf("prune-%05d", i))
+		if _, err := db.Get(key); err != nil {
+			t.Fatalf("get %s: %v", key, err)
+		}
+	}
+}
+
+func TestClusterBatchAcrossShards(t *testing.T) {
+	dir := t.TempDir()
+	options := DefaultOptions
+	options.DirPath = dir
+	options.SnapshotPath = t.TempDir()
+	db, err := Open(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	sm := NewKVStateMachine(1, 1, db)
+	cmds := make([]Command, 0, 100)
+	for i := 0; i < 100; i++ {
+		cmds = append(cmds, Command{Op: OpPut, Key: []byte(fmt.Sprintf("raft-%03d", i)), Value: []byte("v")})
+	}
+	payload, err := json.Marshal(BatchCommand{Op: OpBatch, Commands: cmds})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sm.Update(smachine.Entry{Index: 1, Cmd: payload}); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 100; i++ {
+		key := []byte(fmt.Sprintf("raft-%03d", i))
+		if _, err := db.Get(key); err != nil {
+			t.Fatalf("get %s: %v", key, err)
+		}
+	}
+}
+
+func TestIteratorBlocksCompactionNotWrites(t *testing.T) {
+	options := DefaultOptions
+	options.DirPath = t.TempDir()
+	options.SnapshotPath = t.TempDir()
+	db, err := Open(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	for i := 0; i < 50; i++ {
+		key := []byte(fmt.Sprintf("compact-iterator-%03d", i))
+		if err := db.Put(key, key); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Make sure the values are in the value log before compaction.
+	for _, sh := range db.shards {
+		db.flushMemtable(sh.active)
+	}
+	it, err := db.NewIterator(IteratorOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- db.Compact() }()
+	select {
+	case err := <-done:
+		t.Fatalf("compaction must wait for the iterator, got %v", err)
+	case <-time.After(200 * time.Millisecond):
+	}
+	// Writes are not blocked by the iterator or the pending compaction.
+	if err := db.Put([]byte("after-iterator"), []byte("ok")); err != nil {
+		t.Fatal(err)
+	}
+	if err := it.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("compaction did not finish after iterator close")
+	}
+	for i := 0; i < 50; i++ {
+		key := []byte(fmt.Sprintf("compact-iterator-%03d", i))
+		value, err := db.Get(key)
+		if err != nil {
+			t.Fatalf("get %s: %v", key, err)
+		}
+		if string(value) != string(key) {
+			t.Fatalf("value mismatch for %s", key)
+		}
+	}
+}
+
+func TestBatchIDsAreUnique(t *testing.T) {
+	options := DefaultOptions
+	options.DirPath = t.TempDir()
+	options.SnapshotPath = t.TempDir()
+	db, err := Open(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	const count = 1000
+	for i := 0; i < count; i++ {
+		key := []byte(fmt.Sprintf("unique-batch-%04d", i))
+		if err := db.Put(key, key); err != nil {
+			t.Fatal(err)
+		}
+	}
+	seen := make(map[uint64]struct{})
+	for _, sh := range db.shards {
+		for id := range sh.active.batchIDs {
+			seen[id] = struct{}{}
+		}
+	}
+	if len(seen) != count {
+		t.Fatalf("got %d unique batch IDs, want %d", len(seen), count)
 	}
 }

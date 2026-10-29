@@ -30,11 +30,12 @@ type (
 	//		- 索引（B+树）：存储键和位置信息
 	//		- 值日志（vlog）：存储实际的值数据
 	memtable struct {
-		mu      sync.RWMutex
-		wal     *wal.WAL           // 预写日志
-		skl     *arenaskl.Skiplist // 跳表
-		options memtableOptions
-		shardID uint32
+		mu       sync.RWMutex
+		wal      *wal.WAL           // 预写日志
+		skl      *arenaskl.Skiplist // 跳表
+		options  memtableOptions
+		shardID  uint32
+		batchIDs map[uint64]struct{}
 	}
 
 	// memtableOptions 表示内存表的配置选项
@@ -112,9 +113,10 @@ func openMemtable(options memtableOptions) (*memtable, error) {
 func openMemtableWithCommitted(options memtableOptions, committed map[uint64]struct{}, applyAll bool, seen map[uint64]struct{}) (*memtable, error) {
 	skl := arenaskl.NewSkiplist(int64(float64(options.memSize) * 1.5))
 	table := &memtable{
-		options: options,
-		skl:     skl,
-		shardID: options.shardID,
+		options:  options,
+		skl:      skl,
+		shardID:  options.shardID,
+		batchIDs: make(map[uint64]struct{}),
 	}
 
 	walFile, err := wal.Open(wal.Options{
@@ -148,6 +150,7 @@ func openMemtableWithCommitted(options memtableOptions, committed map[uint64]str
 			if errParseBytes != nil {
 				return nil, errParseBytes
 			}
+			table.batchIDs[uint64(batchID)] = struct{}{}
 			_, committedBatch := committed[uint64(batchID)]
 			if seen != nil {
 				seen[uint64(batchID)] = struct{}{}
@@ -176,6 +179,7 @@ func (mt *memtable) prepareBatch(pendingWrites map[string]*LogRecord, batchID sn
 	if options.DisableWal {
 		return nil
 	}
+	mt.batchIDs[uint64(batchID)] = struct{}{}
 	for _, record := range pendingWrites {
 		record.BatchID = uint64(batchID)
 		mt.wal.PendingWrites(encodeLogRecord(record))

@@ -531,14 +531,16 @@ func TestClusterRPCCodec(t *testing.T) {
 
 func TestClusterDBErrorPaths(t *testing.T) {
 	empty := &ClusterDB{}
-	require.ErrorIs(t, empty.putLocal([]byte("k"), []byte("v")), ErrNodeNotStarted)
-	require.ErrorIs(t, empty.deleteLocal([]byte("k")), ErrNodeNotStarted)
-	_, err := empty.getLocal([]byte("k"))
+	require.ErrorIs(t, empty.putLocal([]byte("k"), []byte("v"), 0), ErrNodeNotStarted)
+	require.ErrorIs(t, empty.deleteLocal([]byte("k"), 0), ErrNodeNotStarted)
+	_, err := empty.getLocal([]byte("k"), 0)
 	require.ErrorIs(t, err, ErrNodeNotStarted)
 	require.ErrorIs(t, empty.BatchWrite(nil, 1), ErrNodeNotStarted)
 	_, err = empty.GetClusterMembership()
 	require.ErrorIs(t, err, ErrNodeNotStarted)
 	require.ErrorIs(t, empty.AddNode(2, "localhost:1"), ErrNodeNotStarted)
+	require.ErrorIs(t, empty.AddLearner(2, "localhost:1"), ErrNodeNotStarted)
+	require.ErrorIs(t, empty.PromoteLearner(2, "localhost:1"), ErrNodeNotStarted)
 	require.ErrorIs(t, empty.RemoveNode(2), ErrNodeNotStarted)
 	_, err = empty.GetLeaderID()
 	require.ErrorIs(t, err, ErrNodeNotStarted)

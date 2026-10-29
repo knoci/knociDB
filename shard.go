@@ -11,6 +11,8 @@ type shard struct {
 	immu   []*memtable
 }
 
+// memTables 返回 newest-first 的内存表顺序，供点读使用。
+// Iterator 使用 immu 的 oldest-first 顺序，保证同 key 的版本号更大者更新。
 func (s *shard) memTables() []*memtable {
 	tables := make([]*memtable, 0, len(s.immu)+1)
 	tables = append(tables, s.active)

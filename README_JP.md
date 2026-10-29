@@ -12,11 +12,9 @@
 ## 機能
 - ⚡ **高性能** キーバリューストレージ
 - 🔄 ACD保証付きの**バッチ操作**
-- 🌲 **B+Treeインデックス**のサポート（旧diskhashインデックスは削除）
-- ⚙️ **シャードmemtable**とパーティション単位の書き込みロック（デフォルト5）
-- 🌐 **ClusterDB** 単一Raftグループ、Leader-aware転送、任意のRPC認証
-- 💾 **S3オブジェクトストレージ**の読み取りとwalのロード
-- 📸 **非同期スナップショット** B+Tree専用のバックグラウンドスナップショット、アトミックアーカイブ、manifest
+- 🌲 **B+Treeインデックス**のサポート
+- 🌐 **シャードClusterDB** 複数Raftグループ、ハッシュルーティング、Leader-aware転送
+- 💾 **オブジェクト層** スナップショット + VLOGコールドセグメント（S3/R2/COS/OSS）
 - 📋 **アトミックDB manifest** ファイル一覧とgeneration管理
 - 🔌 **gRPC対応** クライアントストリームBatch、サーバーストリームScan、認証/TLSオプション
 - 🧩 **Redis互換サブセット** string/hash/list/set/zset、TTL、SCAN、Pub/Sub、クラスタプロトコル
@@ -85,6 +83,8 @@ func main() {
 $ cd examples/cluster
 $ go build -o cluster-example main.go
 ```
+
+`OpenCluster` の前に `config.ShardCount` を設定すると、複数の固定 Raft グループを作成できます。
 🔆 knociDBのより多くの機能を体験したい場合は、examples/cmd_clientにコマンドラインクライアントの実装があります。ファイル内のREADMEドキュメントで具体的な使用方法を確認できます。
 ```bash
 $ cd examples/cmd_client

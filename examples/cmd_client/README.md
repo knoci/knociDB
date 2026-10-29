@@ -29,7 +29,7 @@ go build -o knocidb-cli
 ./knocidb-cli --dir /path/to/data
 
 # Specify number of partitions
-./knocidb-cli --partitions 3
+./knocidb-cli --partitions 5
 ```
 
 #### Distributed Mode
@@ -98,7 +98,7 @@ mode standalone
 
 # Data
 db_path ./data
-partitions 3
+partitions 5
 knocidb> EXIT
 see you next time~
 ```

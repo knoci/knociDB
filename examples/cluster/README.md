@@ -1,6 +1,6 @@
 # KnociDB Cluster Example
 
-This example demonstrates KnociDB's L1 transparent cluster: a single Raft group with leader-aware write forwarding. With the internal RPC addresses configured, `put/get/delete` can be sent to any node.
+This example demonstrates KnociDB's sharded transparent cluster: one Raft group per fixed shard, with hash routing and leader-aware write forwarding. With the internal RPC addresses configured, `put/get/delete` can be sent to any node.
 
 ## Usage
 
@@ -15,7 +15,7 @@ go build -o cluster-example main.go
 #### Start the First Node (Bootstrap)
 
 ```bash
-./cluster-example --id=1 --addr=localhost:8001 --rpc=localhost:9001 \
+./cluster-example --id=1 --addr=localhost:8001 --rpc=localhost:9001 --shards=3 \
   --dir=./node --peers=1=localhost:8001,2=localhost:8002,3=localhost:8003 \
   --rpc-peers=1=localhost:9001,2=localhost:9002,3=localhost:9003
 ```
@@ -23,11 +23,11 @@ go build -o cluster-example main.go
 #### Start the Second and Third Nodes
 
 ```bash
-./cluster-example --id=2 --addr=localhost:8002 --rpc=localhost:9002 \
+./cluster-example --id=2 --addr=localhost:8002 --rpc=localhost:9002 --shards=3 \
   --dir=./node --peers=1=localhost:8001,2=localhost:8002,3=localhost:8003 \
   --rpc-peers=1=localhost:9001,2=localhost:9002,3=localhost:9003 --join
 
-./cluster-example --id=3 --addr=localhost:8003 --rpc=localhost:9003 \
+./cluster-example --id=3 --addr=localhost:8003 --rpc=localhost:9003 --shards=3 \
   --dir=./node --peers=1=localhost:8001,2=localhost:8002,3=localhost:8003 \
   --rpc-peers=1=localhost:9001,2=localhost:9002,3=localhost:9003 --join
 ```
@@ -45,6 +45,7 @@ On Windows, use `.\cluster-example` instead of `./cluster-example`.
 - `--join`: Whether to join an existing cluster as a new node
 - `--peers`: List of cluster members (format: id1=host1:port1,id2=host2:port2,...)
 - `--rpc-peers`: NodeID -> forwarding RPC address (required for follower forwarding)
+- `--shards`: Number of fixed Raft shards (default is 1; all nodes must match)
 - `--sync`: Whether to use synchronous mode (default is true)
 - `--interactive`: Whether to enable interactive mode (default is true)
 

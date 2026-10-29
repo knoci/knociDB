@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -32,14 +34,18 @@ var (
 
 // ClusterDB 管理单 Raft Group 集群节点和共识操作。
 type ClusterDB struct {
-	nodeHost     *dragonboat.NodeHost
-	config       ClusterOptions
-	dbOptions    Options
-	mu           sync.RWMutex
-	leaderID     uint64
-	stateMachine *KVStateMachine
-	state        bool
-	Sync         bool // 是否使用同步模式进行操作
+	nodeHost        *dragonboat.NodeHost
+	config          ClusterOptions
+	dbOptions       Options
+	mu              sync.RWMutex
+	leaderID        uint64
+	stateMachine    *KVStateMachine
+	shards          []*clusterShard
+	leaderIDs       []uint64
+	metadataGroupID uint64
+	metadataSM      *ShardMapStateMachine
+	state           bool
+	Sync            bool // 是否使用同步模式进行操作
 
 	rpcListener net.Listener
 	rpcWG       sync.WaitGroup
@@ -91,46 +97,88 @@ func OpenCluster(config ClusterOptions, dboption Options) (*ClusterDB, error) {
 func (rdb *ClusterDB) start() error {
 	rdb.mu.Lock()
 	defer rdb.mu.Unlock()
-	// 创建状态机工厂函数
-	db, err := Open(rdb.dbOptions)
-	if err != nil {
-		return fmt.Errorf("open database failed: %w", err)
-	}
-	factory := func(clusterID uint64, nodeID uint64) statemachine.IStateMachine {
-		sm := NewKVStateMachine(clusterID, nodeID, db)
-		rdb.stateMachine = sm
-		return sm
-	}
 
-	// 获取Raft配置
-	rc := rdb.config.GetRaftConfig()
+	shardCount := rdb.config.ShardCount
+	if shardCount <= 0 {
+		shardCount = 1
+	}
+	rdb.leaderIDs = make([]uint64, shardCount)
+	rdb.shards = make([]*clusterShard, 0, shardCount)
 
-	// 检查是否需要加入现有集群
-	if rdb.config.JoinCluster {
-		// 加入现有集群
-		log.Printf("joining raft group, NodeID: %d, ClusterID: %d\n", rdb.config.NodeID, rdb.config.ClusterID)
-		if err := rdb.nodeHost.StartReplica(
-			rdb.config.InitialMembers,
-			true,
-			factory,
-			rc,
-		); err != nil {
-			return fmt.Errorf("join goup failed: %w", err)
+	closeShardDBs := func() {
+		for _, sh := range rdb.shards {
+			if sh.db != nil {
+				_ = sh.db.Close()
+			}
 		}
-	} else {
-		// 启动新集群
-		log.Printf("create new raft group, NodeID: %d, ClusterID: %d\n", rdb.config.NodeID, rdb.config.ClusterID)
-		if err := rdb.nodeHost.StartReplica(
-			rdb.config.InitialMembers,
-			false,
-			factory,
-			rc,
-		); err != nil {
-			return fmt.Errorf("create new raft group failed: %w", err)
+		rdb.shards = nil
+	}
+
+	for i := 0; i < shardCount; i++ {
+		dbOptions := rdb.dbOptions
+		if shardCount > 1 {
+			dbOptions.DirPath = filepath.Join(rdb.dbOptions.DirPath, fmt.Sprintf("shard-%d", i))
+			if rdb.dbOptions.SnapshotPath != "" {
+				dbOptions.SnapshotPath = filepath.Join(rdb.dbOptions.SnapshotPath, fmt.Sprintf("shard-%d", i))
+			}
+			if dbOptions.ObjectTier.Enabled {
+				prefix := strings.TrimRight(dbOptions.ObjectTier.Prefix, "/")
+				if prefix != "" {
+					prefix += "/"
+				}
+				dbOptions.ObjectTier.Prefix = prefix + fmt.Sprintf("shard-%d", i)
+			}
+		}
+		db, err := Open(dbOptions)
+		if err != nil {
+			closeShardDBs()
+			return fmt.Errorf("open database for shard %d failed: %w", i, err)
+		}
+		groupID := rdb.config.GroupIDForShard(uint32(i))
+		shard := &clusterShard{
+			id:      uint32(i),
+			groupID: groupID,
+			db:      db,
+		}
+		shard.sm = NewKVStateMachine(groupID, rdb.config.NodeID, db)
+		rdb.shards = append(rdb.shards, shard)
+		if i == 0 {
+			rdb.stateMachine = shard.sm
+		}
+
+		rc := rdb.config.GetRaftConfig()
+		rc.ShardID = groupID
+		factory := func(clusterID uint64, nodeID uint64) statemachine.IStateMachine {
+			return shard.sm
+		}
+		join := rdb.config.JoinCluster
+		initialMembers := rdb.config.InitialMembers
+		if join {
+			initialMembers = nil
+		}
+		if err := rdb.nodeHost.StartReplica(initialMembers, join, factory, rc); err != nil {
+			closeShardDBs()
+			return fmt.Errorf("start raft group %d (shard %d) failed: %w", groupID, i, err)
 		}
 	}
 
-	// 启动Leader检测
+	if metadataID := rdb.config.MetadataGroupID(); metadataID != 0 {
+		sm := NewShardMapStateMachine(rdb.config.ShardMapEpoch, shardCount)
+		rc := rdb.config.GetRaftConfig()
+		rc.ShardID = metadataID
+		factory := func(clusterID uint64, nodeID uint64) statemachine.IStateMachine { return sm }
+		initialMembers := rdb.config.InitialMembers
+		if rdb.config.JoinCluster {
+			initialMembers = nil
+		}
+		if err := rdb.nodeHost.StartReplica(initialMembers, rdb.config.JoinCluster, factory, rc); err != nil {
+			closeShardDBs()
+			return fmt.Errorf("start metadata group %d failed: %w", metadataID, err)
+		}
+		rdb.metadataGroupID = metadataID
+		rdb.metadataSM = sm
+	}
+
 	go rdb.leaderMonitor()
 	rdb.state = true
 	return nil
@@ -163,7 +211,7 @@ func (rdb *ClusterDB) stop() error {
 	return nil
 }
 
-// leaderMonitor 监控Leader变化
+// leaderMonitor 监控各 shard 的 Leader 变化。
 func (rdb *ClusterDB) leaderMonitor() {
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
@@ -173,25 +221,39 @@ func (rdb *ClusterDB) leaderMonitor() {
 		case <-ticker.C:
 			rdb.mu.RLock()
 			nodeHost := rdb.nodeHost
+			shards := append([]*clusterShard(nil), rdb.shards...)
 			rdb.mu.RUnlock()
 			if nodeHost == nil {
 				return
 			}
 
-			// 获取Leader信息
-			leaderID, _, valid, err := nodeHost.GetLeaderID(rdb.config.ClusterID)
-			if err != nil || !valid {
-				continue
+			changed := false
+			leaders := make([]uint64, len(shards))
+			for i, sh := range shards {
+				leaderID, _, valid, err := nodeHost.GetLeaderID(sh.groupID)
+				if err != nil || !valid {
+					continue
+				}
+				leaders[i] = leaderID
+				if sh.id == 0 {
+					rdb.mu.Lock()
+					oldLeaderID := rdb.leaderID
+					rdb.leaderID = leaderID
+					rdb.mu.Unlock()
+					if oldLeaderID != leaderID {
+						changed = true
+					}
+				}
 			}
 
 			rdb.mu.Lock()
-			oldLeaderID := rdb.leaderID
-			rdb.leaderID = leaderID
+			if len(rdb.leaderIDs) == len(leaders) {
+				copy(rdb.leaderIDs, leaders)
+			}
 			rdb.mu.Unlock()
 
-			// 如果Leader发生变化，记录日志
-			if oldLeaderID != leaderID {
-				log.Printf("Leader changed: %d -> %d\n", oldLeaderID, leaderID)
+			if changed {
+				log.Printf("Leader changed on shard 0")
 			}
 		}
 	}
@@ -229,31 +291,17 @@ func (rdb *ClusterDB) IsLeader() bool {
 	return rdb.state && rdb.nodeHost != nil && rdb.leaderID != 0 && rdb.leaderID == rdb.config.NodeID
 }
 
-// GetLeaderID 获取当前Leader的NodeID
+// GetLeaderID 获取 shard 0 的 Leader NodeID。
 func (rdb *ClusterDB) GetLeaderID() (uint64, error) {
-	rdb.mu.RLock()
-	defer rdb.mu.RUnlock()
-
-	if rdb.nodeHost == nil || !rdb.state {
-		return 0, ErrNodeNotStarted
-	}
-
-	leaderID, _, valid, err := rdb.nodeHost.GetLeaderID(rdb.config.ClusterID)
-	if err != nil {
-		return 0, err
-	}
-	if !valid {
-		return 0, ErrNotLeader
-	}
-
-	return leaderID, nil
+	return rdb.leaderForShard(0)
 }
 
 // putLocal 在当前节点通过 Raft 共识写入键值对。
-func (rdb *ClusterDB) putLocal(key, value []byte) error {
+func (rdb *ClusterDB) putLocal(key, value []byte, shard uint32) error {
 	if rdb.nodeHost == nil || !rdb.state {
 		return ErrNodeNotStarted
 	}
+	groupID := rdb.config.GroupIDForShard(shard)
 	// 创建命令
 	cmd := Command{
 		Op:    OpPut,
@@ -272,11 +320,11 @@ func (rdb *ClusterDB) putLocal(key, value []byte) error {
 		// 使用同步Propose方法
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		_, err := rdb.nodeHost.SyncPropose(ctx, rdb.nodeHost.GetNoOPSession(rdb.config.ClusterID), data)
+		_, err := rdb.nodeHost.SyncPropose(ctx, rdb.nodeHost.GetNoOPSession(groupID), data)
 		return err
 	} else {
 		// 使用异步Propose方法
-		rs, err := rdb.nodeHost.Propose(rdb.nodeHost.GetNoOPSession(rdb.config.ClusterID), data, 5*time.Second)
+		rs, err := rdb.nodeHost.Propose(rdb.nodeHost.GetNoOPSession(groupID), data, 5*time.Second)
 		if err != nil {
 			return err
 		}
@@ -301,10 +349,11 @@ func (rdb *ClusterDB) putLocal(key, value []byte) error {
 }
 
 // deleteLocal 在当前节点通过 Raft 共识删除键。
-func (rdb *ClusterDB) deleteLocal(key []byte) error {
+func (rdb *ClusterDB) deleteLocal(key []byte, shard uint32) error {
 	if rdb.nodeHost == nil || !rdb.state {
 		return ErrNodeNotStarted
 	}
+	groupID := rdb.config.GroupIDForShard(shard)
 	// 创建命令
 	cmd := Command{
 		Op:  OpDelete,
@@ -322,11 +371,11 @@ func (rdb *ClusterDB) deleteLocal(key []byte) error {
 		// 使用同步Propose方法
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		_, err := rdb.nodeHost.SyncPropose(ctx, rdb.nodeHost.GetNoOPSession(rdb.config.ClusterID), data)
+		_, err := rdb.nodeHost.SyncPropose(ctx, rdb.nodeHost.GetNoOPSession(groupID), data)
 		return err
 	} else {
 		// 使用异步Propose方法
-		rs, err := rdb.nodeHost.Propose(rdb.nodeHost.GetNoOPSession(rdb.config.ClusterID), data, 5*time.Second)
+		rs, err := rdb.nodeHost.Propose(rdb.nodeHost.GetNoOPSession(groupID), data, 5*time.Second)
 		if err != nil {
 			return err
 		}
@@ -351,10 +400,11 @@ func (rdb *ClusterDB) deleteLocal(key []byte) error {
 }
 
 // getLocal 在当前节点通过 Raft ReadIndex 读取键值。
-func (rdb *ClusterDB) getLocal(key []byte) ([]byte, error) {
+func (rdb *ClusterDB) getLocal(key []byte, shard uint32) ([]byte, error) {
 	if rdb.nodeHost == nil || !rdb.state {
 		return nil, ErrNodeNotStarted
 	}
+	groupID := rdb.config.GroupIDForShard(shard)
 	// 创建查询命令
 	cmd := Command{
 		Key: key,
@@ -371,7 +421,7 @@ func (rdb *ClusterDB) getLocal(key []byte) ([]byte, error) {
 		// 使用同步ReadIndex方法
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		result, err := rdb.nodeHost.SyncRead(ctx, rdb.config.ClusterID, data)
+		result, err := rdb.nodeHost.SyncRead(ctx, groupID, data)
 		if err != nil {
 			return nil, err
 		}
@@ -385,7 +435,7 @@ func (rdb *ClusterDB) getLocal(key []byte) ([]byte, error) {
 		return value, nil
 	} else {
 		// 使用异步ReadIndex方法
-		rs, err := rdb.nodeHost.ReadIndex(rdb.config.ClusterID, 5*time.Second)
+		rs, err := rdb.nodeHost.ReadIndex(groupID, 5*time.Second)
 		if err != nil {
 			return nil, err
 		}
@@ -418,55 +468,78 @@ func (rdb *ClusterDB) getLocal(key []byte) ([]byte, error) {
 	}
 }
 
-// BatchWrite 通过Raft共识批量写入
+// BatchWrite 通过 Raft 共识批量写入。所有命令必须落在同一个 shard。
 func (rdb *ClusterDB) BatchWrite(commands []Command, batchID uint64) error {
 	if rdb.nodeHost == nil || !rdb.state {
 		return ErrNodeNotStarted
 	}
-	// 创建批处理命令
-	batchCmd := BatchCommand{
-		Op:       OpBatch,
-		Commands: commands,
-		BatchID:  batchID,
+	if len(commands) == 0 {
+		return nil
 	}
-
-	// 序列化命令
+	shard := rdb.shardFor(commands[0].Key)
+	for _, cmd := range commands[1:] {
+		if rdb.shardFor(cmd.Key) != shard {
+			return ErrCrossShardBatch
+		}
+	}
+	batchCmd := BatchCommand{Op: OpBatch, Commands: commands, BatchID: batchID}
 	data, err := json.Marshal(batchCmd)
 	if err != nil {
 		return err
 	}
-
-	// 根据Sync字段决定使用同步还是异步模式
-	if rdb.Sync {
-		// 使用同步Propose方法
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		_, err := rdb.nodeHost.SyncPropose(ctx, rdb.nodeHost.GetNoOPSession(rdb.config.ClusterID), data)
-		return err
-	} else {
-		// 使用异步Propose方法
-		rs, err := rdb.nodeHost.Propose(rdb.nodeHost.GetNoOPSession(rdb.config.ClusterID), data, 10*time.Second)
-		if err != nil {
+	var lastErr error
+	for attempt := 0; attempt < 5; attempt++ {
+		if _, addr, ok := rdb.forwardTarget(shard); ok {
+			err := rdb.forwardRequest(addr, rpcOpBatch, nil, data)
+			if !errors.Is(err, ErrNotLeader) {
+				return err
+			}
+			lastErr = err
+			time.Sleep(100 * time.Millisecond)
+			continue
+		}
+		err := rdb.batchWriteLocal(batchCmd, shard)
+		if !errors.Is(err, ErrNotLeader) {
 			return err
 		}
-
-		// 等待操作完成
-		res := <-rs.ResultC()
-		if res.Completed() {
-			rs.Release()
-			return nil
-		}
-
-		// 处理错误
-		if res.Timeout() {
-			return ErrTimeout
-		}
-		if res.Terminated() {
-			return ErrCanceled
-		}
-		rs.Release()
-		return errors.New("batch write failed")
+		lastErr = err
+		time.Sleep(100 * time.Millisecond)
 	}
+	return lastErr
+}
+
+func (rdb *ClusterDB) batchWriteLocal(batchCmd BatchCommand, shard uint32) error {
+	if rdb.nodeHost == nil || !rdb.state {
+		return ErrNodeNotStarted
+	}
+	groupID := rdb.config.GroupIDForShard(shard)
+	data, err := json.Marshal(batchCmd)
+	if err != nil {
+		return err
+	}
+	if rdb.Sync {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_, err := rdb.nodeHost.SyncPropose(ctx, rdb.nodeHost.GetNoOPSession(groupID), data)
+		return err
+	}
+	rs, err := rdb.nodeHost.Propose(rdb.nodeHost.GetNoOPSession(groupID), data, 10*time.Second)
+	if err != nil {
+		return err
+	}
+	res := <-rs.ResultC()
+	if res.Completed() {
+		rs.Release()
+		return nil
+	}
+	if res.Timeout() {
+		return ErrTimeout
+	}
+	if res.Terminated() {
+		return ErrCanceled
+	}
+	rs.Release()
+	return errors.New("batch write failed")
 }
 
 // GetClusterMembership 获取集群成员信息
@@ -522,98 +595,78 @@ func (rdb *ClusterDB) GetClusterMembership() (map[uint64]string, error) {
 	}
 }
 
-// AddNode 向集群添加新节点
-func (rdb *ClusterDB) AddNode(nodeID uint64, address string) error {
-	// 先在不持有写锁的情况下判断状态和 Leader，避免 Lock 后调用 IsLeader 造成重入死锁
-	rdb.mu.RLock()
-	started := rdb.nodeHost != nil && rdb.state
-	leader := rdb.leaderID == rdb.config.NodeID
-	rdb.mu.RUnlock()
-	if !started {
-		return ErrNodeNotStarted
-	}
-	if !leader {
-		return ErrNotLeader
-	}
-
-	rdb.mu.Lock()
-	defer rdb.mu.Unlock()
+func (rdb *ClusterDB) requireLeaderAll() error {
 	if rdb.nodeHost == nil || !rdb.state {
 		return ErrNodeNotStarted
 	}
-
-	// 根据Sync字段决定使用同步还是异步模式
-	if rdb.Sync {
-		// 使用同步方法添加节点
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		return rdb.nodeHost.SyncRequestAddReplica(ctx, rdb.config.ClusterID, nodeID, address, 0)
-	} else {
-		// 使用异步方法添加节点
-		rs, err := rdb.nodeHost.RequestAddReplica(rdb.config.ClusterID, nodeID, address, 0, 30*time.Second)
+	for i := 0; i < rdb.config.ShardCount; i++ {
+		leader, err := rdb.leaderForShard(uint32(i))
 		if err != nil {
 			return err
 		}
-
-		// 等待操作完成
-		res := <-rs.ResultC()
-		if res.Completed() {
-			rs.Release()
-			return nil
+		if leader != rdb.config.NodeID {
+			return ErrNotLeader
 		}
-
-		// 处理错误
-		if res.Timeout() {
-			return ErrTimeout
-		}
-		if res.Terminated() {
-			return ErrCanceled
-		}
-		rs.Release()
-		return errors.New("add node failed")
 	}
+	if mid := rdb.config.MetadataGroupID(); mid != 0 {
+		leader, _, valid, err := rdb.nodeHost.GetLeaderID(mid)
+		if err != nil {
+			return err
+		}
+		if !valid || leader != rdb.config.NodeID {
+			return ErrNotLeader
+		}
+	}
+	return nil
 }
 
-// RemoveNode 从集群移除节点
-func (rdb *ClusterDB) RemoveNode(nodeID uint64) error {
-	rdb.mu.RLock()
-	started := rdb.nodeHost != nil && rdb.state
-	leader := rdb.leaderID == rdb.config.NodeID
-	rdb.mu.RUnlock()
-	if !started {
-		return ErrNodeNotStarted
+func (rdb *ClusterDB) changeMembership(add bool, nonVoting bool, nodeID uint64, address string) error {
+	if err := rdb.requireLeaderAll(); err != nil {
+		return err
 	}
-	if !leader {
-		return ErrNotLeader
-	}
-
 	rdb.mu.Lock()
 	defer rdb.mu.Unlock()
 	if rdb.nodeHost == nil || !rdb.state {
 		return ErrNodeNotStarted
 	}
-
-	// 根据Sync字段决定使用同步还是异步模式
-	if rdb.Sync {
-		// 使用同步方法移除节点
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		return rdb.nodeHost.SyncRequestDeleteReplica(ctx, rdb.config.ClusterID, nodeID, 0)
-	} else {
-		// 使用异步方法移除节点
-		rs, err := rdb.nodeHost.RequestDeleteReplica(rdb.config.ClusterID, nodeID, 0, 30*time.Second)
+	for _, groupID := range rdb.groupIDs() {
+		if rdb.Sync {
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			var err error
+			switch {
+			case add && nonVoting:
+				err = rdb.nodeHost.SyncRequestAddNonVoting(ctx, groupID, nodeID, address, 0)
+			case add:
+				err = rdb.nodeHost.SyncRequestAddReplica(ctx, groupID, nodeID, address, 0)
+			default:
+				err = rdb.nodeHost.SyncRequestDeleteReplica(ctx, groupID, nodeID, 0)
+			}
+			cancel()
+			if err != nil {
+				return err
+			}
+			continue
+		}
+		var (
+			rs  *dragonboat.RequestState
+			err error
+		)
+		switch {
+		case add && nonVoting:
+			rs, err = rdb.nodeHost.RequestAddNonVoting(groupID, nodeID, address, 0, 30*time.Second)
+		case add:
+			rs, err = rdb.nodeHost.RequestAddReplica(groupID, nodeID, address, 0, 30*time.Second)
+		default:
+			rs, err = rdb.nodeHost.RequestDeleteReplica(groupID, nodeID, 0, 30*time.Second)
+		}
 		if err != nil {
 			return err
 		}
-
-		// 等待操作完成
 		res := <-rs.ResultC()
 		if res.Completed() {
 			rs.Release()
-			return nil
+			continue
 		}
-
-		// 处理错误
 		if res.Timeout() {
 			return ErrTimeout
 		}
@@ -621,6 +674,27 @@ func (rdb *ClusterDB) RemoveNode(nodeID uint64) error {
 			return ErrCanceled
 		}
 		rs.Release()
-		return errors.New("remove node failed")
+		return errors.New("membership change failed")
 	}
+	return nil
+}
+
+// AddNode adds (or promotes) a voting replica in every fixed group.
+func (rdb *ClusterDB) AddNode(nodeID uint64, address string) error {
+	return rdb.changeMembership(true, false, nodeID, address)
+}
+
+// AddLearner adds a non-voting replica in every fixed group.
+func (rdb *ClusterDB) AddLearner(nodeID uint64, address string) error {
+	return rdb.changeMembership(true, true, nodeID, address)
+}
+
+// PromoteLearner promotes an existing non-voting replica to voting.
+func (rdb *ClusterDB) PromoteLearner(nodeID uint64, address string) error {
+	return rdb.AddNode(nodeID, address)
+}
+
+// RemoveNode removes a replica from every fixed group.
+func (rdb *ClusterDB) RemoveNode(nodeID uint64) error {
+	return rdb.changeMembership(false, false, nodeID, "")
 }

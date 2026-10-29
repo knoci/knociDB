@@ -87,7 +87,6 @@ type Iterator struct {
 	itrs       []*singleIter       // 用于重建堆
 	versionMap map[int]*singleIter // 映射 version->singleIter
 	db         *DB
-	shards     []*shard
 	locked     bool
 }
 
@@ -239,14 +238,14 @@ func (mi *Iterator) Valid() bool {
 
 // Close 关闭迭代器
 func (mi *Iterator) Close() error {
+	defer mi.unlock()
+	var firstErr error
 	for _, itr := range mi.itrs {
-		err := itr.iter.Close()
-		if err != nil {
-			return err
+		if err := itr.iter.Close(); err != nil && firstErr == nil {
+			firstErr = err
 		}
 	}
-	mi.unlock()
-	return nil
+	return firstErr
 }
 
 func (mi *Iterator) unlock() {
@@ -254,8 +253,65 @@ func (mi *Iterator) unlock() {
 		return
 	}
 	mi.locked = false
-	for i := len(mi.shards) - 1; i >= 0; i-- {
-		mi.shards[i].mu.RUnlock()
+	mi.db.vlogGuard.RUnlock()
+}
+
+// freezeForIterator 把每个 shard 的 active memtable 转为 immutable，并返回
+// 一个不会被后续写入修改的 memtable 列表。这样 iterator 不需要长期持有
+// 所有 shard 的读锁，只需要在扫描期间持有 ValueLog 的 compaction guard。
+func (db *DB) freezeForIterator() ([]*memtable, error) {
+	shards := db.shards
+	for _, s := range shards {
+		s.mu.Lock()
+	}
+	defer func() {
+		for i := len(shards) - 1; i >= 0; i-- {
+			shards[i].mu.Unlock()
+		}
+	}()
+	if db.closed {
+		return nil, ErrDBClosed
+	}
+
+	var tables []*memtable
+	var toFlush []*memtable
+	for _, s := range shards {
+		if s.active.skl.MemSize() > 0 {
+			old := s.active
+			options := old.options
+			options.tableID = makeTableID(s.id, (options.tableID&0xffff)+1)
+			table, err := openMemtable(options)
+			if err != nil {
+				return nil, err
+			}
+			s.immu = append(s.immu, old)
+			s.active = table
+			if s.id == 0 {
+				db.activeMem = table
+				db.immuMems = s.immu
+			}
+			if db.memtables != nil {
+				db.memtables[table.options.tableID] = table
+			}
+			toFlush = append(toFlush, old)
+		}
+		tables = append(tables, s.immu...)
+	}
+	for range toFlush {
+		db.flushWG.Add(1)
+	}
+	db.startSnapshotFlush(toFlush)
+	return tables, nil
+}
+
+func (db *DB) startSnapshotFlush(tables []*memtable) {
+	for _, table := range tables {
+		table := table
+		go func() {
+			defer db.flushWG.Done()
+			db.flushMemtable(table)
+			db.maybePruneCommitLog()
+		}()
 	}
 }
 
@@ -264,33 +320,28 @@ func (mi *Iterator) unlock() {
 // 调用者有责任在不再使用迭代器时调用Close，否则会导致资源泄漏
 // 迭代器不是线程安全的，不可从多个goroutine并发使用同一个迭代器
 func (db *DB) NewIterator(options IteratorOptions) (*Iterator, error) {
-	shards := append([]*shard(nil), db.shards...)
-	for _, s := range shards {
-		s.mu.RLock()
+	memtableList, err := db.freezeForIterator()
+	if err != nil {
+		return nil, err
+	}
+	db.vlogGuard.RLock()
+	if db.closed {
+		db.vlogGuard.RUnlock()
+		return nil, ErrDBClosed
 	}
 	success := false
 	defer func() {
-		if r := recover(); r != nil {
-			if !success {
-				for i := len(shards) - 1; i >= 0; i-- {
-					shards[i].mu.RUnlock()
-				}
-			}
-			panic(r)
-		}
 		if !success {
-			for i := len(shards) - 1; i >= 0; i-- {
-				shards[i].mu.RUnlock()
-			}
+			db.vlogGuard.RUnlock()
 		}
 	}()
 
-	itrs := make([]*singleIter, 0, len(db.getMemTables())+db.options.PartitionNum)
+	itrs := make([]*singleIter, 0, len(memtableList)+db.options.PartitionNum)
 	itrsM := make(map[int]*singleIter)
 	version := 0
 	index, ok := db.index.(*BPTree)
 	if !ok {
-		panic("index type not support")
+		return nil, ErrUnsupportedIndex
 	}
 
 	for i := 0; i < db.options.PartitionNum; i++ {
@@ -298,12 +349,8 @@ func (db *DB) NewIterator(options IteratorOptions) (*Iterator, error) {
 		if err != nil {
 			return nil, err
 		}
-		itr := newBptreeIterator(
-			tx,
-			options,
-		)
+		itr := newBptreeIterator(tx, options)
 		itr.Rewind()
-		// is empty
 		if !itr.Valid() {
 			_ = itr.Close()
 			continue
@@ -318,11 +365,9 @@ func (db *DB) NewIterator(options IteratorOptions) (*Iterator, error) {
 		itrsM[version] = itrs[len(itrs)-1]
 		version++
 	}
-	memtableList := db.getMemTables()
 	for i := 0; i < len(memtableList); i++ {
 		itr := newMemtableIterator(options, memtableList[i])
 		itr.Rewind()
-		// is empty
 		if !itr.Valid() {
 			_ = itr.Close()
 			continue
@@ -347,7 +392,6 @@ func (db *DB) NewIterator(options IteratorOptions) (*Iterator, error) {
 		itrs:       itrs,
 		versionMap: itrsM,
 		db:         db,
-		shards:     shards,
 		locked:     true,
 	}, nil
 }

@@ -28,6 +28,7 @@ var (
 	join           = flag.Bool("join", false, "Join existing cluster")
 	peersStr       = flag.String("peers", "", "Cluster members, format: id1=host1:port1,id2=host2:port2")
 	rpcPeersStr    = flag.String("rpc-peers", "", "Forwarding RPC peers, format: id1=host1:port1,id2=host2:port2")
+	shards         = flag.Int("shards", 1, "Number of fixed Raft shards")
 	sync           = flag.Bool("sync", true, "Use synchronous mode")
 	interactive    = flag.Bool("interactive", true, "Enable interactive mode")
 )
@@ -212,6 +213,7 @@ func main() {
 	// 创建Cluster配置
 	config := knocidb.DefaultClusterOptions(*nodeID, *clusterID, *clusterAddress, nodeDir)
 	config.JoinCluster = *join
+	config.ShardCount = *shards
 	config.InitialMembers = peers
 	config.RPCAddress = *rpcAddress
 	config.PeerRPC = rpcPeers
@@ -229,6 +231,7 @@ func main() {
 	fmt.Printf("KnociDB Cluster node started:\n")
 	fmt.Printf("  Node ID: %d\n", *nodeID)
 	fmt.Printf("  Cluster ID: %d\n", *clusterID)
+	fmt.Printf("  Shards: %d\n", len(clusterDB.Shards()))
 	fmt.Printf("  Raft address: %s\n", *clusterAddress)
 	fmt.Printf("  RPC address: %s\n", *rpcAddress)
 	fmt.Printf("  Data directory: %s\n", nodeDir)

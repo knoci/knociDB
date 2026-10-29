@@ -1,8 +1,10 @@
 package knocidb
 
 import (
+	"context"
 	"crypto/subtle"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -17,6 +19,8 @@ const (
 	rpcOpPut    byte = 1
 	rpcOpDelete byte = 2
 	rpcOpGet    byte = 3
+	rpcOpBatch  byte = 4
+	rpcOpMeta   byte = 5
 
 	rpcStatusOK           byte = 0
 	rpcStatusNotFound     byte = 1
@@ -29,36 +33,48 @@ const (
 
 // Put 写入 key。若当前节点不是 Leader，会尝试转发给已知 Leader。
 func (c *ClusterDB) Put(key, value []byte) error {
+	shard := c.shardFor(key)
 	var lastErr error
-	for attempt := 0; attempt < 2; attempt++ {
-		if _, addr, ok := c.forwardTarget(); ok {
+	for attempt := 0; attempt < 5; attempt++ {
+		if _, addr, ok := c.forwardTarget(shard); ok {
 			err := c.forwardRequest(addr, rpcOpPut, key, value)
 			if !errors.Is(err, ErrNotLeader) {
 				return err
 			}
 			lastErr = err
-			time.Sleep(50 * time.Millisecond)
+			time.Sleep(100 * time.Millisecond)
 			continue
 		}
-		return c.putLocal(key, value)
+		err := c.putLocal(key, value, shard)
+		if !errors.Is(err, ErrNotLeader) {
+			return err
+		}
+		lastErr = err
+		time.Sleep(100 * time.Millisecond)
 	}
 	return lastErr
 }
 
 // Delete 删除 key。若当前节点不是 Leader，会尝试转发给已知 Leader。
 func (c *ClusterDB) Delete(key []byte) error {
+	shard := c.shardFor(key)
 	var lastErr error
-	for attempt := 0; attempt < 2; attempt++ {
-		if _, addr, ok := c.forwardTarget(); ok {
+	for attempt := 0; attempt < 5; attempt++ {
+		if _, addr, ok := c.forwardTarget(shard); ok {
 			err := c.forwardRequest(addr, rpcOpDelete, key, nil)
 			if !errors.Is(err, ErrNotLeader) {
 				return err
 			}
 			lastErr = err
-			time.Sleep(50 * time.Millisecond)
+			time.Sleep(100 * time.Millisecond)
 			continue
 		}
-		return c.deleteLocal(key)
+		err := c.deleteLocal(key, shard)
+		if !errors.Is(err, ErrNotLeader) {
+			return err
+		}
+		lastErr = err
+		time.Sleep(100 * time.Millisecond)
 	}
 	return lastErr
 }
@@ -66,29 +82,30 @@ func (c *ClusterDB) Delete(key []byte) error {
 // Get 读取 key。若当前节点不是 Leader，会优先转发给 Leader，避免依赖
 // 具体 Dragonboat 版本对 follower ReadIndex 的行为。
 func (c *ClusterDB) Get(key []byte) ([]byte, error) {
+	shard := c.shardFor(key)
 	var lastErr error
-	for attempt := 0; attempt < 2; attempt++ {
-		if _, addr, ok := c.forwardTarget(); ok {
+	for attempt := 0; attempt < 5; attempt++ {
+		if _, addr, ok := c.forwardTarget(shard); ok {
 			value, err := c.forwardGet(addr, key)
 			if !errors.Is(err, ErrNotLeader) {
 				return value, err
 			}
 			lastErr = err
-			time.Sleep(50 * time.Millisecond)
+			time.Sleep(100 * time.Millisecond)
 			continue
 		}
-		return c.getLocal(key)
+		value, err := c.getLocal(key, shard)
+		if !errors.Is(err, ErrNotLeader) {
+			return value, err
+		}
+		lastErr = err
+		time.Sleep(100 * time.Millisecond)
 	}
 	return nil, lastErr
 }
 
-func (c *ClusterDB) isLeaderNow() bool {
-	leaderID, err := c.GetLeaderID()
-	return err == nil && leaderID == c.config.NodeID
-}
-
-func (c *ClusterDB) forwardTarget() (uint64, string, bool) {
-	leaderID, err := c.GetLeaderID()
+func (c *ClusterDB) forwardTarget(shard uint32) (uint64, string, bool) {
+	leaderID, err := c.leaderForShard(shard)
 	if err != nil || leaderID == 0 || leaderID == c.config.NodeID {
 		return 0, "", false
 	}
@@ -158,30 +175,81 @@ func (c *ClusterDB) handleRPC(conn net.Conn) {
 		fail(rpcStatusUnauthorized, "unauthorized")
 		return
 	}
-	if !c.isLeaderNow() {
+	if op == rpcOpMeta {
+		var meta ShardMapMeta
+		if err := json.Unmarshal(value, &meta); err != nil {
+			fail(rpcStatusError, err.Error())
+			return
+		}
+		mid := c.config.MetadataGroupID()
+		if mid == 0 {
+			fail(rpcStatusError, "metadata group not enabled")
+			return
+		}
+		leader, _, valid, err := c.nodeHost.GetLeaderID(mid)
+		if err != nil || !valid || leader != c.config.NodeID {
+			fail(rpcStatusNotLeader, "not metadata leader")
+			return
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		data, _ := json.Marshal(meta)
+		if _, err := c.nodeHost.SyncPropose(ctx, c.nodeHost.GetNoOPSession(mid), data); err != nil {
+			fail(rpcStatusForError(err), err.Error())
+			return
+		}
+		_ = writeRPCResponse(conn, rpcStatusOK, nil)
+		return
+	}
+	shard := c.shardFor(key)
+	var batch BatchCommand
+	if op == rpcOpBatch {
+		if err := json.Unmarshal(value, &batch); err != nil {
+			fail(rpcStatusError, err.Error())
+			return
+		}
+		if len(batch.Commands) == 0 {
+			fail(rpcStatusError, "empty batch")
+			return
+		}
+		shard = c.shardFor(batch.Commands[0].Key)
+		for _, cmd := range batch.Commands[1:] {
+			if c.shardFor(cmd.Key) != shard {
+				fail(rpcStatusError, ErrCrossShardBatch.Error())
+				return
+			}
+		}
+	}
+	if leader, err := c.leaderForShard(shard); err != nil || leader != c.config.NodeID {
 		fail(rpcStatusNotLeader, "not leader")
 		return
 	}
 	switch op {
 	case rpcOpPut:
-		if err := c.putLocal(key, value); err != nil {
+		if err := c.putLocal(key, value, shard); err != nil {
 			fail(rpcStatusForError(err), err.Error())
 			return
 		}
 		_ = writeRPCResponse(conn, rpcStatusOK, nil)
 	case rpcOpDelete:
-		if err := c.deleteLocal(key); err != nil {
+		if err := c.deleteLocal(key, shard); err != nil {
 			fail(rpcStatusForError(err), err.Error())
 			return
 		}
 		_ = writeRPCResponse(conn, rpcStatusOK, nil)
 	case rpcOpGet:
-		got, err := c.getLocal(key)
+		got, err := c.getLocal(key, shard)
 		if err != nil {
 			fail(rpcStatusForError(err), err.Error())
 			return
 		}
 		_ = writeRPCResponse(conn, rpcStatusOK, got)
+	case rpcOpBatch:
+		if err := c.batchWriteLocal(batch, shard); err != nil {
+			fail(rpcStatusForError(err), err.Error())
+			return
+		}
+		_ = writeRPCResponse(conn, rpcStatusOK, nil)
 	default:
 		fail(rpcStatusError, "unknown rpc op")
 	}

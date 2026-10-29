@@ -39,6 +39,8 @@ type DB struct {
 	fileLock         *flock.Flock        // 文件锁，防止多个进程使用相同的数据库目录
 	flushChan        chan *memtable      // 用于通知刷新协程将内存表刷新到磁盘
 	flushLock        sync.Mutex          // 刷新锁，防止在压缩未发生时进行刷新
+	flushWG          sync.WaitGroup      // 快照迭代器触发的后台 flush
+	vlogGuard        sync.RWMutex        // 保护 ValueLog 文件指针不被 compaction 替换
 	diskIO           *DiskIO             // 监控磁盘的 IO 状态并在适当时允许自动压缩
 	compactChan      chan discardState   // 用于通知需要压缩的分片
 	mu               sync.RWMutex
@@ -58,6 +60,9 @@ type DB struct {
 	// 记录打开过的 memtable，Close 时兜底关闭，避免 flush 竞态遗留 WAL 句柄。
 	memtables map[uint32]*memtable
 	commitLog *commitLog
+
+	batchRefMu sync.Mutex
+	batchRefs  map[uint64]int
 
 	ttl     *ttlStore
 	ttlStop chan struct{}
@@ -253,8 +258,14 @@ func Open(options Options) (*DB, error) {
 		batchPool:          sync.Pool{New: makeBatch},
 		memtables:          memtableMap,
 		commitLog:          commitLog,
+		batchRefs:          make(map[uint64]int),
 		ttl:                ttl,
 		manifestGeneration: manifestGeneration,
+	}
+	for _, table := range memtables {
+		for id := range table.batchIDs {
+			db.addBatchRefs(id, 1)
+		}
 	}
 
 	if tier != nil {
@@ -459,6 +470,12 @@ func (db *DB) closeInternal() error {
 	}
 	<-db.closeflushChan
 
+	// 拒绝新迭代器并等待它们触发的快照 flush 完成。
+	shards := db.lockAllShards()
+	db.closed = true
+	db.unlockAllShards(shards)
+	db.flushWG.Wait()
+
 	// 内存表已刷盘，上传新产生的冷段后再关闭 vlog。
 	if db.objectTier != nil {
 		_ = db.vlog.sync()
@@ -466,9 +483,10 @@ func (db *DB) closeInternal() error {
 		_ = db.objectTier.Close()
 	}
 
-	shards := db.lockAllShards()
+	shards = db.lockAllShards()
 	defer db.unlockAllShards(shards)
-	db.closed = true
+	db.vlogGuard.Lock()
+	defer db.vlogGuard.Unlock()
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
@@ -665,16 +683,6 @@ func validateOptions(options *Options) error {
 	return nil
 }
 
-// getMemTables 获取所有内存表，包括活跃内存表和不可变内存表。
-// 必须在持有db.mu锁的情况下调用。
-func (db *DB) getMemTables() []*memtable {
-	var tables []*memtable
-	for _, s := range db.shards {
-		tables = append(tables, s.memTables()...)
-	}
-	return tables
-}
-
 // waitMemtableSpace 等待内存表中的空间。
 // 如果活跃内存表已满，它将由后台协程刷新到磁盘。
 // 但如果刷新速度慢于写入速度，内存表中可能没有空间。
@@ -792,6 +800,7 @@ func (db *DB) flushMemtable(table *memtable) {
 		log.Println("delete wal failed:", err)
 		return
 	}
+	db.releaseBatchRefs(table.batchIDs)
 
 	// 删除内存中保存的旧内存表
 	s := db.shards[table.shardID]
@@ -861,6 +870,7 @@ func (db *DB) listenMemtableFlush() {
 		case table, ok := <-db.flushChan:
 			if ok {
 				db.flushMemtable(table)
+				db.maybePruneCommitLog()
 			} else {
 				db.closeflushChan <- struct{}{}
 				return
@@ -1061,7 +1071,7 @@ func (db *DB) Compact() error {
 					validRecords = append(validRecords, record)
 				}
 
-				if capacity >= int64(db.vlog.options.compactBatchCapacity) {
+				if atomic.LoadInt64(&capacity) >= int64(db.vlog.options.compactBatchCapacity) {
 					err = db.rewriteValidRecords(newVlogFile, validRecords, part)
 					if err != nil {
 						_ = newVlogFile.Delete()
@@ -1084,14 +1094,17 @@ func (db *DB) Compact() error {
 			// 用新文件替换 wal。读者持有对应 shard 的读锁，
 			// 这里锁住所有 shard，避免读者拿到旧指针后文件已被删除。
 			shards := db.lockAllShards()
+			db.vlogGuard.Lock()
 			// 先关闭新文件句柄并 rename；旧段仍保持打开，rename 不会覆盖旧段名。
 			_ = newVlogFile.Close()
 			if err := newVlogFile.RenameFileExt(fmt.Sprintf(valueLogFileExt, part)); err != nil {
+				db.vlogGuard.Unlock()
 				db.unlockAllShards(shards)
 				return err
 			}
 			reopened, err := openVlogFile(part, valueLogFileExt, 1)
 			if err != nil {
+				db.vlogGuard.Unlock()
 				db.unlockAllShards(shards)
 				return err
 			}
@@ -1102,6 +1115,7 @@ func (db *DB) Compact() error {
 			_ = reopened.DeleteSegmentsBelow(wal.SegmentID(newID))
 			db.vlog.walFiles[part] = reopened
 			db.vlog.dpTables[part].clean()
+			db.vlogGuard.Unlock()
 			db.unlockAllShards(shards)
 
 			return nil
@@ -1198,7 +1212,7 @@ func (db *DB) CompactWithDiscardtable() error {
 					}
 				}
 
-				if capacity >= int64(db.vlog.options.compactBatchCapacity) {
+				if atomic.LoadInt64(&capacity) >= int64(db.vlog.options.compactBatchCapacity) {
 					err = db.rewriteValidRecords(newVlogFile, validRecords, part)
 					if err != nil {
 						_ = newVlogFile.Delete()
@@ -1219,14 +1233,17 @@ func (db *DB) CompactWithDiscardtable() error {
 
 			// 同 Compact：切换文件指针时锁住所有 shard，避免并发读者读到已删除的旧文件。
 			shards := db.lockAllShards()
+			db.vlogGuard.Lock()
 			// 先关闭新文件句柄并 rename；旧段仍保持打开，rename 不会覆盖旧段名。
 			_ = newVlogFile.Close()
 			if err := newVlogFile.RenameFileExt(fmt.Sprintf(valueLogFileExt, part)); err != nil {
+				db.vlogGuard.Unlock()
 				db.unlockAllShards(shards)
 				return err
 			}
 			reopened, err := openVlogFile(part, valueLogFileExt, 1)
 			if err != nil {
+				db.vlogGuard.Unlock()
 				db.unlockAllShards(shards)
 				return err
 			}
@@ -1237,6 +1254,7 @@ func (db *DB) CompactWithDiscardtable() error {
 			_ = reopened.DeleteSegmentsBelow(wal.SegmentID(newID))
 			db.vlog.walFiles[part] = reopened
 			db.vlog.dpTables[part].clean()
+			db.vlogGuard.Unlock()
 			db.unlockAllShards(shards)
 			return nil
 		})

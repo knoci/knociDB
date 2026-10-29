@@ -129,22 +129,13 @@ func (db *DB) snapshotTo(path string) error {
 	if err := db.Sync(); err != nil {
 		return fmt.Errorf("sync before snapshot: %w", err)
 	}
+	db.flushLock.Lock()
+	defer db.flushLock.Unlock()
 	var sizes map[string]int64
-	checkpointErr := func() error {
-		shards := db.lockAllShards()
-		defer db.unlockAllShards(shards)
-		sizes, _ = db.snapshotFileSizes()
-		return nil
-	}()
-	if checkpointErr != nil {
-		return checkpointErr
-	}
-	copyErr := func() error {
-		db.flushLock.Lock()
-		defer db.flushLock.Unlock()
-		return db.copySnapshotFiles(tmpDir, sizes)
-	}()
-	if copyErr != nil {
+	shards := db.lockAllShards()
+	sizes, _ = db.snapshotFileSizes()
+	db.unlockAllShards(shards)
+	if copyErr := db.copySnapshotFiles(tmpDir, sizes); copyErr != nil {
 		return copyErr
 	}
 	if err := writeSnapshotArchive(tmpDir, path); err != nil {

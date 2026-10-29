@@ -1,6 +1,6 @@
 # KnociDB Cluster 示例
 
-这个示例展示 knociDB 的 L1 透明集群：单 Raft Group + Leader-aware 写转发。配置内部 RPC 地址后，`put/get/delete` 可以发给任意节点。
+这个示例展示 knociDB 的分片透明集群：每个固定 shard 一个 Raft Group，按 key 哈希路由，并支持 Leader-aware 写转发。配置内部 RPC 地址后，`put/get/delete` 可以发给任意节点。
 
 ## 使用方法
 
@@ -15,7 +15,7 @@ go build -o cluster-example main.go
 #### 启动第一个节点（Bootstrap）
 
 ```bash
-./cluster-example --id=1 --addr=localhost:8001 --rpc=localhost:9001 \
+./cluster-example --id=1 --addr=localhost:8001 --rpc=localhost:9001 --shards=3 \
   --dir=./node --peers=1=localhost:8001,2=localhost:8002,3=localhost:8003 \
   --rpc-peers=1=localhost:9001,2=localhost:9002,3=localhost:9003
 ```
@@ -23,11 +23,11 @@ go build -o cluster-example main.go
 #### 启动第二、第三个节点
 
 ```bash
-./cluster-example --id=2 --addr=localhost:8002 --rpc=localhost:9002 \
+./cluster-example --id=2 --addr=localhost:8002 --rpc=localhost:9002 --shards=3 \
   --dir=./node --peers=1=localhost:8001,2=localhost:8002,3=localhost:8003 \
   --rpc-peers=1=localhost:9001,2=localhost:9002,3=localhost:9003 --join
 
-./cluster-example --id=3 --addr=localhost:8003 --rpc=localhost:9003 \
+./cluster-example --id=3 --addr=localhost:8003 --rpc=localhost:9003 --shards=3 \
   --dir=./node --peers=1=localhost:8001,2=localhost:8002,3=localhost:8003 \
   --rpc-peers=1=localhost:9001,2=localhost:9002,3=localhost:9003 --join
 ```
@@ -45,6 +45,7 @@ Windows 下把 `./cluster-example` 换成 `.\cluster-example`。
 - `--join`: 是否作为新节点加入现有集群
 - `--peers`: 集群成员列表（格式：id1=host1:port1,id2=host2:port2,...）
 - `--rpc-peers`: NodeID -> 转发 RPC 地址（Follower 转发必需）
+- `--shards`: 固定 Raft 分片数（默认 1；所有节点必须一致）
 - `--sync`: 是否使用同步模式（默认为true）
 - `--interactive`: 是否启用交互模式（默认为true）
 
