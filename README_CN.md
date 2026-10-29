@@ -86,7 +86,9 @@ $ go build -o cluster-example main.go
 ```
 
 在 `OpenCluster` 前设置 `config.ShardCount` 即可创建多个固定 Raft Group。
+
 🔆 如果您想体验knociDB的更多功能，在`examples/cmd_client`中有一个命令行实现客户端，您可以通过该文件中的README文档获取使用cmd_client的具体方法。
+
 ```bash
 $ cd examples/cmd_client
 $ go build -o knocidb-cli
