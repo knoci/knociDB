@@ -613,20 +613,57 @@ func (db *DB) PutWithOptions(key []byte, value []byte, options WriteOptions) err
 }
 
 // Get 从数据库获取指定键的值。
-// 实际上，它会打开一个新的批处理并提交它。
-// 可以认为这个批处理只有一个Get操作。
 func (db *DB) Get(key []byte) ([]byte, error) {
-	batch, ok := db.batchPool.Get().(*Batch)
-	if !ok {
-		panic("batchPoll.Get failed")
+	if len(key) == 0 {
+		return nil, ErrKeyIsEmpty
 	}
-	batch.init(true, false, true, db)
-	defer func() {
-		_ = batch.Commit()
-		batch.reset()
-		db.batchPool.Put(batch)
-	}()
-	return batch.Get(key)
+	if db.closed {
+		return nil, ErrDBClosed
+	}
+	if db.ttl != nil {
+		expired, err := db.ttl.isExpired(key, time.Now().UnixMilli())
+		if err != nil {
+			return nil, err
+		}
+		if expired {
+			return nil, ErrKeyNotFound
+		}
+	}
+	s := db.shardFor(key)
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if db.closed {
+		return nil, ErrDBClosed
+	}
+	for _, table := range s.memTables() {
+		deleted, empty, value := table.getWithState(key)
+		if deleted {
+			return nil, ErrKeyNotFound
+		}
+		if empty {
+			return []byte{}, nil
+		}
+		if len(value) != 0 {
+			return value, nil
+		}
+	}
+	if db.bloomManager != nil && !db.bloomManager.TestKey(key) {
+		return nil, ErrKeyNotFound
+	}
+	db.vlogGuard.RLock()
+	defer db.vlogGuard.RUnlock()
+	position, err := db.index.Get(key)
+	if err != nil {
+		return nil, err
+	}
+	if position == nil {
+		return nil, ErrKeyNotFound
+	}
+	record, err := db.vlog.read(position)
+	if err != nil {
+		return nil, err
+	}
+	return record.value, nil
 }
 
 // Delete 使用默认写入选项进行删除。

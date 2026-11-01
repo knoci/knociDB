@@ -16,11 +16,12 @@ import (
 const (
 	clusterRPCVersion byte = 1
 
-	rpcOpPut    byte = 1
-	rpcOpDelete byte = 2
-	rpcOpGet    byte = 3
-	rpcOpBatch  byte = 4
-	rpcOpMeta   byte = 5
+	rpcOpPut      byte = 1
+	rpcOpDelete   byte = 2
+	rpcOpGet      byte = 3
+	rpcOpBatch    byte = 4
+	rpcOpMeta     byte = 5
+	rpcOpProgress byte = 6
 
 	rpcStatusOK           byte = 0
 	rpcStatusNotFound     byte = 1
@@ -160,6 +161,14 @@ func (c *ClusterDB) rpcTimeout() time.Duration {
 
 func (c *ClusterDB) handleRPC(conn net.Conn) {
 	defer conn.Close()
+	for {
+		if !c.handleRPCOnce(conn) {
+			return
+		}
+	}
+}
+
+func (c *ClusterDB) handleRPCOnce(conn net.Conn) bool {
 	c.rpcRequests.Add(1)
 	_ = conn.SetDeadline(time.Now().Add(c.rpcTimeout()))
 	fail := func(status byte, message string) {
@@ -168,93 +177,162 @@ func (c *ClusterDB) handleRPC(conn net.Conn) {
 	}
 	token, op, key, value, err := readRPCRequest(conn)
 	if err != nil {
+		if errors.Is(err, io.EOF) {
+			return false
+		}
 		fail(rpcStatusError, err.Error())
-		return
+		return false
 	}
 	if !c.rpcAuthorized(token) {
 		fail(rpcStatusUnauthorized, "unauthorized")
-		return
+		return true
+	}
+	if op == rpcOpProgress {
+		if len(key) != 4 {
+			fail(rpcStatusError, "invalid progress shard id")
+			return true
+		}
+		shardID := binary.BigEndian.Uint32(key)
+		idx, err := c.shardAppliedIndex(shardID)
+		if err != nil {
+			fail(rpcStatusForError(err), err.Error())
+			return true
+		}
+		out := make([]byte, 8)
+		binary.BigEndian.PutUint64(out, idx)
+		_ = writeRPCResponse(conn, rpcStatusOK, out)
+		return true
 	}
 	if op == rpcOpMeta {
 		var meta ShardMapMeta
 		if err := json.Unmarshal(value, &meta); err != nil {
 			fail(rpcStatusError, err.Error())
-			return
+			return true
 		}
 		mid := c.config.MetadataGroupID()
 		if mid == 0 {
 			fail(rpcStatusError, "metadata group not enabled")
-			return
+			return true
 		}
 		leader, _, valid, err := c.nodeHost.GetLeaderID(mid)
 		if err != nil || !valid || leader != c.config.NodeID {
 			fail(rpcStatusNotLeader, "not metadata leader")
-			return
+			return true
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		data, _ := json.Marshal(meta)
 		if _, err := c.nodeHost.SyncPropose(ctx, c.nodeHost.GetNoOPSession(mid), data); err != nil {
 			fail(rpcStatusForError(err), err.Error())
-			return
+			return true
 		}
 		_ = writeRPCResponse(conn, rpcStatusOK, nil)
-		return
+		return true
 	}
 	shard := c.shardFor(key)
 	var batch BatchCommand
 	if op == rpcOpBatch {
 		if err := json.Unmarshal(value, &batch); err != nil {
 			fail(rpcStatusError, err.Error())
-			return
+			return true
 		}
 		if len(batch.Commands) == 0 {
 			fail(rpcStatusError, "empty batch")
-			return
+			return true
 		}
 		shard = c.shardFor(batch.Commands[0].Key)
 		for _, cmd := range batch.Commands[1:] {
 			if c.shardFor(cmd.Key) != shard {
 				fail(rpcStatusError, ErrCrossShardBatch.Error())
-				return
+				return true
 			}
 		}
 	}
 	if leader, err := c.leaderForShard(shard); err != nil || leader != c.config.NodeID {
 		fail(rpcStatusNotLeader, "not leader")
-		return
+		return true
 	}
 	switch op {
 	case rpcOpPut:
 		if err := c.putLocal(key, value, shard); err != nil {
 			fail(rpcStatusForError(err), err.Error())
-			return
+			return true
 		}
 		_ = writeRPCResponse(conn, rpcStatusOK, nil)
 	case rpcOpDelete:
 		if err := c.deleteLocal(key, shard); err != nil {
 			fail(rpcStatusForError(err), err.Error())
-			return
+			return true
 		}
 		_ = writeRPCResponse(conn, rpcStatusOK, nil)
 	case rpcOpGet:
 		got, err := c.getLocal(key, shard)
 		if err != nil {
 			fail(rpcStatusForError(err), err.Error())
-			return
+			return true
 		}
 		_ = writeRPCResponse(conn, rpcStatusOK, got)
 	case rpcOpBatch:
 		if err := c.batchWriteLocal(batch, shard); err != nil {
 			fail(rpcStatusForError(err), err.Error())
-			return
+			return true
 		}
 		_ = writeRPCResponse(conn, rpcStatusOK, nil)
 	default:
 		fail(rpcStatusError, "unknown rpc op")
 	}
+	_ = conn.SetDeadline(time.Time{})
+	return true
 }
 
+func (c *ClusterDB) shardAppliedIndex(shardID uint32) (uint64, error) {
+	c.mu.RLock()
+	if c.nodeHost == nil || !c.state || int(shardID) >= len(c.shards) {
+		c.mu.RUnlock()
+		return 0, ErrNodeNotStarted
+	}
+	sm := c.shards[shardID].sm
+	c.mu.RUnlock()
+	if sm == nil {
+		return 0, fmt.Errorf("shard %d state machine is not ready", shardID)
+	}
+	return sm.AppliedIndex(), nil
+}
+
+func (c *ClusterDB) queryAppliedIndex(addr string, shardID uint32) (uint64, error) {
+	key := make([]byte, 4)
+	binary.BigEndian.PutUint32(key, shardID)
+	payload, err := c.rpcCall(addr, rpcOpProgress, key, nil)
+	if err != nil {
+		return 0, err
+	}
+	if len(payload) != 8 {
+		return 0, fmt.Errorf("invalid progress response")
+	}
+	return binary.BigEndian.Uint64(payload), nil
+}
+
+func (c *ClusterDB) waitForLearnerApplied(shardID uint32, nodeID uint64, timeout time.Duration) error {
+	leaderIndex, err := c.shardAppliedIndex(shardID)
+	if err != nil {
+		return err
+	}
+	c.mu.RLock()
+	addr := c.config.PeerRPC[nodeID]
+	c.mu.RUnlock()
+	if addr == "" {
+		return fmt.Errorf("replica %d has no rpc address", nodeID)
+	}
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		idx, err := c.queryAppliedIndex(addr, shardID)
+		if err == nil && idx >= leaderIndex {
+			return nil
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	return fmt.Errorf("learner %d did not catch up shard %d", nodeID, shardID)
+}
 func (c *ClusterDB) forwardRequest(addr string, op byte, key, value []byte) error {
 	_, err := c.rpcCall(addr, op, key, value)
 	return err
@@ -268,6 +346,53 @@ func (c *ClusterDB) forwardGet(addr string, key []byte) ([]byte, error) {
 	return value, err
 }
 
+func (c *ClusterDB) acquireRPCConn(addr string, dialTimeout, timeout time.Duration) (net.Conn, bool, error) {
+	c.rpcPoolMu.Lock()
+	list := c.rpcPool[addr]
+	if len(list) > 0 {
+		conn := list[len(list)-1]
+		c.rpcPool[addr] = list[:len(list)-1]
+		c.rpcPoolMu.Unlock()
+		_ = conn.SetDeadline(time.Now().Add(timeout))
+		return conn, true, nil
+	}
+	c.rpcPoolMu.Unlock()
+	conn, err := net.DialTimeout("tcp", addr, dialTimeout)
+	if err != nil {
+		return nil, false, err
+	}
+	_ = conn.SetDeadline(time.Now().Add(timeout))
+	return conn, false, nil
+}
+
+func (c *ClusterDB) releaseRPCConn(addr string, conn net.Conn) {
+	if conn == nil {
+		return
+	}
+	_ = conn.SetDeadline(time.Time{})
+	c.rpcPoolMu.Lock()
+	defer c.rpcPoolMu.Unlock()
+	if c.rpcPool == nil {
+		c.rpcPool = make(map[string][]net.Conn)
+	}
+	if len(c.rpcPool[addr]) >= 8 {
+		_ = conn.Close()
+		return
+	}
+	c.rpcPool[addr] = append(c.rpcPool[addr], conn)
+}
+
+func (c *ClusterDB) closeRPCPool() {
+	c.rpcPoolMu.Lock()
+	defer c.rpcPoolMu.Unlock()
+	for _, list := range c.rpcPool {
+		for _, conn := range list {
+			_ = conn.Close()
+		}
+	}
+	c.rpcPool = nil
+}
+
 func (c *ClusterDB) rpcCall(addr string, op byte, key, value []byte) ([]byte, error) {
 	c.forwardedOps.Add(1)
 	timeout := c.rpcTimeout()
@@ -275,22 +400,23 @@ func (c *ClusterDB) rpcCall(addr string, op byte, key, value []byte) ([]byte, er
 	if timeout < dialTimeout {
 		dialTimeout = timeout
 	}
-	conn, err := net.DialTimeout("tcp", addr, dialTimeout)
+	conn, _, err := c.acquireRPCConn(addr, dialTimeout, timeout)
 	if err != nil {
 		c.rpcErrors.Add(1)
 		return nil, err
 	}
-	defer conn.Close()
-	_ = conn.SetDeadline(time.Now().Add(timeout))
 	if err := writeRPCRequest(conn, []byte(c.config.RPCSecret), op, key, value); err != nil {
+		_ = conn.Close()
 		c.rpcErrors.Add(1)
 		return nil, err
 	}
 	status, payload, err := readRPCResponse(conn)
 	if err != nil {
+		_ = conn.Close()
 		c.rpcErrors.Add(1)
 		return nil, err
 	}
+	c.releaseRPCConn(addr, conn)
 	switch status {
 	case rpcStatusOK:
 		return payload, nil

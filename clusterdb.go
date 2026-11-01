@@ -49,6 +49,8 @@ type ClusterDB struct {
 
 	rpcListener net.Listener
 	rpcWG       sync.WaitGroup
+	rpcPoolMu   sync.Mutex
+	rpcPool     map[string][]net.Conn
 
 	rpcRequests  atomic.Uint64
 	rpcErrors    atomic.Uint64
@@ -200,6 +202,7 @@ func (rdb *ClusterDB) stop() error {
 	}
 	rdb.mu.Unlock()
 	rdb.rpcWG.Wait()
+	rdb.closeRPCPool()
 
 	rdb.mu.Lock()
 	defer rdb.mu.Unlock()

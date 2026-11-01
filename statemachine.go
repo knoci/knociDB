@@ -78,6 +78,12 @@ func (s *KVStateMachine) Lookup(query interface{}) (interface{}, error) {
 
 // Update 实现了statemachine.IStateMachine接口的Update方法
 // 用于应用Raft日志条目到状态机
+func (s *KVStateMachine) AppliedIndex() uint64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.appliedIndex
+}
+
 func (s *KVStateMachine) Update(entry statemachine.Entry) (statemachine.Result, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

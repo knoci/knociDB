@@ -40,6 +40,12 @@ func (c *ClusterDB) MigrateShard(shardID uint32, fromNode, toNode uint64, toAddr
 		}
 		return fmt.Errorf("wait learner: %w", err)
 	}
+	if err := c.waitForLearnerApplied(shardID, toNode, 10*time.Second); err != nil {
+		if addedLearner {
+			_ = c.RemoveShardReplica(shardID, toNode)
+		}
+		return fmt.Errorf("wait learner applied: %w", err)
+	}
 
 	if err := c.PromoteShardLearner(shardID, toNode, toAddress); err != nil {
 		if addedLearner {
