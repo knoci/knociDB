@@ -1,6 +1,7 @@
 package knocidb
 
 import (
+	"errors"
 	"log"
 	"os"
 	"strings"
@@ -45,6 +46,19 @@ func destroyDB(db *DB) {
 	}
 
 	_ = os.RemoveAll(db.options.DirPath)
+}
+
+func TestFlushErrorBlocksWrites(t *testing.T) {
+	options := DefaultOptions
+	options.DirPath = t.TempDir()
+	db, err := Open(options)
+	require.NoError(t, err)
+	defer destroyDB(db)
+
+	require.NoError(t, db.Put([]byte("before"), []byte("ok")))
+	db.setFlushError(errors.New("injected flush failure"))
+	err = db.Put([]byte("after"), []byte("blocked"))
+	require.ErrorIs(t, err, ErrFlushFailed)
 }
 
 func TestDBOpen(t *testing.T) {

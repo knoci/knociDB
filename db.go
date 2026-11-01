@@ -39,6 +39,8 @@ type DB struct {
 	fileLock         *flock.Flock        // 文件锁，防止多个进程使用相同的数据库目录
 	flushChan        chan *memtable      // 用于通知刷新协程将内存表刷新到磁盘
 	flushLock        sync.Mutex          // 刷新锁，防止在压缩未发生时进行刷新
+	flushErrMu       sync.RWMutex        // 保护 flush 失败状态
+	flushErr         error               // 首次 flush 失败后进入 fail-fast 状态
 	flushWG          sync.WaitGroup      // 快照迭代器触发的后台 flush
 	vlogGuard        sync.RWMutex        // 保护 ValueLog 文件指针不被 compaction 替换
 	diskIO           *DiskIO             // 监控磁盘的 IO 状态并在适当时允许自动压缩
@@ -383,9 +385,22 @@ func (db *DB) ttlSweeper() {
 				log.Printf("ttl scan failed: %v", err)
 				continue
 			}
-			for _, key := range keys {
-				if err := db.Delete(key); err != nil {
-					log.Printf("ttl delete failed: %v", err)
+			const ttlDeleteBatchSize = 256
+			for start := 0; start < len(keys); start += ttlDeleteBatchSize {
+				end := start + ttlDeleteBatchSize
+				if end > len(keys) {
+					end = len(keys)
+				}
+				batch := db.NewBatch(DefaultBatchOptions)
+				for _, key := range keys[start:end] {
+					if err := batch.Delete(key); err != nil {
+						log.Printf("ttl delete prepare failed: %v", err)
+						break
+					}
+				}
+				if err := batch.Commit(); err != nil {
+					log.Printf("ttl delete batch failed: %v", err)
+					break
 				}
 			}
 		}
@@ -688,6 +703,9 @@ func validateOptions(options *Options) error {
 // 但如果刷新速度慢于写入速度，内存表中可能没有空间。
 // 因此写入操作将等待内存表中的空间，超时时间由 WaitMemSpaceTimeout 指定。
 func (db *DB) waitMemtableSpace(s *shard) error {
+	if err := db.flushError(); err != nil {
+		return err
+	}
 	if !s.active.isFull() {
 		return nil
 	}
@@ -716,6 +734,26 @@ func (db *DB) waitMemtableSpace(s *shard) error {
 	return nil
 }
 
+func (db *DB) setFlushError(err error) {
+	if err == nil {
+		return
+	}
+	db.flushErrMu.Lock()
+	if db.flushErr == nil {
+		db.flushErr = err
+	}
+	db.flushErrMu.Unlock()
+}
+
+func (db *DB) flushError() error {
+	db.flushErrMu.RLock()
+	defer db.flushErrMu.RUnlock()
+	if db.flushErr == nil {
+		return nil
+	}
+	return fmt.Errorf("%w: %v", ErrFlushFailed, db.flushErr)
+}
+
 // flushMemtable 将指定的内存表刷新到磁盘。
 // 将执行以下步骤：
 // 1. 遍历内存表中的所有记录，将它们分为已删除的键和日志记录。
@@ -724,6 +762,13 @@ func (db *DB) waitMemtableSpace(s *shard) error {
 // 4. 添加已删除的uuid，并从索引中删除已删除的键。
 // 5. 删除WAL。
 func (db *DB) flushMemtable(table *memtable) {
+	if err := db.flushMemtableE(table); err != nil {
+		db.setFlushError(err)
+		log.Printf("flush memtable failed: %v", err)
+	}
+}
+
+func (db *DB) flushMemtableE(table *memtable) error {
 	db.flushLock.Lock()
 	defer db.flushLock.Unlock()
 
@@ -748,14 +793,12 @@ func (db *DB) flushMemtable(table *memtable) {
 	// 写入值日志，获取键的位置
 	keyPos, err := db.vlog.writeBatch(logRecords)
 	if err != nil {
-		log.Println("vlog writeBatch failed:", err)
-		return
+		return fmt.Errorf("vlog writeBatch: %w", err)
 	}
 
 	// 同步值日志
 	if err = db.vlog.sync(); err != nil {
-		log.Println("vlog sync failed:", err)
-		return
+		return fmt.Errorf("vlog sync: %w", err)
 	}
 
 	// 先加布隆，再写索引：避免“索引已可见、布隆还没加”期间读到假阴性。
@@ -769,8 +812,7 @@ func (db *DB) flushMemtable(table *memtable) {
 	// 将所有键和位置写入索引。
 	oldKeyPostions, err := db.index.PutBatch(keyPos)
 	if err != nil {
-		log.Println("index PutBatch failed:", err)
-		return
+		return fmt.Errorf("index PutBatch: %w", err)
 	}
 
 	// 将旧键 uuid 加入废弃表（覆盖写的旧版本）。
@@ -780,8 +822,7 @@ func (db *DB) flushMemtable(table *memtable) {
 
 	// 删除键：删除索引，最后把旧 uuid 加入废弃表。
 	if oldKeyPostions, err = db.index.DeleteBatch(deletedKeys); err != nil {
-		log.Println("index DeleteBatch failed:", err)
-		return
+		return fmt.Errorf("index DeleteBatch: %w", err)
 	}
 
 	// 删除的 key 也必须进入废弃表，否则增量压缩会把它当有效记录重新插回索引。
@@ -791,14 +832,12 @@ func (db *DB) flushMemtable(table *memtable) {
 
 	// 同步索引
 	if err = db.index.Sync(); err != nil {
-		log.Println("index sync failed:", err)
-		return
+		return fmt.Errorf("index sync: %w", err)
 	}
 
 	// 删除WAL
 	if err = table.deleteWAl(); err != nil {
-		log.Println("delete wal failed:", err)
-		return
+		return fmt.Errorf("delete wal: %w", err)
 	}
 	db.releaseBatchRefs(table.batchIDs)
 
@@ -811,7 +850,7 @@ func (db *DB) flushMemtable(table *memtable) {
 		options.tableID = makeTableID(s.id, (options.tableID&0xffff)+1)
 		table, err = openMemtable(options)
 		if err != nil {
-			panic("flush active memtable failed")
+			return fmt.Errorf("open active memtable: %w", err)
 		}
 		s.active = table
 		if s.id == 0 {
@@ -833,8 +872,9 @@ func (db *DB) flushMemtable(table *memtable) {
 	s.mu.Unlock()
 	db.sendThresholdState()
 	if err := db.writeDBManifest(); err != nil {
-		log.Printf("write manifest after flush failed: %v", err)
+		return fmt.Errorf("write manifest after flush: %w", err)
 	}
+	return nil
 }
 
 func (db *DB) sendThresholdState() {
