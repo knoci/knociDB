@@ -285,8 +285,10 @@ func TestMultiNodeClusterObjectTierFailover(t *testing.T) {
 	cleanups := make([]func(), nodeCount)
 
 	initialMembers := make(map[uint64]string)
+	addrs := make([]string, nodeCount)
 	for i := 0; i < nodeCount; i++ {
-		initialMembers[uint64(i+1)] = fmt.Sprintf("localhost:%d", 10400+i)
+		addrs[i] = freeClusterAddress(t)
+		initialMembers[uint64(i+1)] = addrs[i]
 	}
 
 	for i := 0; i < nodeCount; i++ {
@@ -295,7 +297,7 @@ func TestMultiNodeClusterObjectTierFailover(t *testing.T) {
 		stores[i] = newFakeObjectStore()
 
 		nodeID := uint64(i + 1)
-		config := createTestClusterOptions(nodeID, 500, fmt.Sprintf("localhost:%d", 10400+i), tempDir)
+		config := createTestClusterOptions(nodeID, 500, addrs[i], tempDir)
 		config.InitialMembers = initialMembers
 		config.SnapshotIntervalSeconds = 1
 		options := createTestDBOptions(t, tempDir)
@@ -392,14 +394,16 @@ func TestThreeNodeClusterObjectTierLeaderFailover(t *testing.T) {
 	nodes := make([]*ClusterDB, nodeCount)
 	cleanups := make([]func(), nodeCount)
 	initialMembers := make(map[uint64]string)
+	addrs := make([]string, nodeCount)
 	for i := 0; i < nodeCount; i++ {
-		initialMembers[uint64(i+1)] = fmt.Sprintf("localhost:%d", 10500+i)
+		addrs[i] = freeClusterAddress(t)
+		initialMembers[uint64(i+1)] = addrs[i]
 	}
 
 	for i := 0; i < nodeCount; i++ {
 		tempDir, cleanup := setupTestEnvironment(t)
 		cleanups[i] = cleanup
-		config := createTestClusterOptions(uint64(i+1), 501, fmt.Sprintf("localhost:%d", 10500+i), tempDir)
+		config := createTestClusterOptions(uint64(i+1), 501, addrs[i], tempDir)
 		config.InitialMembers = initialMembers
 		options := createTestDBOptions(t, tempDir)
 		options.ObjectTier = ObjectTierOptions{

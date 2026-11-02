@@ -220,13 +220,14 @@ func TestClusterDB(t *testing.T) {
 	tempDir, cleanup := setupTestEnvironment(t)
 	defer cleanup()
 
-	config := createTestClusterOptions(1, 100, "localhost:10000", tempDir)
+	addr := freeClusterAddress(t)
+	config := createTestClusterOptions(1, 100, addr, tempDir)
 	option := createTestDBOptions(t, tempDir)
 
 	nm, err := OpenCluster(config, option)
 	require.NoError(t, err)
 
-	time.Sleep(2 * time.Second)
+	require.Eventually(t, nm.IsLeader, 10*time.Second, 100*time.Millisecond)
 
 	t.Run("IsLeader", func(t *testing.T) {
 		isLeader := nm.IsLeader()
@@ -264,7 +265,7 @@ func TestClusterDB(t *testing.T) {
 		members, err := nm.GetClusterMembership()
 		require.NoError(t, err)
 		assert.Equal(t, 1, len(members))
-		assert.Equal(t, "localhost:10000", members[1])
+		assert.Equal(t, addr, members[1])
 	})
 
 	t.Run("RemoveMissingNode", func(t *testing.T) {
@@ -310,11 +311,10 @@ func TestMultiNodeCluster(t *testing.T) {
 	cleanups := make([]func(), nodeCount)
 
 	initialMembers := make(map[uint64]string)
+	addrs := make([]string, nodeCount)
 	for i := 0; i < nodeCount; i++ {
-		nodeID := uint64(i + 1)
-		port := 10100 + i
-		address := fmt.Sprintf("localhost:%d", port)
-		initialMembers[nodeID] = address
+		addrs[i] = freeClusterAddress(t)
+		initialMembers[uint64(i+1)] = addrs[i]
 	}
 
 	for i := 0; i < nodeCount; i++ {
@@ -323,9 +323,7 @@ func TestMultiNodeCluster(t *testing.T) {
 		cleanups[i] = cleanup
 
 		nodeID := uint64(i + 1)
-		port := 10100 + i
-		address := fmt.Sprintf("localhost:%d", port)
-		config := createTestClusterOptions(nodeID, 300, address, tempDir)
+		config := createTestClusterOptions(nodeID, 300, addrs[i], tempDir)
 		config.InitialMembers = initialMembers
 		option := createTestDBOptions(t, tempDir)
 
@@ -345,17 +343,16 @@ func TestMultiNodeCluster(t *testing.T) {
 		}
 	}()
 
-	time.Sleep(5 * time.Second)
-
 	var leaderIndex int = -1
-	for i := 0; i < nodeCount; i++ {
-		if nodes[i].IsLeader() {
-			leaderIndex = i
-			break
+	require.Eventually(t, func() bool {
+		for i := 0; i < nodeCount; i++ {
+			if nodes[i].IsLeader() {
+				leaderIndex = i
+				return true
+			}
 		}
-	}
-
-	require.GreaterOrEqual(t, leaderIndex, 0)
+		return false
+	}, 15*time.Second, 100*time.Millisecond)
 	err := nodes[leaderIndex].Put([]byte("cluster-key"), []byte("cluster-value"))
 	require.NoError(t, err)
 
@@ -376,19 +373,25 @@ func TestClusterLeaderForwarding(t *testing.T) {
 	cleanups := make([]func(), nodeCount)
 	initialMembers := make(map[uint64]string)
 	peerRPC := make(map[uint64]string)
+	addrs := make([]string, nodeCount)
+	rpcs := make([]string, nodeCount)
+	for i := 0; i < nodeCount; i++ {
+		addrs[i] = freeClusterAddress(t)
+		rpcs[i] = freeClusterAddress(t)
+	}
 	for i := 0; i < nodeCount; i++ {
 		nodeID := uint64(i + 1)
-		initialMembers[nodeID] = fmt.Sprintf("localhost:%d", 10600+i)
-		peerRPC[nodeID] = fmt.Sprintf("localhost:%d", 10700+i)
+		initialMembers[nodeID] = addrs[i]
+		peerRPC[nodeID] = rpcs[i]
 	}
 
 	for i := 0; i < nodeCount; i++ {
 		tempDir, cleanup := setupTestEnvironment(t)
 		cleanups[i] = cleanup
 		nodeID := uint64(i + 1)
-		config := createTestClusterOptions(nodeID, 600, fmt.Sprintf("localhost:%d", 10600+i), tempDir)
+		config := createTestClusterOptions(nodeID, 600, addrs[i], tempDir)
 		config.InitialMembers = initialMembers
-		config.RPCAddress = peerRPC[nodeID]
+		config.RPCAddress = rpcs[i]
 		config.PeerRPC = peerRPC
 		config.RPCSecret = "test-secret"
 		option := createTestDBOptions(t, tempDir)
@@ -408,15 +411,16 @@ func TestClusterLeaderForwarding(t *testing.T) {
 		}
 	}()
 
-	time.Sleep(5 * time.Second)
 	leaderIndex := -1
-	for i, node := range nodes {
-		if node.IsLeader() {
-			leaderIndex = i
-			break
+	require.Eventually(t, func() bool {
+		for i, node := range nodes {
+			if node.IsLeader() {
+				leaderIndex = i
+				return true
+			}
 		}
-	}
-	require.GreaterOrEqual(t, leaderIndex, 0)
+		return false
+	}, 15*time.Second, 100*time.Millisecond)
 
 	follower := -1
 	for i := range nodes {
