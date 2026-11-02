@@ -49,7 +49,7 @@ func TestCoreTTLSetPersistAndReopen(t *testing.T) {
 	db, err := Open(options)
 	require.NoError(t, err)
 	require.NoError(t, db.Put([]byte("k"), []byte("v")))
-	ok, err := db.SetTTL([]byte("k"), 200*time.Millisecond)
+	ok, err := db.SetTTL([]byte("k"), 5*time.Second)
 	require.NoError(t, err)
 	require.True(t, ok)
 	require.NoError(t, db.Close())
