@@ -455,10 +455,26 @@ func TestClusterLeaderForwarding(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, []byte("batch-forward-value"), value)
 
-	require.ErrorIs(t, nodes[follower].AddNode(99, "localhost:19999"), ErrNotLeader)
-	require.ErrorIs(t, nodes[follower].RemoveNode(99), ErrNotLeader)
+	currentLeader, currentFollower := -1, -1
+	for i, node := range nodes {
+		if node.IsLeader() {
+			currentLeader = i
+			break
+		}
+	}
+	for i := range nodes {
+		if i != currentLeader {
+			currentFollower = i
+			break
+		}
+	}
+	require.GreaterOrEqual(t, currentLeader, 0)
+	require.GreaterOrEqual(t, currentFollower, 0)
 
-	_, err = nodes[follower].rpcCall(nodes[follower].config.RPCAddress, rpcOpPut, []byte("x"), []byte("y"))
+	require.ErrorIs(t, nodes[currentFollower].AddNode(99, "localhost:19999"), ErrNotLeader)
+	require.ErrorIs(t, nodes[currentFollower].RemoveNode(99), ErrNotLeader)
+
+	_, err = nodes[currentFollower].rpcCall(nodes[currentFollower].config.RPCAddress, rpcOpPut, []byte("x"), []byte("y"))
 	require.ErrorIs(t, err, ErrNotLeader)
 	_, err = nodes[leaderIndex].rpcCall(nodes[leaderIndex].config.RPCAddress, 99, []byte("x"), nil)
 	require.Error(t, err)

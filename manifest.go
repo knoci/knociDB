@@ -65,6 +65,10 @@ func (db *DB) writeDBManifest() error {
 			continue
 		}
 		info, err := entry.Info()
+		if errors.Is(err, os.ErrNotExist) {
+			// 并发 flush 可能刚好删除了自己的 WAL 段，清单跳过已消失文件即可。
+			continue
+		}
 		if err != nil {
 			return err
 		}
