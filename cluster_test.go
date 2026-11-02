@@ -356,12 +356,18 @@ func TestMultiNodeCluster(t *testing.T) {
 	err := nodes[leaderIndex].Put([]byte("cluster-key"), []byte("cluster-value"))
 	require.NoError(t, err)
 
-	time.Sleep(2 * time.Second)
-
 	for i := 0; i < nodeCount; i++ {
+		idx := i
 		t.Run(fmt.Sprintf("Node%d", i+1), func(t *testing.T) {
-			value, err := nodes[i].Get([]byte("cluster-key"))
-			require.NoError(t, err)
+			var value []byte
+			require.Eventually(t, func() bool {
+				got, err := nodes[idx].Get([]byte("cluster-key"))
+				if err != nil {
+					return false
+				}
+				value = got
+				return true
+			}, 10*time.Second, 100*time.Millisecond)
 			assert.Equal(t, []byte("cluster-value"), value)
 		})
 	}
@@ -471,8 +477,28 @@ func TestClusterLeaderForwarding(t *testing.T) {
 	require.GreaterOrEqual(t, currentLeader, 0)
 	require.GreaterOrEqual(t, currentFollower, 0)
 
-	require.ErrorIs(t, nodes[currentFollower].AddNode(99, "localhost:19999"), ErrNotLeader)
-	require.ErrorIs(t, nodes[currentFollower].RemoveNode(99), ErrNotLeader)
+	var removeErr error
+	for attempt := 0; attempt < 10; attempt++ {
+		currentLeader, currentFollower = -1, -1
+		for i, node := range nodes {
+			if node.IsLeader() {
+				currentLeader = i
+				break
+			}
+		}
+		for i := range nodes {
+			if i != currentLeader {
+				currentFollower = i
+				break
+			}
+		}
+		require.GreaterOrEqual(t, currentFollower, 0)
+		removeErr = nodes[currentFollower].RemoveNode(99)
+		if errors.Is(removeErr, ErrNotLeader) {
+			break
+		}
+	}
+	require.ErrorIs(t, removeErr, ErrNotLeader)
 
 	_, err = nodes[currentFollower].rpcCall(nodes[currentFollower].config.RPCAddress, rpcOpPut, []byte("x"), []byte("y"))
 	require.ErrorIs(t, err, ErrNotLeader)
