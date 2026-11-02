@@ -420,6 +420,39 @@ func (b *Batch) Commit() error {
 		return nil
 	}
 
+	// 同一分片的多 key 批次同样不需要构造分组/排序 map。
+	if len(b.pendingTTL) == 0 {
+		var single *shard
+		for key := range b.pendingWrites {
+			s := b.db.shardFor([]byte(key))
+			if single == nil {
+				single = s
+				continue
+			}
+			if s.id != single.id {
+				single = nil
+				break
+			}
+		}
+		if single != nil {
+			b.lockShards([]*shard{single})
+			defer b.unlockShards([]*shard{single})
+			if b.db.closed {
+				return ErrDBClosed
+			}
+			batchID := b.batchID.Generate()
+			if err := b.db.waitMemtableSpace(single); err != nil {
+				return err
+			}
+			if err := single.active.prepareBatch(b.pendingWrites, batchID, b.options.WriteOptions, 1); err != nil {
+				return err
+			}
+			single.active.applyBatch(b.pendingWrites)
+			b.committed = true
+			return nil
+		}
+	}
+
 	// 写入数据之前先落“设置 TTL”；崩溃时最多留下一个指向不存在 key 的 TTL。
 	sets := make(map[string]int64)
 	deletes := make(map[string]int64)

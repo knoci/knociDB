@@ -49,6 +49,8 @@ func readDBManifest(dir string) (uint64, error) {
 }
 
 func (db *DB) writeDBManifest() error {
+	db.manifestMu.Lock()
+	defer db.manifestMu.Unlock()
 	entries, err := os.ReadDir(db.options.DirPath)
 	if err != nil {
 		return err

@@ -5,10 +5,11 @@ import "sync"
 // shard 是本地写入并发的最小单元。一个 shard 拥有独立的
 // active/immutable memtable 和 WAL；索引与 ValueLog 仍复用分区文件。
 type shard struct {
-	id     uint32
-	mu     sync.RWMutex
-	active *memtable
-	immu   []*memtable
+	id      uint32
+	mu      sync.RWMutex
+	flushMu sync.Mutex
+	active  *memtable
+	immu    []*memtable
 }
 
 // memTables 返回 newest-first 的内存表顺序，供点读使用。

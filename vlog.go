@@ -30,6 +30,7 @@ type valueLog struct {
 	// 压缩期间新 ValueLog 还没替换进 walFiles，但索引可能已经指向新位置。
 	// 读路径通过 extraWALs 找到这些“临时可读”的新段（按分区隔离）。
 	mu        sync.RWMutex
+	statsMu   sync.Mutex
 	extraWALs [][]*wal.WAL
 }
 
@@ -215,7 +216,9 @@ func (vlog *valueLog) read(pos *KeyPosition) (*ValueLogRecord, error) {
 func (vlog *valueLog) writeBatch(records []*ValueLogRecord) ([]*KeyPosition, error) {
 	// 按分区对记录进行分组
 	partitionRecords := make([][]*ValueLogRecord, vlog.options.partitionNum)
+	vlog.statsMu.Lock()
 	vlog.totalNumber += uint32(len(records))
+	vlog.statsMu.Unlock()
 	for _, record := range records {
 		// 获取并收集分区号。
 		p := vlog.getKeyPartition(record.key)
@@ -309,8 +312,10 @@ func (vlog *valueLog) getKeyPartition(key []byte) int {
 }
 
 func (vlog *valueLog) setDiscard(partition uint32, id uuid.UUID) {
+	vlog.statsMu.Lock()
 	vlog.dpTables[partition].addEntry(id)
 	vlog.discardNumber++
+	vlog.statsMu.Unlock()
 }
 
 func (vlog *valueLog) isDiscard(partition int, id uuid.UUID) bool {
@@ -318,9 +323,17 @@ func (vlog *valueLog) isDiscard(partition int, id uuid.UUID) bool {
 }
 
 func (vlog *valueLog) cleanDiscardTable() {
+	vlog.statsMu.Lock()
+	defer vlog.statsMu.Unlock()
 	for i := 0; i < int(vlog.options.partitionNum); i++ {
 		vlog.dpTables[i].clean()
 	}
 	vlog.totalNumber -= vlog.discardNumber
 	vlog.discardNumber = 0
+}
+
+func (vlog *valueLog) stats() (uint32, uint32) {
+	vlog.statsMu.Lock()
+	defer vlog.statsMu.Unlock()
+	return vlog.totalNumber, vlog.discardNumber
 }

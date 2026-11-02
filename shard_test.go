@@ -509,6 +509,57 @@ func TestBatchIDsAreUnique(t *testing.T) {
 	}
 }
 
+func TestSingleShardMultiKeyBatchRecoveryWithoutCommit(t *testing.T) {
+	dir := t.TempDir()
+	options := DefaultOptions
+	options.DirPath = dir
+	options.SnapshotPath = t.TempDir()
+	db, err := Open(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var keys [][]byte
+	for i := 0; len(keys) < 3; i++ {
+		key := []byte(fmt.Sprintf("same-shard-%d", i))
+		if db.shardFor(key).id == 0 {
+			keys = append(keys, key)
+		}
+	}
+	batch := db.NewBatch(DefaultBatchOptions)
+	for i, key := range keys {
+		if err := batch.Put(key, []byte(fmt.Sprintf("value-%d", i))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := batch.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(filepath.Join(dir, "COMMIT"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Size() != 0 {
+		t.Fatalf("single-shard batch wrote %d bytes to COMMIT", info.Size())
+	}
+	db, err = Open(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	for i, key := range keys {
+		got, err := db.Get(key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(got) != fmt.Sprintf("value-%d", i) {
+			t.Fatalf("key %q got %q", key, got)
+		}
+	}
+}
+
 func TestSingleShardBatchRecoveryWithoutCommit(t *testing.T) {
 	dir := t.TempDir()
 	options := DefaultOptions

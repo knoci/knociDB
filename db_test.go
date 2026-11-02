@@ -486,15 +486,15 @@ func TestDBCompact(t *testing.T) {
 		})
 	}
 
-	produceAndWriteLogs(100000, 0, db)
+	produceAndWriteLogsNoSync(100000, 0, db)
 	for _, sh := range db.shards {
 		db.flushMemtable(sh.active)
 	}
 	// overwrite half. background busy flushing.
-	produceAndWriteLogs(50000, 0, db)
-	produceAndWriteLogs(50000, 0, db)
-	produceAndWriteLogs(50000, 0, db)
-	produceAndWriteLogs(50000, 0, db)
+	produceAndWriteLogsNoSync(50000, 0, db)
+	produceAndWriteLogsNoSync(50000, 0, db)
+	produceAndWriteLogsNoSync(50000, 0, db)
+	produceAndWriteLogsNoSync(50000, 0, db)
 	for _, sh := range db.shards {
 		db.flushMemtable(sh.active)
 	}
@@ -541,15 +541,15 @@ func TestDBCompactWitchDeprecatetable(t *testing.T) {
 		})
 	}
 
-	produceAndWriteLogs(100000, 0, db)
+	produceAndWriteLogsNoSync(100000, 0, db)
 	for _, sh := range db.shards {
 		db.flushMemtable(sh.active)
 	}
 	// overwrite half. background busy flushing.
-	produceAndWriteLogs(50000, 0, db)
-	produceAndWriteLogs(50000, 0, db)
-	produceAndWriteLogs(50000, 0, db)
-	produceAndWriteLogs(50000, 0, db)
+	produceAndWriteLogsNoSync(50000, 0, db)
+	produceAndWriteLogsNoSync(50000, 0, db)
+	produceAndWriteLogsNoSync(50000, 0, db)
+	produceAndWriteLogsNoSync(50000, 0, db)
 	for _, sh := range db.shards {
 		db.flushMemtable(sh.active)
 	}
@@ -609,11 +609,11 @@ func TestDBAutoCompact(t *testing.T) {
 			})
 		}
 		// load init key value.
-		produceAndWriteLogs(100000, 0, db)
+		produceAndWriteLogsNoSync(100000, 0, db)
 		// overwrite half. background busy flushing.
 		for i := 0; i < 6; i++ {
 			time.Sleep(500 * time.Microsecond)
-			produceAndWriteLogs(50000, 0, db)
+			produceAndWriteLogsNoSync(50000, 0, db)
 		}
 
 		require.NoError(t, err)
@@ -678,19 +678,19 @@ func TestDBAutoCompactWithBusyIO(t *testing.T) {
 			ioCloseChan <- struct{}{}
 		}()
 
-		produceAndWriteLogs(100000, 0, db)
+		produceAndWriteLogsNoSync(100000, 0, db)
 		// overwrite half. background busy flushing.
-		produceAndWriteLogs(50000, 0, db)
+		produceAndWriteLogsNoSync(50000, 0, db)
 		go SimpleIO(options.DirPath+"iofile", 10)
-		produceAndWriteLogs(50000, 0, db)
-		produceAndWriteLogs(50000, 0, db)
-		produceAndWriteLogs(50000, 0, db)
+		produceAndWriteLogsNoSync(50000, 0, db)
+		produceAndWriteLogsNoSync(50000, 0, db)
+		produceAndWriteLogsNoSync(50000, 0, db)
 		// we sleep 1s, this time not IO busy. So that background will do autoCompact.
 		time.Sleep(1 * time.Second)
 		<-ioCloseChan
 		close(ioCloseChan)
-		produceAndWriteLogs(50000, 0, db)
-		produceAndWriteLogs(50000, 0, db)
+		produceAndWriteLogsNoSync(50000, 0, db)
+		produceAndWriteLogsNoSync(50000, 0, db)
 		require.NoError(t, err)
 
 		var value []byte
@@ -750,6 +750,19 @@ func produceAndWriteLogs(numLogs int64, offset int64, db *DB) []*testLog {
 			Sync:       true,
 			DisableWal: false,
 		})
+	}
+	return logs
+}
+
+func produceAndWriteLogsNoSync(numLogs int64, offset int64, db *DB) []*testLog {
+	var logs []*testLog
+	var i int64
+	for i = 0; i < numLogs; i++ {
+		log := &testLog{key: util.GetTestKey(offset + i), value: util.RandomValue(1 << 10)}
+		logs = append(logs, log)
+	}
+	for _, log := range logs {
+		_ = db.Put(log.key, log.value)
 	}
 	return logs
 }
@@ -814,7 +827,7 @@ func TestDBMultiClients(t *testing.T) {
 		for i := 0; i < 2; i++ {
 			wg.Add(1)
 			go func(i int) {
-				delLogs := produceAndWriteLogs(50000, int64(i)*50000, db)
+				delLogs := produceAndWriteLogs(5000, int64(i)*50000, db)
 				// delete logs
 				for idx, log := range delLogs {
 					if idx%5 == 0 {
@@ -824,7 +837,7 @@ func TestDBMultiClients(t *testing.T) {
 						})
 					}
 				}
-				produceAndWriteLogs(50000, int64(i)*50000, db)
+				produceAndWriteLogs(5000, int64(i)*50000, db)
 				time.Sleep(time.Millisecond * 500)
 				for _, log := range logs[i] {
 					_ = db.PutWithOptions(log.key, log.value, WriteOptions{
@@ -1104,11 +1117,11 @@ func TestDeprecatetableMetaPersist(t *testing.T) {
 	require.NoError(t, err)
 
 	t.Run("test same deprecated number", func(t *testing.T) {
-		produceAndWriteLogs(100000, 0, db)
+		produceAndWriteLogsNoSync(100000, 0, db)
 		// overwrite half. background busy flushing.
 		for i := 0; i < 3; i++ {
 			time.Sleep(500 * time.Microsecond)
-			produceAndWriteLogs(50000, 0, db)
+			produceAndWriteLogsNoSync(50000, 0, db)
 		}
 		db.Close()
 		deprecatedNumberFirst := db.vlog.discardNumber

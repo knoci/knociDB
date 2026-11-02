@@ -38,7 +38,7 @@ type DB struct {
 	bloomManager     *BloomFilterManager // 布隆过滤器管理器
 	fileLock         *flock.Flock        // 文件锁，防止多个进程使用相同的数据库目录
 	flushChan        chan *memtable      // 用于通知刷新协程将内存表刷新到磁盘
-	flushLock        sync.Mutex          // 刷新锁，防止在压缩未发生时进行刷新
+	flushLock        sync.RWMutex        // 刷新闸门：flush 读锁，compact/snapshot/close 写锁
 	flushErrMu       sync.RWMutex        // 保护 flush 失败状态
 	flushErr         error               // 首次 flush 失败后进入 fail-fast 状态
 	flushWG          sync.WaitGroup      // 快照迭代器触发的后台 flush
@@ -60,8 +60,10 @@ type DB struct {
 	objectTierWG   sync.WaitGroup
 
 	// 记录打开过的 memtable，Close 时兜底关闭，避免 flush 竞态遗留 WAL 句柄。
-	memtables map[uint32]*memtable
-	commitLog *commitLog
+	memtables   map[uint32]*memtable
+	memtablesMu sync.Mutex
+	manifestMu  sync.Mutex
+	commitLog   *commitLog
 
 	batchRefMu sync.Mutex
 	batchRefs  map[uint64]int
@@ -506,11 +508,14 @@ func (db *DB) closeInternal() error {
 	defer db.mu.Unlock()
 
 	// 关闭所有打开过的内存表；注册表包含所有 shard 的 active/immu 表。
+	db.memtablesMu.Lock()
 	for _, table := range db.memtables {
 		if err := table.close(); err != nil {
+			db.memtablesMu.Unlock()
 			return err
 		}
 	}
+	db.memtablesMu.Unlock()
 	// 关闭索引
 	if err := db.index.Close(); err != nil {
 		return err
@@ -519,7 +524,8 @@ func (db *DB) closeInternal() error {
 	db.flushLock.Lock()
 	// 持久化废弃数量和总条目数量
 	discardMetaPath := filepath.Join(db.options.DirPath, discardMetaName)
-	err := storeDiscardEntryMeta(discardMetaPath, db.vlog.discardNumber, db.vlog.totalNumber)
+	totalNumber, discardNumber := db.vlog.stats()
+	err := storeDiscardEntryMeta(discardMetaPath, discardNumber, totalNumber)
 	if err != nil {
 		return err
 	}
@@ -590,26 +596,30 @@ func (db *DB) Put(key []byte, value []byte) error {
 	return db.PutWithOptions(key, value, DefaultWriteOptions)
 }
 
-// PutWithOptions 将键值对写入数据库。
-// 实际上，它会打开一个新的批处理并提交它。
-// 可以认为这个批处理只有一个Put操作。
+// PutWithOptions 将键值对写入数据库。单条写入直接走 WAL + memtable，不创建 Batch。
 func (db *DB) PutWithOptions(key []byte, value []byte, options WriteOptions) error {
-	batch, ok := db.batchPool.Get().(*Batch)
-	if !ok {
-		panic("batchPoll.Get failed")
+	if len(key) == 0 {
+		return ErrKeyIsEmpty
 	}
-	batch.options.WriteOptions = options
-	defer func() {
-		batch.reset()
-		db.batchPool.Put(batch)
-	}()
-	// 这是单个put操作，我们可以将Sync设置为false。
-	// 因为数据将被写入WAL，并且WAL文件将根据DB选项同步到磁盘。
-	batch.init(false, false, false, db).withPendingWrites()
-	if err := batch.Put(key, value); err != nil {
+	if db.closed {
+		return ErrDBClosed
+	}
+	s := db.shardFor(key)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if db.closed {
+		return ErrDBClosed
+	}
+	if err := db.waitMemtableSpace(s); err != nil {
 		return err
 	}
-	return batch.Commit()
+	record := &LogRecord{Key: key, Value: value, Type: LogRecordNormal}
+	batchID := globalBatchIDNode.Generate()
+	if err := s.active.prepareRecord(record, batchID, 1, options); err != nil {
+		return err
+	}
+	s.active.applyRecord(record)
+	return nil
 }
 
 // Get 从数据库获取指定键的值。
@@ -671,27 +681,30 @@ func (db *DB) Delete(key []byte) error {
 	return db.DeleteWithOptions(key, DefaultWriteOptions)
 }
 
-// DeleteWithOptions 从数据库中删除指定的键。
-// 实际上，它会打开一个新的批处理并提交它。
-// 可以认为这个批处理只有一个Delete操作。
+// DeleteWithOptions 从数据库中删除指定的键。单条删除直接走 WAL + memtable。
 func (db *DB) DeleteWithOptions(key []byte, options WriteOptions) error {
-	batch, ok := db.batchPool.Get().(*Batch)
-	if !ok {
-		panic("batchPoll.Get failed")
+	if len(key) == 0 {
+		return ErrKeyIsEmpty
 	}
-	batch.options.WriteOptions = options
-	defer func() {
-		batch.reset()
-		db.batchPool.Put(batch)
-	}()
-	// 这是单个delete操作，我们可以将Sync设置为false。
-	// 因为数据将被写入WAL，
-	// 并且WAL文件将根据DB选项同步到磁盘。
-	batch.init(false, false, false, db).withPendingWrites()
-	if err := batch.Delete(key); err != nil {
+	if db.closed {
+		return ErrDBClosed
+	}
+	s := db.shardFor(key)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if db.closed {
+		return ErrDBClosed
+	}
+	if err := db.waitMemtableSpace(s); err != nil {
 		return err
 	}
-	return batch.Commit()
+	record := &LogRecord{Key: key, Type: LogRecordDeleted}
+	batchID := globalBatchIDNode.Generate()
+	if err := s.active.prepareRecord(record, batchID, 1, options); err != nil {
+		return err
+	}
+	s.active.applyRecord(record)
+	return nil
 }
 
 // Exist 检查指定的键是否存在于数据库中。
@@ -763,7 +776,9 @@ func (db *DB) waitMemtableSpace(s *shard) error {
 			db.activeMem = table
 			db.immuMems = s.immu
 		}
+		db.memtablesMu.Lock()
 		db.memtables[table.options.tableID] = table
+		db.memtablesMu.Unlock()
 	case <-timer.C:
 		return ErrWaitMemtableSpaceTimeOut
 	}
@@ -806,8 +821,11 @@ func (db *DB) flushMemtable(table *memtable) {
 }
 
 func (db *DB) flushMemtableE(table *memtable) error {
-	db.flushLock.Lock()
-	defer db.flushLock.Unlock()
+	db.flushLock.RLock()
+	defer db.flushLock.RUnlock()
+	s := db.shards[table.shardID]
+	s.flushMu.Lock()
+	defer s.flushMu.Unlock()
 
 	sklIter := table.skl.NewIterator()
 	var deletedKeys [][]byte
@@ -879,7 +897,7 @@ func (db *DB) flushMemtableE(table *memtable) error {
 	db.releaseBatchRefs(table.batchIDs)
 
 	// 删除内存中保存的旧内存表
-	s := db.shards[table.shardID]
+	s = db.shards[table.shardID]
 	s.mu.Lock()
 	oldTableID := table.options.tableID
 	if table == s.active {
@@ -893,7 +911,9 @@ func (db *DB) flushMemtableE(table *memtable) error {
 		if s.id == 0 {
 			db.activeMem = table
 		}
+		db.memtablesMu.Lock()
 		db.memtables[table.options.tableID] = table
+		db.memtablesMu.Unlock()
 	} else {
 		for i, t := range s.immu {
 			if t == table {
@@ -905,7 +925,9 @@ func (db *DB) flushMemtableE(table *memtable) error {
 			db.immuMems = s.immu
 		}
 	}
+	db.memtablesMu.Lock()
 	delete(db.memtables, oldTableID)
+	db.memtablesMu.Unlock()
 	s.mu.Unlock()
 	db.sendThresholdState()
 	if err := db.writeDBManifest(); err != nil {
@@ -917,16 +939,17 @@ func (db *DB) flushMemtableE(table *memtable) error {
 func (db *DB) sendThresholdState() {
 	if db.options.AutoCompactSupport {
 		// 检查废弃表大小
-		lowerThreshold := uint32((float32)(db.vlog.totalNumber) * db.options.AdvisedCompactionRate)
-		upperThreshold := uint32((float32)(db.vlog.totalNumber) * db.options.ForceCompactionRate)
+		totalNumber, discardNumber := db.vlog.stats()
+		lowerThreshold := uint32((float32)(totalNumber) * db.options.AdvisedCompactionRate)
+		upperThreshold := uint32((float32)(totalNumber) * db.options.ForceCompactionRate)
 		thresholdState := discardState{
 			thresholdState: ThresholdState(UnarriveThreshold),
 		}
-		if db.vlog.discardNumber >= upperThreshold {
+		if discardNumber >= upperThreshold {
 			thresholdState = discardState{
 				thresholdState: ThresholdState(ArriveForceThreshold),
 			}
-		} else if db.vlog.discardNumber > lowerThreshold {
+		} else if discardNumber > lowerThreshold {
 			thresholdState = discardState{
 				thresholdState: ThresholdState(ArriveAdvisedThreshold),
 			}
@@ -941,18 +964,24 @@ func (db *DB) sendThresholdState() {
 func (db *DB) listenMemtableFlush() {
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, os.Interrupt, syscall.SIGHUP, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT)
+	var workers sync.WaitGroup
 	for {
 		select {
-		// 定时器
 		case table, ok := <-db.flushChan:
 			if ok {
-				db.flushMemtable(table)
-				db.maybePruneCommitLog()
+				workers.Add(1)
+				go func(t *memtable) {
+					defer workers.Done()
+					db.flushMemtable(t)
+					db.maybePruneCommitLog()
+				}(table)
 			} else {
+				workers.Wait()
 				db.closeflushChan <- struct{}{}
 				return
 			}
 		case <-sig:
+			workers.Wait()
 			return
 		}
 	}
