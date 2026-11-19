@@ -499,8 +499,7 @@ func (b *Batch) Commit() error {
 			}
 		}
 		if !b.options.DisableWal && len(shards) > 1 {
-			b.db.addBatchRefs(uint64(batchID), len(shards))
-			if err := b.db.commitLog.append(uint64(batchID), b.options.Sync); err != nil {
+			if err := b.db.commitBatch(uint64(batchID), len(shards), b.options.Sync); err != nil {
 				return err
 			}
 		}

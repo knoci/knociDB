@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func destroyWAL(wal *WAL) {
@@ -322,6 +323,46 @@ func TestWAL_RenameFileExt(t *testing.T) {
 		_, err = wal2.Write([]byte(strings.Repeat("W", 512)))
 		assert.Nil(t, err)
 	}
+}
+
+func TestWAL_PublishSegmentsResumesAfterPartialFailure(t *testing.T) {
+	options := Options{DirPath: t.TempDir(), SegmentFileExt: ".SEG", SegmentSize: 64 << 10}
+	live, err := Open(options)
+	require.NoError(t, err)
+	defer live.Close()
+	old, err := live.Write([]byte("old"))
+	require.NoError(t, err)
+
+	stagedOptions := options
+	stagedOptions.DirPath = t.TempDir()
+	stagedOptions.InitialSegmentID = live.ActiveSegmentID() + 1
+	staged, err := Open(stagedOptions)
+	require.NoError(t, err)
+	defer staged.Close()
+	first, err := staged.Write([]byte("first"))
+	require.NoError(t, err)
+	require.NoError(t, staged.OpenNewActiveSegment())
+	second, err := staged.Write([]byte("second"))
+	require.NoError(t, err)
+	require.NoError(t, staged.Sync())
+	require.NoError(t, staged.Close())
+
+	obstruction := SegmentFileName(options.DirPath, options.SegmentFileExt, second.SegmentId)
+	require.NoError(t, os.Mkdir(obstruction, 0700))
+	require.Error(t, live.PublishSegments(stagedOptions.DirPath, second.SegmentId))
+	require.Equal(t, first.SegmentId, live.ActiveSegmentID())
+	got, err := live.Read(old)
+	require.NoError(t, err)
+	require.Equal(t, []byte("old"), got)
+	got, err = live.Read(first)
+	require.NoError(t, err)
+	require.Equal(t, []byte("first"), got)
+
+	require.NoError(t, os.Remove(obstruction))
+	require.NoError(t, live.PublishSegments(stagedOptions.DirPath, second.SegmentId))
+	got, err = live.Read(second)
+	require.NoError(t, err)
+	require.Equal(t, []byte("second"), got)
 }
 
 func TestWAL_DeleteSegmentsBelow(t *testing.T) {

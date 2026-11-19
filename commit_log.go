@@ -104,16 +104,23 @@ func (db *DB) maybePruneCommitLog() {
 	if db.commitLog.recordCount() < commitLogPruneThreshold {
 		return
 	}
-	if err := db.commitLog.rewrite(db.batchRefSnapshot()); err != nil {
+	// 裁剪与提交使用同一把锁，避免用过期的 WAL 引用覆盖新提交。
+	db.batchRefMu.Lock()
+	defer db.batchRefMu.Unlock()
+	if err := db.commitLog.rewrite(db.batchRefs); err != nil {
 		// 裁剪失败不影响写入；下次 flush 再试。
 		return
 	}
 }
 
-func (db *DB) addBatchRefs(id uint64, n int) {
+func (db *DB) commitBatch(id uint64, shardCount int, syncWrite bool) error {
 	db.batchRefMu.Lock()
-	db.batchRefs[id] += n
-	db.batchRefMu.Unlock()
+	defer db.batchRefMu.Unlock()
+	if err := db.commitLog.append(id, syncWrite); err != nil {
+		return err
+	}
+	db.batchRefs[id] = shardCount
+	return nil
 }
 
 func (db *DB) releaseBatchRefs(ids map[uint64]struct{}) {
@@ -128,25 +135,15 @@ func (db *DB) releaseBatchRefs(ids map[uint64]struct{}) {
 	db.batchRefMu.Unlock()
 }
 
-func (db *DB) batchRefSnapshot() map[uint64]struct{} {
-	db.batchRefMu.Lock()
-	defer db.batchRefMu.Unlock()
-	ids := make(map[uint64]struct{}, len(db.batchRefs))
-	for id := range db.batchRefs {
-		ids[id] = struct{}{}
-	}
-	return ids
-}
-
 func (c *commitLog) append(id uint64, syncWrite bool) error {
 	if c == nil {
 		return nil
 	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	if c.file == nil {
 		return fmt.Errorf("commit log is not open")
 	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
 	if _, err := c.file.Write(encodeCommitRecord(id)); err != nil {
 		return err
 	}
@@ -166,7 +163,7 @@ func (c *commitLog) recordCount() int {
 	return c.records
 }
 
-func (c *commitLog) rewrite(ids map[uint64]struct{}) error {
+func (c *commitLog) rewrite(refs map[uint64]int) error {
 	if c == nil {
 		return nil
 	}
@@ -178,7 +175,7 @@ func (c *commitLog) rewrite(ids map[uint64]struct{}) error {
 		return err
 	}
 	var writeErr error
-	for id := range ids {
+	for id := range refs {
 		if _, writeErr = f.Write(encodeCommitRecord(id)); writeErr != nil {
 			break
 		}
@@ -216,25 +213,31 @@ func (c *commitLog) rewrite(ids map[uint64]struct{}) error {
 		return err
 	}
 	c.file = reopened
-	c.records = len(ids)
+	c.records = len(refs)
 	return nil
 }
 
 func (c *commitLog) Sync() error {
-	if c == nil || c.file == nil {
+	if c == nil {
 		return nil
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.file == nil {
+		return nil
+	}
 	return c.file.Sync()
 }
 
 func (c *commitLog) close() error {
-	if c == nil || c.file == nil {
+	if c == nil {
 		return nil
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.file == nil {
+		return nil
+	}
 	err := c.file.Sync()
 	if closeErr := c.file.Close(); err == nil {
 		err = closeErr

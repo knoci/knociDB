@@ -1,7 +1,6 @@
 package knocidb
 
 import (
-	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -10,8 +9,8 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"sync"
-	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -42,7 +41,7 @@ type DB struct {
 	flushErrMu       sync.RWMutex        // 保护 flush 失败状态
 	flushErr         error               // 首次 flush 失败后进入 fail-fast 状态
 	flushWG          sync.WaitGroup      // 快照迭代器触发的后台 flush
-	vlogGuard        sync.RWMutex        // 保护 ValueLog 文件指针不被 compaction 替换
+	vlogGuard        sync.RWMutex        // 防止读者仍持有旧索引位置时回收 ValueLog 段
 	diskIO           *DiskIO             // 监控磁盘的 IO 状态并在适当时允许自动压缩
 	compactChan      chan discardState   // 用于通知需要压缩的分片
 	mu               sync.RWMutex
@@ -268,7 +267,10 @@ func Open(options Options) (*DB, error) {
 	}
 	for _, table := range memtables {
 		for id := range table.batchIDs {
-			db.addBatchRefs(id, 1)
+			// 只有已有提交标记的批次（含旧库迁移）才能被裁剪保留。
+			if _, ok := committed[id]; legacy || ok {
+				db.batchRefs[id]++
+			}
 		}
 	}
 
@@ -451,7 +453,6 @@ func (db *DB) closeInternal() error {
 		if db.fileLock != nil {
 			_ = db.fileLock.Unlock()
 		}
-		db.closed = true
 	}()
 
 	// 先停止 TTL 后台清理，避免关闭 bbolt 后仍有扫描。
@@ -493,6 +494,9 @@ func (db *DB) closeInternal() error {
 	db.unlockAllShards(shards)
 	db.flushWG.Wait()
 
+	db.flushLock.Lock()
+	defer db.flushLock.Unlock()
+
 	// 内存表已刷盘，上传新产生的冷段后再关闭 vlog。
 	if db.objectTier != nil {
 		_ = db.vlog.sync()
@@ -521,7 +525,6 @@ func (db *DB) closeInternal() error {
 		return err
 	}
 
-	db.flushLock.Lock()
 	// 持久化废弃数量和总条目数量
 	discardMetaPath := filepath.Join(db.options.DirPath, discardMetaName)
 	totalNumber, discardNumber := db.vlog.stats()
@@ -529,8 +532,6 @@ func (db *DB) closeInternal() error {
 	if err != nil {
 		return err
 	}
-	defer db.flushLock.Unlock()
-
 	// 保存布隆过滤器
 	if db.bloomManager != nil {
 		db.bloomManager.StopAutoSave()
@@ -1104,300 +1105,223 @@ func sameChunkPosition(a, b *wal.ChunkPosition) bool {
 		a.ChunkOffset == b.ChunkOffset
 }
 
-// Compact 会遍历vlog中的所有值，并将有效值写入新的vlog文件。
-// 然后用新文件替换旧的vlog文件，并删除旧文件。
-//
-//nolint:gocognit
+// Compact 复制索引仍引用的值，并在索引同步后回收旧段。
 func (db *DB) Compact() error {
-	db.flushLock.Lock()
-	defer db.flushLock.Unlock()
-
-	log.Println("[Compact data]")
-	openVlogFile := func(part int, ext string, initialID uint32) (*wal.WAL, error) {
-		walFile, err := wal.Open(wal.Options{
-			DirPath:          db.vlog.options.dirPath,
-			SegmentSize:      db.vlog.options.segmentSize,
-			SegmentFileExt:   fmt.Sprintf(ext, part),
-			InitialSegmentID: wal.SegmentID(initialID),
-			Sync:             false, // 我们会手动同步
-			BytesPerSync:     0,     // 与Sync相同
-		})
-		if err != nil {
-			if walFile != nil {
-				_ = walFile.Delete()
-			}
-			return nil, err
-		}
-		return walFile, nil
-	}
-
-	g, _ := errgroup.WithContext(context.Background())
-	var capacity int64
-	var capacityList = make([]int64, db.options.PartitionNum)
-	for i := 0; i < int(db.vlog.options.partitionNum); i++ {
-		part := i
-		g.Go(func() error {
-			// 新段使用比旧段更大的 ID，避免压缩过程中新旧段文件名冲突。
-			newID := db.vlog.walFiles[part].ActiveSegmentID() + 1
-			newVlogFile, err := openVlogFile(part, tempValueLogFileExt, uint32(newID))
-			if err != nil {
-				return err
-			}
-			// 索引可能在新文件 rename 之前就指向新段，先让读路径能找到它。
-			db.vlog.addReadableWAL(part, newVlogFile)
-			defer db.vlog.removeReadableWAL(part, newVlogFile)
-			validRecords := make([]*ValueLogRecord, 0)
-			reader := db.vlog.walFiles[part].NewReader() // 遍历wal中的所有记录，找到有效记录
-			for {
-				chunk, pos, err := reader.Next()
-				atomic.AddInt64(&capacity, int64(len(chunk)))
-				capacityList[part] += int64(len(chunk))
-				if err != nil {
-					if errors.Is(err, io.EOF) {
-						break
-					}
-					_ = newVlogFile.Delete()
-					return err
-				}
-
-				record := decodeValueLogRecord(chunk)
-				if record == nil {
-					continue
-				}
-				keyPos, err := db.index.Get(record.key)
-				if err != nil {
-					_ = newVlogFile.Delete()
-					return err
-				}
-
-				if keyPos == nil {
-					continue
-				}
-				if keyPos.partition == uint32(part) && sameChunkPosition(keyPos.position, pos) {
-					validRecords = append(validRecords, record)
-				}
-
-				if atomic.LoadInt64(&capacity) >= int64(db.vlog.options.compactBatchCapacity) {
-					err = db.rewriteValidRecords(newVlogFile, validRecords, part)
-					if err != nil {
-						_ = newVlogFile.Delete()
-						return err
-					}
-					validRecords = validRecords[:0]
-					atomic.AddInt64(&capacity, -capacityList[part])
-					capacityList[part] = 0
-				}
-			}
-
-			if len(validRecords) > 0 {
-				err := db.rewriteValidRecords(newVlogFile, validRecords, part)
-				if err != nil {
-					_ = newVlogFile.Delete()
-					return err
-				}
-			}
-
-			// 用新文件替换 wal。读者持有对应 shard 的读锁，
-			// 这里锁住所有 shard，避免读者拿到旧指针后文件已被删除。
-			shards := db.lockAllShards()
-			db.vlogGuard.Lock()
-			// 先关闭新文件句柄并 rename；旧段仍保持打开，rename 不会覆盖旧段名。
-			_ = newVlogFile.Close()
-			if err := newVlogFile.RenameFileExt(fmt.Sprintf(valueLogFileExt, part)); err != nil {
-				db.vlogGuard.Unlock()
-				db.unlockAllShards(shards)
-				return err
-			}
-			reopened, err := openVlogFile(part, valueLogFileExt, 1)
-			if err != nil {
-				db.vlogGuard.Unlock()
-				db.unlockAllShards(shards)
-				return err
-			}
-			// reopened 同时打开旧段和新段；此时再关闭旧 WAL，并删除旧段。
-			if oldWal := db.vlog.walFiles[part]; oldWal != nil {
-				_ = oldWal.Close()
-			}
-			_ = reopened.DeleteSegmentsBelow(wal.SegmentID(newID))
-			db.vlog.walFiles[part] = reopened
-			db.vlog.dpTables[part].clean()
-			db.vlogGuard.Unlock()
-			db.unlockAllShards(shards)
-
-			return nil
-		})
-	}
-	err := g.Wait()
-	db.mu.Lock()
-	db.vlog.cleanDiscardTable()
-	db.mu.Unlock()
-	if err == nil {
-		if manifestErr := db.writeDBManifest(); manifestErr != nil {
-			log.Printf("write manifest after compact failed: %v", manifestErr)
-		}
-	}
-	return err
+	return db.compact(false)
 }
 
-// CompactWithDiscardtable 会遍历vlog中的所有值，通过discardtable查找旧值，
-// 并将有效值写入新的vlog文件。
-// 然后用新文件替换旧的vlog文件，并删除旧文件。
-//
-//nolint:gocognit
+// CompactWithDiscardtable 用废弃表跳过已知的旧值。
 func (db *DB) CompactWithDiscardtable() error {
+	return db.compact(true)
+}
+
+func (db *DB) compact(useDiscardTable bool) error {
 	db.flushLock.Lock()
 	defer db.flushLock.Unlock()
 
-	log.Println("[CompactWithDiscardtable data]")
-	openVlogFile := func(part int, ext string, initialID uint32) (*wal.WAL, error) {
-		walFile, err := wal.Open(wal.Options{
-			DirPath:          db.vlog.options.dirPath,
-			SegmentSize:      db.vlog.options.segmentSize,
-			SegmentFileExt:   fmt.Sprintf(ext, part),
-			InitialSegmentID: wal.SegmentID(initialID),
-			Sync:             false, // 我们会手动同步
-			BytesPerSync:     0,     // 与Sync相同
-		})
-		if err != nil {
-			if walFile != nil {
-				_ = walFile.Delete()
-			}
-			return nil, err
-		}
-		return walFile, nil
+	shard := db.shards[0]
+	shard.mu.RLock()
+	closed := db.closed
+	shard.mu.RUnlock()
+	if closed {
+		return ErrDBClosed
 	}
 
-	g, _ := errgroup.WithContext(context.Background())
-	var capacity int64
-	var capacityList = make([]int64, db.options.PartitionNum)
-	for i := 0; i < int(db.vlog.options.partitionNum); i++ {
-		part := i
-		g.Go(func() error {
-			// 新段使用比旧段更大的 ID，避免压缩过程中新旧段文件名冲突。
-			newID := db.vlog.walFiles[part].ActiveSegmentID() + 1
-			newVlogFile, err := openVlogFile(part, tempValueLogFileExt, uint32(newID))
-			if err != nil {
-				return err
-			}
-			// 索引可能在新文件 rename 之前就指向新段，先让读路径能找到它。
-			db.vlog.addReadableWAL(part, newVlogFile)
-			defer db.vlog.removeReadableWAL(part, newVlogFile)
-			validRecords := make([]*ValueLogRecord, 0)
-			reader := db.vlog.walFiles[part].NewReader()
-			// 遍历wal中的所有记录，找到有效记录
-			for {
-				chunk, pos, err := reader.Next()
-				atomic.AddInt64(&capacity, int64(len(chunk)))
-				capacityList[part] += int64(len(chunk))
-				if err != nil {
-					if errors.Is(err, io.EOF) {
-						break
-					}
-					_ = newVlogFile.Delete()
-					return err
-				}
-
-				record := decodeValueLogRecord(chunk)
-				if record == nil {
-					continue
-				}
-
-				// 废弃表命中时可以直接跳过；未命中时仍要回查索引，
-				// 因为废弃表可能在重启/崩溃后不完整。索引不存在或位置不匹配的记录一律丢弃，
-				// 这样增量压缩也不会把已删除的 key 重新插回索引。
-				if !db.vlog.isDiscard(part, record.uid) {
-					keyPos, err := db.index.Get(record.key)
-					if err != nil {
-						_ = newVlogFile.Delete()
-						return err
-					}
-
-					if keyPos != nil && keyPos.partition == uint32(part) &&
-						sameChunkPosition(keyPos.position, pos) {
-						validRecords = append(validRecords, record)
-					}
-				}
-
-				if atomic.LoadInt64(&capacity) >= int64(db.vlog.options.compactBatchCapacity) {
-					err = db.rewriteValidRecords(newVlogFile, validRecords, part)
-					if err != nil {
-						_ = newVlogFile.Delete()
-						return err
-					}
-					validRecords = validRecords[:0]
-					atomic.AddInt64(&capacity, -capacityList[part])
-					capacityList[part] = 0
-				}
-			}
-			if len(validRecords) > 0 {
-				err := db.rewriteValidRecords(newVlogFile, validRecords, part)
-				if err != nil {
-					_ = newVlogFile.Delete()
-					return err
-				}
-			}
-
-			// 同 Compact：切换文件指针时锁住所有 shard，避免并发读者读到已删除的旧文件。
-			shards := db.lockAllShards()
-			db.vlogGuard.Lock()
-			// 先关闭新文件句柄并 rename；旧段仍保持打开，rename 不会覆盖旧段名。
-			_ = newVlogFile.Close()
-			if err := newVlogFile.RenameFileExt(fmt.Sprintf(valueLogFileExt, part)); err != nil {
-				db.vlogGuard.Unlock()
-				db.unlockAllShards(shards)
-				return err
-			}
-			reopened, err := openVlogFile(part, valueLogFileExt, 1)
-			if err != nil {
-				db.vlogGuard.Unlock()
-				db.unlockAllShards(shards)
-				return err
-			}
-			// reopened 同时打开旧段和新段；此时再关闭旧 WAL，并删除旧段。
-			if oldWal := db.vlog.walFiles[part]; oldWal != nil {
-				_ = oldWal.Close()
-			}
-			_ = reopened.DeleteSegmentsBelow(wal.SegmentID(newID))
-			db.vlog.walFiles[part] = reopened
-			db.vlog.dpTables[part].clean()
-			db.vlogGuard.Unlock()
-			db.unlockAllShards(shards)
-			return nil
-		})
-	}
-
-	err := g.Wait()
-	db.mu.Lock()
-	db.vlog.cleanDiscardTable()
-	db.mu.Unlock()
-	if err == nil {
-		if manifestErr := db.writeDBManifest(); manifestErr != nil {
-			log.Printf("write manifest after compact failed: %v", manifestErr)
-		}
-	}
-	return err
-}
-
-func (db *DB) rewriteValidRecords(walFile *wal.WAL, validRecords []*ValueLogRecord, part int) error {
-	for _, record := range validRecords {
-		walFile.PendingWrites(encodeValueLogRecord(record))
-	}
-
-	walChunkPositions, err := walFile.WriteAll()
+	stageDir, err := os.MkdirTemp(db.vlog.options.dirPath, ".vlog-compact-")
 	if err != nil {
 		return err
 	}
+	defer os.RemoveAll(stageDir)
 
-	positions := make([]*KeyPosition, len(walChunkPositions))
-	for i, walChunkPosition := range walChunkPositions {
-		positions[i] = &KeyPosition{
-			key:       validRecords[i].key,
-			partition: uint32(part),
-			position:  walChunkPosition,
+	firstSegments := make([]wal.SegmentID, len(db.vlog.walFiles))
+	batchLimit := max(1, db.vlog.options.compactBatchCapacity/len(firstSegments))
+	var copyGroup errgroup.Group
+	for part, source := range db.vlog.walFiles {
+		copyGroup.Go(func() error {
+			firstID, err := db.copyCompactPartition(part, source, stageDir, batchLimit, useDiscardTable)
+			firstSegments[part] = firstID
+			if err != nil {
+				return fmt.Errorf("copy compact partition %d: %w", part, err)
+			}
+			return nil
+		})
+	}
+	if err := copyGroup.Wait(); err != nil {
+		return err
+	}
+	if err := syncCompactionDirectory(db.vlog.options.dirPath); err != nil {
+		return fmt.Errorf("sync compacted segment names: %w", err)
+	}
+
+	// 新段已经可读且同步。索引即使只更新一部分，新旧位置也都有效。
+	var indexGroup errgroup.Group
+	for part, source := range db.vlog.walFiles {
+		indexGroup.Go(func() error {
+			if err := db.indexCompactPartition(part, source, firstSegments[part], batchLimit); err != nil {
+				return fmt.Errorf("index compact partition %d: %w", part, err)
+			}
+			return nil
+		})
+	}
+	if err := indexGroup.Wait(); err != nil {
+		return err
+	}
+	if err := db.index.Sync(); err != nil {
+		return fmt.Errorf("sync compacted index: %w", err)
+	}
+
+	// 旧索引视图可能仍被点读或迭代器持有。
+	db.vlogGuard.Lock()
+	for part, source := range db.vlog.walFiles {
+		if err = source.DeleteSegmentsBelow(firstSegments[part]); err != nil {
+			break
 		}
 	}
-	_, err = db.index.PutBatch(positions)
-	return err
+	db.vlogGuard.Unlock()
+	if err != nil {
+		return fmt.Errorf("reclaim compacted value log: %w", err)
+	}
+
+	db.vlog.cleanDiscardTable()
+	if err := db.writeDBManifest(); err != nil {
+		log.Printf("write manifest after compact failed: %v", err)
+	}
+	return nil
+}
+
+func (db *DB) copyCompactPartition(part int, source *wal.WAL, stageDir string, batchLimit int, useDiscardTable bool) (wal.SegmentID, error) {
+	firstID := source.ActiveSegmentID() + 1
+	if firstID == 0 {
+		return 0, fmt.Errorf("value log segment IDs exhausted")
+	}
+	staged, err := wal.Open(wal.Options{
+		DirPath:          stageDir,
+		SegmentSize:      db.vlog.options.segmentSize,
+		SegmentFileExt:   fmt.Sprintf(valueLogFileExt, part),
+		InitialSegmentID: firstID,
+	})
+	if err != nil {
+		return 0, err
+	}
+	err = db.copyIndexedValues(part, source.NewReader(), staged, batchLimit, useDiscardTable)
+	if err == nil {
+		err = staged.Sync()
+	}
+	lastID := staged.ActiveSegmentID()
+	if err := errors.Join(err, staged.Close()); err != nil {
+		return 0, err
+	}
+	if err := source.PublishSegments(stageDir, lastID); err != nil {
+		return 0, err
+	}
+	return firstID, nil
+}
+
+func (db *DB) copyIndexedValues(part int, reader *wal.Reader, staged *wal.WAL, batchLimit int, useDiscardTable bool) error {
+	var chunks [][]byte
+	var batchBytes int
+	for {
+		chunk, pos, err := reader.Next()
+		if errors.Is(err, io.EOF) {
+			return writeCompactedValues(staged, chunks)
+		}
+		if err != nil {
+			return err
+		}
+		record := decodeValueLogRecord(chunk)
+		if record == nil {
+			return fmt.Errorf("invalid value log record at %+v", pos)
+		}
+		if useDiscardTable && db.vlog.isDiscard(part, record.uid) {
+			continue
+		}
+		current, err := db.index.Get(record.key)
+		if err != nil {
+			return err
+		}
+		if current == nil || current.partition != uint32(part) || !sameChunkPosition(current.position, pos) {
+			continue
+		}
+		chunks = append(chunks, chunk)
+		batchBytes += len(chunk)
+		if batchBytes >= batchLimit {
+			if err := writeCompactedValues(staged, chunks); err != nil {
+				return err
+			}
+			clear(chunks)
+			chunks = chunks[:0]
+			batchBytes = 0
+		}
+	}
+}
+
+func writeCompactedValues(staged *wal.WAL, chunks [][]byte) error {
+	for _, chunk := range chunks {
+		staged.PendingWrites(chunk)
+	}
+	_, err := staged.WriteAll()
+	if !errors.Is(err, wal.ErrPendingSizeTooLarge) {
+		return err
+	}
+	// 值可以放进一个段，但批次加上记录头后未必能放进一个段。
+	for _, chunk := range chunks {
+		if _, err := staged.Write(chunk); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (db *DB) indexCompactPartition(part int, source *wal.WAL, firstID wal.SegmentID, batchLimit int) error {
+	reader := source.NewReader()
+	for reader.CurrentSegmentId() < firstID {
+		reader.SkipCurrentSegment()
+	}
+
+	var positions []*KeyPosition
+	var batchBytes int
+	for {
+		chunk, pos, err := reader.Next()
+		if errors.Is(err, io.EOF) {
+			_, err := db.index.PutBatch(positions)
+			return err
+		}
+		if err != nil {
+			return err
+		}
+		record := decodeValueLogRecord(chunk)
+		if record == nil {
+			return fmt.Errorf("invalid compacted value at %+v", pos)
+		}
+		positions = append(positions, &KeyPosition{
+			key:       record.key,
+			partition: uint32(part),
+			uid:       record.uid,
+			position:  pos,
+		})
+		batchBytes += len(chunk)
+		if batchBytes >= batchLimit {
+			if _, err := db.index.PutBatch(positions); err != nil {
+				return err
+			}
+			clear(positions)
+			positions = positions[:0]
+			batchBytes = 0
+		}
+	}
+}
+
+func syncCompactionDirectory(path string) error {
+	if runtime.GOOS == "windows" {
+		// Windows 的段文件发布已经使用写穿透重命名。
+		return nil
+	}
+	dir, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer dir.Close()
+	return dir.Sync()
 }
 
 func (db *DB) GetOptions() Options {

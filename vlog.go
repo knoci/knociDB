@@ -27,11 +27,7 @@ type valueLog struct {
 	totalNumber   uint32
 	options       valueLogOptions
 
-	// 压缩期间新 ValueLog 还没替换进 walFiles，但索引可能已经指向新位置。
-	// 读路径通过 extraWALs 找到这些“临时可读”的新段（按分区隔离）。
-	mu        sync.RWMutex
-	statsMu   sync.Mutex
-	extraWALs [][]*wal.WAL
+	statsMu sync.Mutex
 }
 
 type valueLogOptions struct {
@@ -137,79 +133,23 @@ func openValueLog(options valueLogOptions) (*valueLog, error) {
 		options:       options}, nil
 }
 
-// addReadableWAL 注册压缩期间的临时 WAL，使索引更新后立刻可读。
-func (vlog *valueLog) addReadableWAL(partition int, walFile *wal.WAL) {
-	vlog.mu.Lock()
-	for len(vlog.extraWALs) <= partition {
-		vlog.extraWALs = append(vlog.extraWALs, nil)
-	}
-	vlog.extraWALs[partition] = append(vlog.extraWALs[partition], walFile)
-	vlog.mu.Unlock()
-}
-
-func (vlog *valueLog) removeReadableWAL(partition int, walFile *wal.WAL) {
-	vlog.mu.Lock()
-	if partition < len(vlog.extraWALs) {
-		list := vlog.extraWALs[partition]
-		for i, w := range list {
-			if w == walFile {
-				vlog.extraWALs[partition] = append(list[:i], list[i+1:]...)
-				break
-			}
-		}
-	}
-	vlog.mu.Unlock()
-}
-
 // 从指定位置读取值日志记录。
-// 先读正式 WAL，失败时再尝试压缩期间注册的临时 WAL。
 func (vlog *valueLog) read(pos *KeyPosition) (*ValueLogRecord, error) {
 	if pos == nil {
 		return nil, ErrKeyNotFound
 	}
-	vlog.mu.RLock()
-	var main *wal.WAL
-	if int(pos.partition) < len(vlog.walFiles) {
-		main = vlog.walFiles[pos.partition]
+	if int(pos.partition) >= len(vlog.walFiles) || vlog.walFiles[pos.partition] == nil {
+		return nil, fmt.Errorf("value log partition %d not found", pos.partition)
 	}
-	var extras []*wal.WAL
-	if int(pos.partition) < len(vlog.extraWALs) {
-		extras = append(extras, vlog.extraWALs[pos.partition]...)
+	buf, err := vlog.walFiles[pos.partition].Read(pos.position)
+	if err != nil {
+		return nil, err
 	}
-	vlog.mu.RUnlock()
-
-	var firstErr error
-	if main != nil {
-		buf, err := main.Read(pos.position)
-		if err == nil {
-			record := decodeValueLogRecord(buf)
-			if record == nil {
-				return nil, fmt.Errorf("invalid value log record at %+v", pos.position)
-			}
-			return record, nil
-		}
-		firstErr = err
+	record := decodeValueLogRecord(buf)
+	if record == nil {
+		return nil, fmt.Errorf("invalid value log record at %+v", pos.position)
 	}
-	for _, w := range extras {
-		if w == nil {
-			continue
-		}
-		buf, err := w.Read(pos.position)
-		if err == nil {
-			record := decodeValueLogRecord(buf)
-			if record == nil {
-				return nil, fmt.Errorf("invalid value log record at %+v", pos.position)
-			}
-			return record, nil
-		}
-		if firstErr == nil {
-			firstErr = err
-		}
-	}
-	if firstErr != nil {
-		return nil, firstErr
-	}
-	return nil, fmt.Errorf("value log partition %d not found", pos.partition)
+	return record, nil
 }
 
 // 将vlog记录写入，它将被写入相应的分区

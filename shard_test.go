@@ -333,12 +333,11 @@ func TestCommitLogRewrite(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	ids := db.batchRefSnapshot()
-	if err := db.commitLog.rewrite(ids); err != nil {
+	if err := db.commitLog.rewrite(db.batchRefs); err != nil {
 		t.Fatal(err)
 	}
-	if got := db.commitLog.recordCount(); got != len(ids) {
-		t.Fatalf("commit records = %d, want %d", got, len(ids))
+	if got := db.commitLog.recordCount(); got != len(db.batchRefs) {
+		t.Fatalf("commit records = %d, want %d", got, len(db.batchRefs))
 	}
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
@@ -357,27 +356,30 @@ func TestCommitLogRewrite(t *testing.T) {
 }
 
 func TestCommitLogPruning(t *testing.T) {
-	dir := t.TempDir()
 	options := DefaultOptions
-	options.DirPath = dir
+	options.DirPath = t.TempDir()
 	options.SnapshotPath = t.TempDir()
+	options.PartitionNum = 2
+	options.MemtableSize = 1 * MB
+	options.KeyHashFunction = func(key []byte) uint64 { return uint64(key[0]) }
 	db, err := Open(options)
 	if err != nil {
 		t.Fatal(err)
 	}
-	const count = commitLogPruneThreshold + 100
-	for i := 0; i < count; i++ {
-		key := []byte(fmt.Sprintf("prune-%05d", i))
-		if err := db.Put(key, key); err != nil {
+	defer db.Close()
+
+	for id := uint64(1); id <= commitLogPruneThreshold; id++ {
+		if err := db.commitLog.append(id, false); err != nil {
 			t.Fatal(err)
 		}
 	}
-	for _, sh := range db.shards {
-		db.flushMemtable(sh.active)
+	// Simulate a crash after one shard prepared a batch and before COMMIT.
+	unfinished := []byte("unfinished")
+	records := map[string]*LogRecord{
+		string(unfinished): {Key: unfinished, Value: []byte("discard"), Type: LogRecordNormal},
 	}
-	db.maybePruneCommitLog()
-	if got := db.commitLog.recordCount(); got != 0 {
-		t.Fatalf("commit log still has %d records after all WALs flushed", got)
+	if err := db.shardFor(unfinished).active.prepareBatch(records, globalBatchIDNode.Generate(), WriteOptions{Sync: true}, 2); err != nil {
+		t.Fatal(err)
 	}
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
@@ -387,10 +389,58 @@ func TestCommitLogPruning(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
+	if _, err := db.Get(unfinished); err != ErrKeyNotFound {
+		t.Fatalf("unfinished key before pruning: %v, want ErrKeyNotFound", err)
+	}
+
+	writeBatch := func(i int) {
+		t.Helper()
+		batch := db.NewBatch(BatchOptions{WriteOptions: WriteOptions{Sync: true}})
+		defer batch.Close()
+		for _, prefix := range []string{"a", "b"} {
+			key := []byte(fmt.Sprintf("%s-%02d", prefix, i))
+			if err := batch.Put(key, key); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := batch.Commit(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	const count = 16
+	writeBatch(0)
+	pruned := make(chan struct{})
+	go func() {
+		defer close(pruned)
+		db.maybePruneCommitLog()
+	}()
+	defer func() { <-pruned }()
+	for i := 1; i < count; i++ {
+		writeBatch(i)
+	}
+	<-pruned
+	if got := db.commitLog.recordCount(); got != count {
+		t.Errorf("commit log has %d records after pruning, want %d", got, count)
+	}
+
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err = Open(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Get(unfinished); err != ErrKeyNotFound {
+		t.Errorf("unfinished key after pruning and reopening: %v, want ErrKeyNotFound", err)
+	}
 	for i := 0; i < count; i++ {
-		key := []byte(fmt.Sprintf("prune-%05d", i))
-		if _, err := db.Get(key); err != nil {
-			t.Fatalf("get %s: %v", key, err)
+		for _, prefix := range []string{"a", "b"} {
+			key := []byte(fmt.Sprintf("%s-%02d", prefix, i))
+			got, err := db.Get(key)
+			if err != nil || string(got) != string(key) {
+				t.Errorf("get %s after pruning and reopening: %q, %v", key, got, err)
+			}
 		}
 	}
 }

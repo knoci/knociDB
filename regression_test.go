@@ -98,7 +98,10 @@ func TestRegressionIncrementalCompactKeepsDelete(t *testing.T) {
 }
 
 func TestRegressionCompactChunkBoundary(t *testing.T) {
-	db := openRegressionDB(t, nil)
+	db := openRegressionDB(t, func(opt *Options) {
+		opt.PartitionNum = 1
+		opt.ValueLogFileSize = 80 << 10
+	})
 	defer db.Close()
 
 	// 16(uuid)+4(keyLen)+2(key)+32732 = 32754，+7 chunk 头 = 32761；
@@ -110,12 +113,21 @@ func TestRegressionCompactChunkBoundary(t *testing.T) {
 	if err := db.Put([]byte("k2"), value); err != nil {
 		t.Fatal(err)
 	}
-	db.flushMemtable(db.activeMem)
+	if err := db.flushMemtableE(db.activeMem); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Put([]byte("k3"), value); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.flushMemtableE(db.activeMem); err != nil {
+		t.Fatal(err)
+	}
 
+	// 压缩输出需要轮转到第二个新段。
 	if err := db.Compact(); err != nil {
 		t.Fatal(err)
 	}
-	for _, key := range [][]byte{[]byte("k1"), []byte("k2")} {
+	for _, key := range [][]byte{[]byte("k1"), []byte("k2"), []byte("k3")} {
 		got, err := db.Get(key)
 		if err != nil {
 			t.Fatalf("get %s after compact: %v", key, err)
@@ -123,6 +135,119 @@ func TestRegressionCompactChunkBoundary(t *testing.T) {
 		if !bytes.Equal(got, value) {
 			t.Fatalf("value mismatch for %s", key)
 		}
+	}
+}
+
+type compactFaultIndex struct {
+	Index
+	getCalls int
+	putCalls int
+	failGet  int
+	failPut  int
+	failSync bool
+}
+
+var errCompactTestFault = errors.New("injected compaction failure")
+
+func (i *compactFaultIndex) Get(key []byte) (*KeyPosition, error) {
+	i.getCalls++
+	if i.getCalls == i.failGet {
+		return nil, errCompactTestFault
+	}
+	return i.Index.Get(key)
+}
+
+func (i *compactFaultIndex) PutBatch(positions []*KeyPosition) ([]*KeyPosition, error) {
+	i.putCalls++
+	if i.putCalls == i.failPut {
+		return nil, errCompactTestFault
+	}
+	return i.Index.PutBatch(positions)
+}
+
+func (i *compactFaultIndex) Sync() error {
+	if i.failSync {
+		return errCompactTestFault
+	}
+	return i.Index.Sync()
+}
+
+func TestRegressionCompactFailurePreservesValues(t *testing.T) {
+	for _, mode := range []struct {
+		name    string
+		compact func(*DB) error
+	}{
+		{"full", (*DB).Compact},
+		{"discard", (*DB).CompactWithDiscardtable},
+	} {
+		t.Run(mode.name, func(t *testing.T) {
+			for _, fault := range []struct {
+				name  string
+				index compactFaultIndex
+			}{
+				{"lookup_during_copy", compactFaultIndex{failGet: 2}},
+				{"second_index_update", compactFaultIndex{failPut: 2}},
+				{"index_sync", compactFaultIndex{failSync: true}},
+			} {
+				t.Run(fault.name, func(t *testing.T) {
+					db := openRegressionDB(t, func(opt *Options) {
+						opt.PartitionNum = 1
+						opt.CompactBatchCapacity = 1
+					})
+					defer db.Close()
+					keys := []string{"alpha", "beta", "gamma"}
+					for _, key := range keys {
+						if err := db.Put([]byte(key), []byte(key)); err != nil {
+							t.Fatal(err)
+						}
+					}
+					if err := db.flushMemtableE(db.shards[0].active); err != nil {
+						t.Fatal(err)
+					}
+					old, err := db.index.Get([]byte(keys[0]))
+					if err != nil || old == nil {
+						t.Fatalf("initial index position: %v, %v", old, err)
+					}
+					index := db.index
+					fault.index.Index = index
+					db.index = &fault.index
+					err = mode.compact(db)
+					db.index = index
+					if !errors.Is(err, errCompactTestFault) {
+						t.Fatalf("compaction error = %v, want injected failure", err)
+					}
+					checkValues := func(db *DB) {
+						t.Helper()
+						for _, key := range keys {
+							value, err := db.Get([]byte(key))
+							if err != nil || string(value) != key {
+								t.Fatalf("get %s after failed compaction: %q, %v", key, value, err)
+							}
+						}
+					}
+					checkValues(db)
+					if _, err := db.vlog.read(old); err != nil {
+						t.Fatalf("old segment reclaimed after failure: %v", err)
+					}
+					if err := db.Close(); err != nil {
+						t.Fatal(err)
+					}
+					reopened, err := Open(db.options)
+					if err != nil {
+						t.Fatal(err)
+					}
+					defer reopened.Close()
+					checkValues(reopened)
+					if err := mode.compact(reopened); err != nil {
+						t.Fatalf("retry compaction: %v", err)
+					}
+					checkValues(reopened)
+					if _, err := reopened.vlog.read(old); err == nil {
+						t.Fatal("successful retry retained the old segment")
+					}
+				})
+			}
+		})
 	}
 }
 

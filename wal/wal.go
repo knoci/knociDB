@@ -249,7 +249,7 @@ func (wal *WAL) NewReaderWithMax(segId SegmentID) *Reader {
 	// 获取所有段文件读取器。
 	var segmentIters []*segmentIter
 	for _, segment := range wal.olderSegments {
-		if segId == 0 || segment.id <= segId {
+		if !segment.closed && (segId == 0 || segment.id <= segId) {
 			reader := segment.NewIter()
 			segmentIters = append(segmentIters, reader)
 		}
@@ -547,6 +547,36 @@ func (wal *WAL) Close() error {
 	return wal.activeSegment.Close()
 }
 
+// PublishSegments moves a contiguous sequence of closed, synced staging
+// segments into this WAL. All existing segments stay readable.
+func (wal *WAL) PublishSegments(stagingDir string, lastID SegmentID) error {
+	wal.mu.Lock()
+	defer wal.mu.Unlock()
+
+	if lastID <= wal.activeSegment.id {
+		return fmt.Errorf("staged segment IDs must follow the active segment")
+	}
+	if err := wal.activeSegment.Sync(); err != nil {
+		return err
+	}
+	wal.durableSeq = wal.writeSeq
+	ext := wal.options.SegmentFileExt
+	for wal.activeSegment.id < lastID {
+		id := wal.activeSegment.id + 1
+		if err := publishSegmentFile(SegmentFileName(stagingDir, ext, id), SegmentFileName(wal.options.DirPath, ext, id)); err != nil {
+			return err
+		}
+		newSegment, err := openSegmentFile(wal.options.DirPath, ext, id)
+		if err != nil {
+			return err
+		}
+		wal.olderSegments[wal.activeSegment.id] = wal.activeSegment
+		wal.activeSegment = newSegment
+		wal.bytesWrite = 0
+	}
+	return nil
+}
+
 // DeleteSegmentsBelow 删除所有 ID 小于 id 的旧段文件。
 // 压缩写入新段后，索引已经指向新段，可以把旧段清掉；崩溃时旧段仍可被读取。
 func (wal *WAL) DeleteSegmentsBelow(id SegmentID) error {
@@ -557,7 +587,7 @@ func (wal *WAL) DeleteSegmentsBelow(id SegmentID) error {
 		if segID >= id {
 			continue
 		}
-		if err := segment.Remove(); err != nil {
+		if err := segment.Remove(); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return err
 		}
 		delete(wal.olderSegments, segID)
