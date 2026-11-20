@@ -15,4 +15,7 @@ var (
 	ErrUnsupportedIndex         = errors.New("unsupported index type")
 	ErrCrossShardBatch          = errors.New("batch spans multiple shards")
 	ErrCrossShardScan           = errors.New("cross-shard scan is not supported")
+	ErrInvalidRaftCommand       = errors.New("invalid raft command")
+	ErrStaleShardMapEpoch       = errors.New("stale shard map epoch")
+	ErrShardMigrationConflict   = errors.New("shard migration conflicts with the recorded move or current membership")
 )

@@ -14,19 +14,24 @@ import (
 
 func main() {
 	addr := flag.String("addr", "127.0.0.1:50051", "grpc server addr")
+	tlsEnabled := flag.Bool("tls", false, "use TLS with system trust roots when no CA file is given")
 	tlsCA := flag.String("tls-ca", "", "ca cert file")
 	tlsServerName := flag.String("tls-server-name", "", "tls server name for verify")
+	clientCert := flag.String("client-cert", "", "client certificate file for mTLS")
+	clientKey := flag.String("client-key", "", "client key file for mTLS")
 	token := flag.String("token", "", "auth token")
 	flag.Parse()
 
 	var cli *knocigrpc.Client
 	var err error
-	if *tlsCA != "" || *token != "" {
+	if *tlsEnabled || *tlsCA != "" || *tlsServerName != "" || *clientCert != "" || *clientKey != "" || *token != "" {
 		cli, err = knocigrpc.DialSecure(*addr, knocigrpc.ClientSecurityOptions{
-			TLSCACertFile: *tlsCA,
-			TLSServerName: *tlsServerName,
-			EnableAuth:    *token != "",
-			AuthToken:     *token,
+			TLSCACertFile:  *tlsCA,
+			TLSServerName:  *tlsServerName,
+			ClientCertFile: *clientCert,
+			ClientKeyFile:  *clientKey,
+			EnableAuth:     *token != "",
+			AuthToken:      *token,
 		})
 	} else {
 		cli, err = knocigrpc.Dial(*addr)

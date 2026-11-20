@@ -11,6 +11,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/knoci/knocidb/util"
 )
 
 const (
@@ -563,7 +565,7 @@ func (wal *WAL) PublishSegments(stagingDir string, lastID SegmentID) error {
 	ext := wal.options.SegmentFileExt
 	for wal.activeSegment.id < lastID {
 		id := wal.activeSegment.id + 1
-		if err := publishSegmentFile(SegmentFileName(stagingDir, ext, id), SegmentFileName(wal.options.DirPath, ext, id)); err != nil {
+		if err := util.RenameDurable(SegmentFileName(stagingDir, ext, id), SegmentFileName(wal.options.DirPath, ext, id)); err != nil {
 			return err
 		}
 		newSegment, err := openSegmentFile(wal.options.DirPath, ext, id)

@@ -88,30 +88,41 @@ type Iterator struct {
 	versionMap map[int]*singleIter // 映射 version->singleIter
 	db         *DB
 	locked     bool
+	startKey   []byte
+	endKey     []byte
 }
 
 // Rewind 将迭代器定位到第一个键
 func (mi *Iterator) Rewind() {
+	if len(mi.startKey) > 0 {
+		mi.Seek(mi.startKey)
+		return
+	}
+	h := mi.h[:0]
 	for _, v := range mi.itrs {
 		v.iter.Rewind()
+		if v.iter.Valid() {
+			v.idx = len(h)
+			h = append(h, v)
+		}
 	}
-	h := iterHeap(mi.itrs)
 	heap.Init(&h)
 	mi.h = h
 }
 
 // Seek 将迭代器移动到大于等于（当reverse为true时为小于等于）指定键的位置
 func (mi *Iterator) Seek(key []byte) {
-	seekItrs := make([]*singleIter, 0)
+	if len(mi.startKey) > 0 && bytes.Compare(key, mi.startKey) < 0 {
+		key = mi.startKey
+	}
+	h := mi.h[:0]
 	for _, v := range mi.itrs {
 		v.iter.Seek(key)
 		if v.iter.Valid() {
-			// 重置索引
-			v.idx = len(seekItrs)
-			seekItrs = append(seekItrs, v)
+			v.idx = len(h)
+			h = append(h, v)
 		}
 	}
-	h := iterHeap(seekItrs)
 	heap.Init(&h)
 	mi.h = h
 }
@@ -207,6 +218,9 @@ func (mi *Iterator) Valid() bool {
 		return false
 	}
 	topIter := mi.h[0]
+	if len(mi.endKey) > 0 && bytes.Compare(topIter.iter.Key(), mi.endKey) > 0 {
+		return false
+	}
 	// TTL 过期 key 对迭代器不可见；这里只跳过，后台 sweeper 负责物理删除。
 	if mi.db.ttl != nil {
 		if expired, err := mi.db.ttl.isExpired(topIter.iter.Key(), time.Now().UnixMilli()); err == nil && expired {
@@ -383,7 +397,7 @@ func (db *DB) NewIterator(options IteratorOptions) (*Iterator, error) {
 		version++
 	}
 
-	h := iterHeap(itrs)
+	h := append(iterHeap(nil), itrs...)
 	heap.Init(&h)
 
 	success = true

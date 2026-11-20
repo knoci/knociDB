@@ -2,9 +2,17 @@ package knocigrpc
 
 import (
 	"context"
-
-	"github.com/knoci/knocidb"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"encoding/pem"
+	"math/big"
+	"net"
+	"os"
+	"path/filepath"
 	"testing"
+	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -101,35 +109,76 @@ func TestTokenCredentials(t *testing.T) {
 	if md["authorization"] != "Bearer secret" || md["x-api-key"] != "secret" {
 		t.Fatalf("unexpected metadata: %#v", md)
 	}
-	if creds.RequireTransportSecurity() {
-		t.Fatal("token credentials should not require TLS by themselves")
+	if !creds.RequireTransportSecurity() {
+		t.Fatal("token credentials must require TLS")
 	}
 }
 
-func TestStartSecureWithoutTLS(t *testing.T) {
-	dbOpts := knocidb.DefaultOptions
-	dbOpts.DirPath = t.TempDir()
-	db, err := knocidb.Open(dbOpts)
-	if err != nil {
+func TestSecureRejectsInvalidConfiguration(t *testing.T) {
+	cert, key := testTLSCertificate(t)
+	badCA := filepath.Join(t.TempDir(), "bad-ca.pem")
+	if err := os.WriteFile(badCA, []byte("invalid PEM"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
+	for _, opt := range []ServerSecurityOptions{
+		{},
+		{TLSCertFile: cert},
+		{TLSCertFile: key, TLSKeyFile: key},
+		{TLSCertFile: cert, TLSKeyFile: key, EnableAuth: true},
+		{TLSCertFile: cert, TLSKeyFile: key, RequireClientCert: true},
+		{TLSCertFile: cert, TLSKeyFile: key, TLSClientCAFile: cert},
+		{TLSCertFile: cert, TLSKeyFile: key, RequireClientCert: true, TLSClientCAFile: badCA},
+	} {
+		if srv, _, err := StartSecure("127.0.0.1:0", nil, opt); err == nil {
+			srv.Stop()
+			t.Errorf("unexpectedly accepted invalid server configuration: %+v", opt)
+		}
+	}
+	for _, opt := range []ClientSecurityOptions{
+		{TLSCACertFile: badCA},
+		{ClientCertFile: cert},
+		{ClientCertFile: cert, ClientKeyFile: cert},
+		{EnableAuth: true},
+	} {
+		if cli, err := DialSecure("127.0.0.1:0", opt); err == nil {
+			_ = cli.Close()
+			t.Errorf("unexpectedly accepted invalid client configuration: %+v", opt)
+		}
+	}
+}
 
-	srv, lis, err := StartSecure("127.0.0.1:0", db, ServerSecurityOptions{})
+func testTLSCertificate(t *testing.T) (string, string) {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if srv == nil || lis == nil {
-		t.Fatal("nil server or listener")
+	now := time.Now()
+	template := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		NotBefore:             now.Add(-time.Minute),
+		NotAfter:              now.Add(time.Hour),
+		IPAddresses:           []net.IP{net.ParseIP("127.0.0.1")},
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
 	}
-	srv.GracefulStop()
-
-	srv, lis, err = StartSecure("127.0.0.1:0", db, ServerSecurityOptions{EnableAuth: true, AuthToken: "token"})
+	cert, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if srv == nil || lis == nil {
-		t.Fatal("nil auth server or listener")
+	der, err := x509.MarshalPKCS8PrivateKey(key)
+	if err != nil {
+		t.Fatal(err)
 	}
-	srv.GracefulStop()
+	dir := t.TempDir()
+	certPath, keyPath := filepath.Join(dir, "cert.pem"), filepath.Join(dir, "key.pem")
+	if err := os.WriteFile(certPath, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: cert}), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(keyPath, pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der}), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return certPath, keyPath
 }

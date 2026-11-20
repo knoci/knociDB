@@ -1,6 +1,6 @@
 package knocidb
 
-import "fmt"
+import "sort"
 
 // ShardMove 描述 PlanRebalance 产生的一次副本迁移。
 type ShardMove struct {
@@ -36,14 +36,20 @@ func (c *ClusterDB) PlanRebalance() ([]ShardMove, error) {
 	}
 
 	var best *ShardMove
-	bestDiff := 0
+	bestDiff := 1
+	candidates := make([]uint64, 0, len(addresses))
+	for id := range addresses {
+		candidates = append(candidates, id)
+	}
+	sort.Slice(candidates, func(i, j int) bool { return candidates[i] < candidates[j] })
 	for _, m := range memberships {
 		voters := make(map[uint64]struct{}, len(m.Voters))
 		for _, id := range m.Voters {
 			voters[id] = struct{}{}
 		}
 		for _, from := range m.Voters {
-			for to, addr := range addresses {
+			for _, to := range candidates {
+				addr := addresses[to]
 				if to == from || addr == "" {
 					continue
 				}
@@ -95,13 +101,6 @@ func (c *ClusterDB) RebalanceAll(maxMoves int) ([]ShardMove, error) {
 // 可重复调用来逐步收敛。
 // ExecuteShardMove 执行一个已经计算好的迁移。
 func (c *ClusterDB) ExecuteShardMove(move ShardMove) error {
-	leader, err := c.leaderForShard(move.ShardID)
-	if err != nil {
-		return err
-	}
-	if leader != c.config.NodeID {
-		return fmt.Errorf("shard %d leader is node %d, not local node", move.ShardID, leader)
-	}
 	return c.MigrateShard(move.ShardID, move.FromNode, move.ToNode, move.ToAddress)
 }
 
@@ -115,7 +114,7 @@ func (c *ClusterDB) Rebalance() ([]ShardMove, error) {
 	}
 	move := moves[0]
 	if err := c.ExecuteShardMove(move); err != nil {
-		return nil, err
+		return moves, err
 	}
 	return moves, nil
 }

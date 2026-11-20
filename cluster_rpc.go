@@ -34,6 +34,9 @@ const (
 
 // Put 写入 key。若当前节点不是 Leader，会尝试转发给已知 Leader。
 func (c *ClusterDB) Put(key, value []byte) error {
+	if len(key) == 0 {
+		return ErrKeyIsEmpty
+	}
 	shard := c.shardFor(key)
 	var lastErr error
 	for attempt := 0; attempt < 5; attempt++ {
@@ -58,6 +61,9 @@ func (c *ClusterDB) Put(key, value []byte) error {
 
 // Delete 删除 key。若当前节点不是 Leader，会尝试转发给已知 Leader。
 func (c *ClusterDB) Delete(key []byte) error {
+	if len(key) == 0 {
+		return ErrKeyIsEmpty
+	}
 	shard := c.shardFor(key)
 	var lastErr error
 	for attempt := 0; attempt < 5; attempt++ {
@@ -204,9 +210,11 @@ func (c *ClusterDB) handleRPCOnce(conn net.Conn) bool {
 		return true
 	}
 	if op == rpcOpMeta {
-		var meta ShardMapMeta
-		if err := json.Unmarshal(value, &meta); err != nil {
-			fail(rpcStatusError, err.Error())
+		var meta shardMapUpdate
+		if err := json.Unmarshal(value, &meta); err != nil || meta.ShardCount != c.config.ShardCount ||
+			(meta.Migration == nil && meta.Epoch == 0) ||
+			(meta.Migration != nil && (meta.Epoch != 0 || !meta.Migration.valid(c.config.ShardCount))) {
+			fail(rpcStatusError, ErrInvalidRaftCommand.Error())
 			return true
 		}
 		mid := c.config.MetadataGroupID()
@@ -221,31 +229,34 @@ func (c *ClusterDB) handleRPCOnce(conn net.Conn) bool {
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		data, _ := json.Marshal(meta)
-		if _, err := c.nodeHost.SyncPropose(ctx, c.nodeHost.GetNoOPSession(mid), data); err != nil {
+		result, err := c.nodeHost.SyncPropose(ctx, c.nodeHost.GetNoOPSession(mid), value)
+		if err == nil {
+			err = raftResultError(result)
+		}
+		if err != nil {
 			fail(rpcStatusForError(err), err.Error())
+			return true
+		}
+		if meta.Migration != nil {
+			var out [8]byte
+			binary.BigEndian.PutUint64(out[:], result.Value)
+			_ = writeRPCResponse(conn, rpcStatusOK, out[:])
 			return true
 		}
 		_ = writeRPCResponse(conn, rpcStatusOK, nil)
 		return true
 	}
 	shard := c.shardFor(key)
-	var batch BatchCommand
 	if op == rpcOpBatch {
-		if err := json.Unmarshal(value, &batch); err != nil {
+		var batch raftWriteCommand
+		if err := json.Unmarshal(value, &batch); err != nil || batch.Op != OpBatch {
+			fail(rpcStatusError, ErrInvalidRaftCommand.Error())
+			return true
+		}
+		shard, err = c.shardForBatch(batch.Commands)
+		if err != nil {
 			fail(rpcStatusError, err.Error())
 			return true
-		}
-		if len(batch.Commands) == 0 {
-			fail(rpcStatusError, "empty batch")
-			return true
-		}
-		shard = c.shardFor(batch.Commands[0].Key)
-		for _, cmd := range batch.Commands[1:] {
-			if c.shardFor(cmd.Key) != shard {
-				fail(rpcStatusError, ErrCrossShardBatch.Error())
-				return true
-			}
 		}
 	}
 	if leader, err := c.leaderForShard(shard); err != nil || leader != c.config.NodeID {
@@ -273,7 +284,7 @@ func (c *ClusterDB) handleRPCOnce(conn net.Conn) bool {
 		}
 		_ = writeRPCResponse(conn, rpcStatusOK, got)
 	case rpcOpBatch:
-		if err := c.batchWriteLocal(batch, shard); err != nil {
+		if err := c.proposeData(shard, value, 10*time.Second); err != nil {
 			fail(rpcStatusForError(err), err.Error())
 			return true
 		}
@@ -429,7 +440,7 @@ func (c *ClusterDB) rpcCall(addr string, op byte, key, value []byte) ([]byte, er
 		return nil, ErrClusterUnauthorized
 	default:
 		c.rpcErrors.Add(1)
-		return nil, errors.New(string(payload))
+		return nil, decodeRaftError(string(payload))
 	}
 }
 

@@ -109,9 +109,7 @@ func (rdb *ClusterDB) start() error {
 
 	closeShardDBs := func() {
 		for _, sh := range rdb.shards {
-			if sh.db != nil {
-				_ = sh.db.Close()
-			}
+			_ = sh.sm.Close()
 		}
 		rdb.shards = nil
 	}
@@ -140,7 +138,6 @@ func (rdb *ClusterDB) start() error {
 		shard := &clusterShard{
 			id:      uint32(i),
 			groupID: groupID,
-			db:      db,
 		}
 		shard.sm = NewKVStateMachine(groupID, rdb.config.NodeID, db)
 		rdb.shards = append(rdb.shards, shard)
@@ -301,104 +298,59 @@ func (rdb *ClusterDB) GetLeaderID() (uint64, error) {
 
 // putLocal 在当前节点通过 Raft 共识写入键值对。
 func (rdb *ClusterDB) putLocal(key, value []byte, shard uint32) error {
-	if rdb.nodeHost == nil || !rdb.state {
-		return ErrNodeNotStarted
-	}
-	groupID := rdb.config.GroupIDForShard(shard)
-	// 创建命令
-	cmd := Command{
-		Op:    OpPut,
-		Key:   key,
-		Value: value,
-	}
-
-	// 序列化命令
-	data, err := json.Marshal(cmd)
-	if err != nil {
-		return err
-	}
-
-	// 根据Sync字段决定使用同步还是异步模式
-	if rdb.Sync {
-		// 使用同步Propose方法
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		_, err := rdb.nodeHost.SyncPropose(ctx, rdb.nodeHost.GetNoOPSession(groupID), data)
-		return err
-	} else {
-		// 使用异步Propose方法
-		rs, err := rdb.nodeHost.Propose(rdb.nodeHost.GetNoOPSession(groupID), data, 5*time.Second)
-		if err != nil {
-			return err
-		}
-
-		// 等待操作完成
-		res := <-rs.ResultC()
-		if res.Completed() {
-			rs.Release()
-			return nil
-		}
-
-		// 处理错误
-		if res.Timeout() {
-			return ErrTimeout
-		}
-		if res.Terminated() {
-			return ErrCanceled
-		}
-		rs.Release()
-		return errors.New("propose failed")
-	}
+	return rdb.proposeWrite(Command{Op: OpPut, Key: key, Value: value}, shard)
 }
 
 // deleteLocal 在当前节点通过 Raft 共识删除键。
 func (rdb *ClusterDB) deleteLocal(key []byte, shard uint32) error {
-	if rdb.nodeHost == nil || !rdb.state {
-		return ErrNodeNotStarted
-	}
-	groupID := rdb.config.GroupIDForShard(shard)
-	// 创建命令
-	cmd := Command{
-		Op:  OpDelete,
-		Key: key,
-	}
+	return rdb.proposeWrite(Command{Op: OpDelete, Key: key}, shard)
+}
 
-	// 序列化命令
+func (rdb *ClusterDB) proposeWrite(cmd Command, shard uint32) error {
+	if err := validateRaftWrite(cmd); err != nil {
+		return err
+	}
 	data, err := json.Marshal(cmd)
 	if err != nil {
 		return err
 	}
+	return rdb.proposeData(shard, data, 5*time.Second)
+}
 
-	// 根据Sync字段决定使用同步还是异步模式
+func (rdb *ClusterDB) proposeData(shard uint32, data []byte, timeout time.Duration) error {
+	rdb.mu.RLock()
+	nodeHost := rdb.nodeHost
+	started := rdb.state && nodeHost != nil
+	rdb.mu.RUnlock()
+	if !started {
+		return ErrNodeNotStarted
+	}
+	session := nodeHost.GetNoOPSession(rdb.config.GroupIDForShard(shard))
 	if rdb.Sync {
-		// 使用同步Propose方法
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
 		defer cancel()
-		_, err := rdb.nodeHost.SyncPropose(ctx, rdb.nodeHost.GetNoOPSession(groupID), data)
-		return err
-	} else {
-		// 使用异步Propose方法
-		rs, err := rdb.nodeHost.Propose(rdb.nodeHost.GetNoOPSession(groupID), data, 5*time.Second)
+		result, err := nodeHost.SyncPropose(ctx, session, data)
 		if err != nil {
 			return err
 		}
+		return raftResultError(result)
+	}
 
-		// 等待操作完成
-		res := <-rs.ResultC()
-		if res.Completed() {
-			rs.Release()
-			return nil
-		}
-
-		// 处理错误
-		if res.Timeout() {
-			return ErrTimeout
-		}
-		if res.Terminated() {
-			return ErrCanceled
-		}
-		rs.Release()
-		return errors.New("delete failed")
+	rs, err := nodeHost.Propose(session, data, timeout)
+	if err != nil {
+		return err
+	}
+	res := <-rs.ResultC()
+	defer rs.Release()
+	switch {
+	case res.Completed():
+		return raftResultError(res.GetResult())
+	case res.Timeout():
+		return ErrTimeout
+	case res.Terminated():
+		return ErrCanceled
+	default:
+		return errors.New("raft proposal did not complete")
 	}
 }
 
@@ -473,17 +425,18 @@ func (rdb *ClusterDB) getLocal(key []byte, shard uint32) ([]byte, error) {
 
 // BatchWrite 通过 Raft 共识批量写入。所有命令必须落在同一个 shard。
 func (rdb *ClusterDB) BatchWrite(commands []Command, batchID uint64) error {
-	if rdb.nodeHost == nil || !rdb.state {
+	rdb.mu.RLock()
+	started := rdb.state && rdb.nodeHost != nil
+	rdb.mu.RUnlock()
+	if !started {
 		return ErrNodeNotStarted
 	}
 	if len(commands) == 0 {
 		return nil
 	}
-	shard := rdb.shardFor(commands[0].Key)
-	for _, cmd := range commands[1:] {
-		if rdb.shardFor(cmd.Key) != shard {
-			return ErrCrossShardBatch
-		}
+	shard, err := rdb.shardForBatch(commands)
+	if err != nil {
+		return err
 	}
 	batchCmd := BatchCommand{Op: OpBatch, Commands: commands, BatchID: batchID}
 	data, err := json.Marshal(batchCmd)
@@ -501,7 +454,7 @@ func (rdb *ClusterDB) BatchWrite(commands []Command, batchID uint64) error {
 			time.Sleep(100 * time.Millisecond)
 			continue
 		}
-		err := rdb.batchWriteLocal(batchCmd, shard)
+		err := rdb.proposeData(shard, data, 10*time.Second)
 		if !errors.Is(err, ErrNotLeader) {
 			return err
 		}
@@ -511,38 +464,21 @@ func (rdb *ClusterDB) BatchWrite(commands []Command, batchID uint64) error {
 	return lastErr
 }
 
-func (rdb *ClusterDB) batchWriteLocal(batchCmd BatchCommand, shard uint32) error {
-	if rdb.nodeHost == nil || !rdb.state {
-		return ErrNodeNotStarted
+// shardForBatch validates every command before routing the batch.
+func (rdb *ClusterDB) shardForBatch(commands []Command) (uint32, error) {
+	if len(commands) == 0 {
+		return 0, ErrInvalidRaftCommand
 	}
-	groupID := rdb.config.GroupIDForShard(shard)
-	data, err := json.Marshal(batchCmd)
-	if err != nil {
-		return err
+	shard := rdb.shardFor(commands[0].Key)
+	for i, cmd := range commands {
+		if err := validateRaftWrite(cmd); err != nil {
+			return 0, fmt.Errorf("command %d: %w", i+1, err)
+		}
+		if rdb.shardFor(cmd.Key) != shard {
+			return 0, ErrCrossShardBatch
+		}
 	}
-	if rdb.Sync {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		_, err := rdb.nodeHost.SyncPropose(ctx, rdb.nodeHost.GetNoOPSession(groupID), data)
-		return err
-	}
-	rs, err := rdb.nodeHost.Propose(rdb.nodeHost.GetNoOPSession(groupID), data, 10*time.Second)
-	if err != nil {
-		return err
-	}
-	res := <-rs.ResultC()
-	if res.Completed() {
-		rs.Release()
-		return nil
-	}
-	if res.Timeout() {
-		return ErrTimeout
-	}
-	if res.Terminated() {
-		return ErrCanceled
-	}
-	rs.Release()
-	return errors.New("batch write failed")
+	return shard, nil
 }
 
 // GetClusterMembership 获取集群成员信息
@@ -633,34 +569,29 @@ func (rdb *ClusterDB) changeMembership(add bool, nonVoting bool, nodeID uint64, 
 		return ErrNodeNotStarted
 	}
 	for _, groupID := range rdb.groupIDs() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		members, err := rdb.nodeHost.SyncGetShardMembership(ctx, groupID)
+		cancel()
+		if err != nil {
+			return err
+		}
 		if rdb.Sync {
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-			var err error
-			switch {
-			case add && nonVoting:
-				err = rdb.nodeHost.SyncRequestAddNonVoting(ctx, groupID, nodeID, address, 0)
-			case add:
-				err = rdb.nodeHost.SyncRequestAddReplica(ctx, groupID, nodeID, address, 0)
-			default:
-				err = rdb.nodeHost.SyncRequestDeleteReplica(ctx, groupID, nodeID, 0)
-			}
+			err := changeReplica(ctx, rdb.nodeHost, groupID, members.ConfigChangeID, nodeID, address, add, nonVoting)
 			cancel()
 			if err != nil {
 				return err
 			}
 			continue
 		}
-		var (
-			rs  *dragonboat.RequestState
-			err error
-		)
+		var rs *dragonboat.RequestState
 		switch {
 		case add && nonVoting:
-			rs, err = rdb.nodeHost.RequestAddNonVoting(groupID, nodeID, address, 0, 30*time.Second)
+			rs, err = rdb.nodeHost.RequestAddNonVoting(groupID, nodeID, address, members.ConfigChangeID, 30*time.Second)
 		case add:
-			rs, err = rdb.nodeHost.RequestAddReplica(groupID, nodeID, address, 0, 30*time.Second)
+			rs, err = rdb.nodeHost.RequestAddReplica(groupID, nodeID, address, members.ConfigChangeID, 30*time.Second)
 		default:
-			rs, err = rdb.nodeHost.RequestDeleteReplica(groupID, nodeID, 0, 30*time.Second)
+			rs, err = rdb.nodeHost.RequestDeleteReplica(groupID, nodeID, members.ConfigChangeID, 30*time.Second)
 		}
 		if err != nil {
 			return err

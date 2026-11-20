@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"hash/crc32"
 	"io"
 	"os"
@@ -204,12 +205,30 @@ func TestKVStateMachine_Update(t *testing.T) {
 			Value: []byte("invalid-value"),
 		}
 
-		entry := createTestEntry(t, 99, cmd)
-		_, err := sm.Update(entry)
-		assert.Error(t, err)
+		entry := createTestEntry(t, 5, cmd)
+		result, err := sm.Update(entry)
+		require.NoError(t, err)
+		require.ErrorIs(t, raftResultError(result), ErrInvalidRaftCommand)
+		require.Equal(t, uint64(5), sm.AppliedIndex())
+	})
 
-		// appliedIndex不应该更新
-		assert.Equal(t, uint64(4), sm.appliedIndex)
+	t.Run("InvalidBatchDoesNotApplyEarlierCommands", func(t *testing.T) {
+		entry := createTestEntry(t, 6, BatchCommand{Op: OpBatch, Commands: []Command{
+			{Op: OpPut, Key: []byte("batch-key1"), Value: []byte("must-not-apply")},
+			{Op: OpDelete},
+		}})
+		result, err := sm.Update(entry)
+		require.NoError(t, err)
+		require.ErrorIs(t, raftResultError(result), ErrKeyIsEmpty)
+		require.Equal(t, uint64(6), sm.AppliedIndex())
+		value, err := db.Get([]byte("batch-key1"))
+		require.NoError(t, err)
+		require.Equal(t, []byte("batch-value1"), value)
+
+		result, err = sm.Update(createTestEntry(t, 7, Command{Op: OpPut, Key: []byte("next"), Value: []byte("value")}))
+		require.NoError(t, err)
+		require.NoError(t, raftResultError(result))
+		require.Equal(t, uint64(7), sm.AppliedIndex())
 	})
 
 	t.Run("AlreadyAppliedEntry", func(t *testing.T) {
@@ -220,13 +239,20 @@ func TestKVStateMachine_Update(t *testing.T) {
 		}
 
 		// 使用已应用的索引
-		entry := createTestEntry(t, 4, cmd)
+		entry := createTestEntry(t, 7, cmd)
 		result, err := sm.Update(entry)
 		require.NoError(t, err)
 		assert.Equal(t, uint64(0), result.Value) // 不应处理任何命令
 
 		// appliedIndex不应该更新
-		assert.Equal(t, uint64(4), sm.appliedIndex)
+		assert.Equal(t, uint64(7), sm.appliedIndex)
+	})
+
+	t.Run("StorageFailureRemainsFatal", func(t *testing.T) {
+		db.setFlushError(errors.New("injected write failure"))
+		_, err := sm.Update(createTestEntry(t, 8, Command{Op: OpPut, Key: []byte("next"), Value: []byte("value")}))
+		require.ErrorIs(t, err, ErrFlushFailed)
+		require.Equal(t, uint64(7), sm.AppliedIndex())
 	})
 }
 

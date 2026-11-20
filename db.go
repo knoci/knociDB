@@ -9,11 +9,11 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"runtime"
 	"sync"
 	"syscall"
 	"time"
 
+	"github.com/knoci/knocidb/util"
 	"github.com/knoci/knocidb/wal"
 
 	"github.com/dgraph-io/badger/v4/y"
@@ -131,6 +131,9 @@ func Open(options Options) (*DB, error) {
 	}()
 
 	// 持锁后再恢复，避免两个进程同时导入同一快照。
+	if err := recoverSnapshotRestore(options.DirPath); err != nil {
+		return nil, fmt.Errorf("recover interrupted snapshot import: %w", err)
+	}
 	if err := restoreFromObjectTier(options); err != nil {
 		return nil, err
 	}
@@ -435,10 +438,27 @@ func (db *DB) uploadColdSegments(skipActive bool) {
 // 将closed标志设置为true。
 // 关闭后不能再使用DB实例。
 func (db *DB) Close() error {
+	_, err := db.closeAndRun(nil)
+	return err
+}
+
+func (db *DB) closeAndRun(afterClose func() error) (ran bool, err error) {
 	db.closeOnce.Do(func() {
+		ran = true
+		defer func() {
+			if db.fileLock != nil {
+				_ = db.fileLock.Unlock()
+			}
+		}()
 		db.closeErr = db.closeInternal()
+		if db.closeErr == nil && afterClose != nil {
+			err = afterClose()
+		}
 	})
-	return db.closeErr
+	if db.closeErr != nil {
+		return ran, db.closeErr
+	}
+	return ran, err
 }
 
 func (db *DB) closeInternal() error {
@@ -447,13 +467,6 @@ func (db *DB) closeInternal() error {
 	db.snapshotsClosed = true
 	db.snapshotMu.Unlock()
 	db.snapshotWG.Wait()
-
-	// 无论中途哪个资源关闭失败，都必须释放文件锁，否则同目录无法再次打开。
-	defer func() {
-		if db.fileLock != nil {
-			_ = db.fileLock.Unlock()
-		}
-	}()
 
 	// 先停止 TTL 后台清理，避免关闭 bbolt 后仍有扫描。
 	if db.ttlStop != nil {
@@ -1149,7 +1162,7 @@ func (db *DB) compact(useDiscardTable bool) error {
 	if err := copyGroup.Wait(); err != nil {
 		return err
 	}
-	if err := syncCompactionDirectory(db.vlog.options.dirPath); err != nil {
+	if err := util.SyncDir(db.vlog.options.dirPath); err != nil {
 		return fmt.Errorf("sync compacted segment names: %w", err)
 	}
 
@@ -1309,19 +1322,6 @@ func (db *DB) indexCompactPartition(part int, source *wal.WAL, firstID wal.Segme
 			batchBytes = 0
 		}
 	}
-}
-
-func syncCompactionDirectory(path string) error {
-	if runtime.GOOS == "windows" {
-		// Windows 的段文件发布已经使用写穿透重命名。
-		return nil
-	}
-	dir, err := os.Open(path)
-	if err != nil {
-		return err
-	}
-	defer dir.Close()
-	return dir.Sync()
 }
 
 func (db *DB) GetOptions() Options {

@@ -207,6 +207,9 @@ type ClusterOptions struct {
 	ShardMapEpoch uint64
 	// IsLearner 让本节点以 non-voting 成员启动，等待 leader 提升。
 	IsLearner bool
+	// OrderedConfigChange 要求成员变更携带当前配置版本。仅在新建集群时启用，
+	// 所有节点必须使用相同的设置，避免改变历史成员变更日志的回放语义。
+	OrderedConfigChange bool
 }
 
 // GetNodeHostOptions 返回Dragonboat节点主机配置
@@ -228,6 +231,7 @@ func (c *ClusterOptions) GetRaftConfig() config.Config {
 		ElectionRTT:             c.ElectionRTTMs,
 		HeartbeatRTT:            c.HeartbeatRTTMs,
 		CheckQuorum:             true,
+		OrderedConfigChange:     c.OrderedConfigChange,
 		SnapshotEntries:         c.SnapshotIntervalSeconds,
 		CompactionOverhead:      5,
 		IsNonVoting:             c.IsLearner,

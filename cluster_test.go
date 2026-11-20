@@ -261,6 +261,20 @@ func TestClusterDB(t *testing.T) {
 		assert.Error(t, err)
 	})
 
+	t.Run("RejectsInvalidWritesBeforeProposal", func(t *testing.T) {
+		index := nm.stateMachine.AppliedIndex()
+		require.ErrorIs(t, nm.Put(nil, []byte("value")), ErrKeyIsEmpty)
+		require.ErrorIs(t, nm.Delete(nil), ErrKeyIsEmpty)
+		require.ErrorIs(t, nm.BatchWrite([]Command{
+			{Op: OpPut, Key: []byte("pending"), Value: []byte("value")},
+			{Op: OpBatch, Key: []byte("invalid")},
+		}, 1), ErrInvalidRaftCommand)
+		require.Equal(t, index, nm.stateMachine.AppliedIndex())
+		_, err := nm.Get([]byte("pending"))
+		require.ErrorIs(t, err, ErrKeyNotFound)
+		require.NoError(t, nm.Put([]byte("next"), []byte("value")))
+	})
+
 	t.Run("GetClusterMembership", func(t *testing.T) {
 		members, err := nm.GetClusterMembership()
 		require.NoError(t, err)
@@ -707,6 +721,16 @@ func TestShardedClusterSingleNode(t *testing.T) {
 	require.ErrorIs(t, err, ErrCrossShardBatch)
 }
 
+func (c *ClusterDB) dbForShard(shard uint32) (*DB, error) {
+	sm, err := c.stateMachineForShard(shard)
+	if err != nil {
+		return nil, err
+	}
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	return sm.db.(*DB), nil
+}
+
 func TestClusterScanSingleShard(t *testing.T) {
 	dir := t.TempDir()
 	addr := freeClusterAddress(t)
@@ -723,17 +747,34 @@ func TestClusterScanSingleShard(t *testing.T) {
 
 	require.NoError(t, nm.Put([]byte("a"), []byte("1")))
 	require.NoError(t, nm.Put([]byte("b"), []byte("2")))
-	it, err := nm.Scan([]byte("a"), []byte("z"))
-	require.NoError(t, err)
-	defer it.Close()
+	require.NoError(t, nm.Put([]byte("c"), []byte("3")))
+	checkRange := func() {
+		t.Helper()
+		it, err := nm.Scan([]byte("b"), []byte("b"))
+		require.NoError(t, err)
+		defer it.Close()
 
-	got := make(map[string]string)
-	for it.Valid() {
-		got[string(it.Key())] = string(it.Value())
+		require.True(t, it.Valid())
+		require.Equal(t, "b", string(it.Key()))
+		require.Equal(t, "2", string(it.Value()))
 		it.Next()
+		require.False(t, it.Valid())
+		it.Seek([]byte("a"))
+		require.True(t, it.Valid())
+		require.Equal(t, "b", string(it.Key()))
+		it.Seek([]byte("c"))
+		require.False(t, it.Valid())
+		it.Rewind()
+		require.True(t, it.Valid())
+		require.Equal(t, "b", string(it.Key()))
 	}
-	require.Equal(t, "1", got["a"])
-	require.Equal(t, "2", got["b"])
+	checkRange()
+
+	var snapshot bytes.Buffer
+	require.NoError(t, nm.stateMachine.SaveSnapshot(&snapshot, nil, nil))
+	checkRange()
+	require.NoError(t, nm.stateMachine.RecoverFromSnapshot(&snapshot, nil, nil))
+	checkRange()
 }
 
 func TestClusterShardObjectTierSnapshot(t *testing.T) {
@@ -988,13 +1029,16 @@ func TestShardMapStateMachine(t *testing.T) {
 
 	// Stale and invalid updates are rejected.
 	stale, _ := json.Marshal(ShardMapMeta{Epoch: 1, ShardCount: 3})
-	_, err = sm.Update(statemachine.Entry{Cmd: stale})
-	require.Error(t, err)
-	_, err = sm.Update(statemachine.Entry{Cmd: []byte("{bad")})
-	require.Error(t, err)
+	res, err = sm.Update(statemachine.Entry{Cmd: stale})
+	require.NoError(t, err)
+	require.ErrorIs(t, raftResultError(res), ErrStaleShardMapEpoch)
+	res, err = sm.Update(statemachine.Entry{Cmd: []byte("{bad")})
+	require.NoError(t, err)
+	require.ErrorIs(t, raftResultError(res), ErrInvalidRaftCommand)
 	badCount, _ := json.Marshal(ShardMapMeta{Epoch: 3, ShardCount: 0})
-	_, err = sm.Update(statemachine.Entry{Cmd: badCount})
-	require.Error(t, err)
+	res, err = sm.Update(statemachine.Entry{Cmd: badCount})
+	require.NoError(t, err)
+	require.ErrorIs(t, raftResultError(res), ErrInvalidRaftCommand)
 
 	var buf bytes.Buffer
 	require.NoError(t, sm.SaveSnapshot(&buf, nil, make(chan struct{})))
@@ -1011,6 +1055,46 @@ func TestShardMapStateMachine(t *testing.T) {
 	require.NoError(t, err)
 	require.NotZero(t, hash)
 	require.NoError(t, sm.Close())
+}
+
+func TestShardMigrationMetadataSnapshot(t *testing.T) {
+	sm := NewShardMapStateMachine(1, 2)
+	move := ShardMove{ShardID: 0, FromNode: 1, ToNode: 4, ToAddress: "127.0.0.1:8004"}
+	apply := func(sm *ShardMapStateMachine, change migrationChange) (uint64, error) {
+		t.Helper()
+		result, err := sm.Update(createTestEntry(t, 1, shardMapUpdate{
+			ShardMapMeta: ShardMapMeta{ShardCount: 2},
+			Migration:    &change,
+		}))
+		require.NoError(t, err)
+		return result.Value, raftResultError(result)
+	}
+	restore := func(sm *ShardMapStateMachine) *ShardMapStateMachine {
+		t.Helper()
+		var buf bytes.Buffer
+		require.NoError(t, sm.SaveSnapshot(&buf, nil, nil))
+		out := NewShardMapStateMachine(1, 2)
+		require.NoError(t, out.RecoverFromSnapshot(&buf, nil, nil))
+		return out
+	}
+
+	value, err := apply(sm, migrationChange{Move: move, CanStart: true})
+	require.NoError(t, err)
+	require.Equal(t, migrationPending, value)
+	sm = restore(sm)
+	conflict := move
+	conflict.ToNode = 5
+	_, err = apply(sm, migrationChange{Move: conflict, CanStart: true})
+	require.ErrorIs(t, err, ErrShardMigrationConflict)
+
+	value, err = apply(sm, migrationChange{Move: move, Complete: true})
+	require.NoError(t, err)
+	require.Equal(t, migrationDone, value)
+	sm = restore(sm)
+	value, err = apply(sm, migrationChange{Move: move, Complete: true})
+	require.NoError(t, err)
+	require.Equal(t, migrationDone, value)
+	require.Equal(t, uint64(2), sm.Meta().Epoch)
 }
 
 func TestMigrateShardToLearner(t *testing.T) {
@@ -1040,6 +1124,7 @@ func TestMigrateShardToLearner(t *testing.T) {
 		config.RPCAddress = rpcs[i]
 		config.PeerRPC = peerRPC
 		config.RPCSecret = "test-secret"
+		config.OrderedConfigChange = true
 		db, err := OpenCluster(config, createTestDBOptions(t, dir))
 		require.NoError(t, err)
 		cluster[i] = db
@@ -1088,6 +1173,7 @@ func TestMigrateShardToLearner(t *testing.T) {
 	config4.RPCAddress = rpcs[3]
 	config4.PeerRPC = peerRPC
 	config4.RPCSecret = "test-secret"
+	config4.OrderedConfigChange = true
 	node4, err := OpenCluster(config4, createTestDBOptions(t, dir4))
 	require.NoError(t, err)
 	cluster[3] = node4
@@ -1102,12 +1188,37 @@ func TestMigrateShardToLearner(t *testing.T) {
 		return err == nil && string(v) == "before-migration"
 	}, 25*time.Second, 100*time.Millisecond)
 
-	require.NoError(t, leaderNode.MigrateShard(0, 3, 4, addrs[3]))
+	fromNode := leaderNode.config.NodeID
+	existingVoter := fromNode%voting + 1
+	require.ErrorIs(t, leaderNode.MigrateShard(0, fromNode, existingVoter, addrs[existingVoter-1]), ErrShardMigrationConflict)
+	require.ErrorIs(t, leaderNode.MigrateShard(0, fromNode, 4, addrs[3]), ErrNotLeader)
 
-	m, err := leaderNode.ShardMembership(0)
+	var newLeader *ClusterDB
+	require.Eventually(t, func() bool {
+		for _, db := range cluster {
+			if db.config.NodeID == fromNode {
+				continue
+			}
+			id, err := db.leaderForShard(0)
+			if err == nil && id == db.config.NodeID {
+				newLeader = db
+				return true
+			}
+		}
+		return false
+	}, 20*time.Second, 100*time.Millisecond)
+	m, err := newLeader.ShardMembership(0)
+	require.NoError(t, err)
+	require.Contains(t, m.Voters, fromNode)
+	require.Contains(t, m.Voters, uint64(4))
+
+	require.NoError(t, newLeader.MigrateShard(0, fromNode, 4, addrs[3]))
+	m, err = newLeader.ShardMembership(0)
 	require.NoError(t, err)
 	require.Contains(t, m.Voters, uint64(4))
-	require.NotContains(t, m.Voters, uint64(3))
+	require.NotContains(t, m.Voters, fromNode)
+	require.Len(t, m.Voters, voting)
+	require.NoError(t, newLeader.MigrateShard(0, fromNode, 4, addrs[3]))
 	require.Eventually(t, func() bool {
 		return leaderNode.ShardMapEpoch() == 2
 	}, 10*time.Second, 100*time.Millisecond)
@@ -1118,24 +1229,56 @@ func TestMigrateShardToLearner(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, []byte("before-migration"), v)
 
-	moves, err := leaderNode.PlanRebalance()
+	// PlanRebalance reads all shards. The new leader may only host shard 0.
+	planner := cluster[existingVoter-1]
+	moves, err := planner.PlanRebalance()
 	require.NoError(t, err)
-	require.NotEmpty(t, moves)
-	var execNode *ClusterDB
-	for _, db := range cluster[:voting] {
-		leader, lerr := db.leaderForShard(moves[0].ShardID)
-		if lerr == nil && leader == db.config.NodeID {
-			execNode = db
-			break
-		}
-	}
-	require.NotNil(t, execNode)
-	require.NoError(t, execNode.ExecuteShardMove(moves[0]))
+	require.Empty(t, moves)
 
 	// The migrated shard must still serve reads through the new voter.
 	got, err := node4.Get(key)
 	require.NoError(t, err)
 	require.Equal(t, []byte("before-migration"), got)
+}
+
+func TestSingleShardMigrationResumesAfterRemoval(t *testing.T) {
+	addr1, addr2 := freeClusterAddress(t), freeClusterAddress(t)
+	rpc1, rpc2 := freeClusterAddress(t), freeClusterAddress(t)
+	peers := map[uint64]string{1: rpc1, 2: rpc2}
+	start := func(id uint64, addr string) *ClusterDB {
+		t.Helper()
+		dir := t.TempDir()
+		cfg := createTestClusterOptions(id, 920, addr, dir)
+		cfg.InitialMembers = map[uint64]string{1: addr1}
+		cfg.JoinCluster = id == 2
+		cfg.IsLearner = id == 2
+		cfg.PeerRPC, cfg.RPCAddress, cfg.RPCSecret = peers, peers[id], "test-secret"
+		db, err := OpenCluster(cfg, createTestDBOptions(t, dir))
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = db.Close() })
+		return db
+	}
+	source := start(1, addr1)
+	require.Eventually(t, source.IsLeader, 15*time.Second, 50*time.Millisecond)
+	require.NoError(t, source.Put([]byte("key"), []byte("value")))
+	target := start(2, addr2)
+	move := ShardMove{FromNode: 1, ToNode: 2, ToAddress: addr2}
+	require.ErrorIs(t, source.ExecuteShardMove(move), ErrNotLeader)
+	require.Eventually(t, target.IsLeader, 15*time.Second, 50*time.Millisecond)
+
+	// Model a restart between the committed membership change and finalization.
+	require.NoError(t, target.RemoveShardReplica(0, 1))
+	members, err := target.ShardMembership(0)
+	require.NoError(t, err)
+	require.Contains(t, members.Removed, uint64(1))
+	require.NoError(t, target.ExecuteShardMove(move))
+	require.NoError(t, target.ExecuteShardMove(move))
+	members, err = target.ShardMembership(0)
+	require.NoError(t, err)
+	require.Equal(t, []uint64{2}, members.Voters)
+	value, err := target.Get([]byte("key"))
+	require.NoError(t, err)
+	require.Equal(t, []byte("value"), value)
 }
 
 func TestMigrateShardErrorPaths(t *testing.T) {

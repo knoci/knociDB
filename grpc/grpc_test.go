@@ -114,36 +114,46 @@ func TestGRPCBatchAndScan(t *testing.T) {
 }
 
 func TestGRPCTokenAuth(t *testing.T) {
-	dir := filepath.Join(os.TempDir(), "knocidb_grpc_auth")
-	_ = os.RemoveAll(dir)
 	opts := knocidb.DefaultOptions
-	opts.DirPath = dir
+	opts.DirPath = t.TempDir()
 	db, err := knocidb.Open(opts)
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
-	s, lis, err := Start("127.0.0.1:0", db,
-		grpc.ChainUnaryInterceptor(authUnaryInterceptor("secret")),
-		grpc.ChainStreamInterceptor(authStreamInterceptor("secret")),
-	)
+	defer db.Close()
+	cert, key := testTLSCertificate(t)
+	s, lis, err := StartSecure("127.0.0.1:0", db, ServerSecurityOptions{
+		TLSCertFile: cert, TLSKeyFile: key, TLSClientCAFile: cert,
+		RequireClientCert: true, EnableAuth: true, AuthToken: "secret",
+	})
 	if err != nil {
 		t.Fatalf("start: %v", err)
 	}
 	defer s.GracefulStop()
-	// 无token应失败
-	cli1, err := Dial(lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
-	if err != nil {
-		t.Fatalf("dial: %v", err)
-	}
-	defer cli1.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	err = cli1.Put(ctx, []byte("k"), []byte("v"))
-	if status.Code(err) != codes.Unauthenticated {
-		t.Fatalf("expect unauthenticated, got %v", err)
+
+	clientOptions := ClientSecurityOptions{TLSCACertFile: cert, ClientCertFile: cert, ClientKeyFile: key}
+	for _, tc := range []struct {
+		opt  ClientSecurityOptions
+		code codes.Code
+	}{
+		{ClientSecurityOptions{TLSCACertFile: cert}, codes.Unavailable},
+		{ClientSecurityOptions{ClientCertFile: cert, ClientKeyFile: key}, codes.Unavailable},
+		{clientOptions, codes.Unauthenticated},
+	} {
+		client, err := DialSecure(lis.Addr().String(), tc.opt)
+		if err != nil {
+			t.Fatalf("dial secure: %v", err)
+		}
+		defer client.Close()
+		if err := client.Put(ctx, []byte("k"), []byte("v")); status.Code(err) != tc.code {
+			t.Fatalf("put: %v, want %v", err, tc.code)
+		}
 	}
-	// 携带token应成功
-	cli2, err := Dial(lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithPerRPCCredentials(tokenCredentials{token: "secret"}))
+
+	clientOptions.EnableAuth, clientOptions.AuthToken = true, "secret"
+	cli2, err := DialSecure(lis.Addr().String(), clientOptions)
 	if err != nil {
 		t.Fatalf("dial secure: %v", err)
 	}
@@ -155,7 +165,6 @@ func TestGRPCTokenAuth(t *testing.T) {
 	if err != nil || string(v) != "v1" {
 		t.Fatalf("get: %v val=%s", err, string(v))
 	}
-	_ = db.Close()
 }
 
 func TestGRPCInvalidPayloads(t *testing.T) {

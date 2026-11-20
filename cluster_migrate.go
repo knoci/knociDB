@@ -2,14 +2,18 @@ package knocidb
 
 import (
 	"context"
+	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"sort"
 	"time"
+
+	"github.com/lni/dragonboat/v4"
 )
 
-// MigrateShard 把一个固定分片的 voting 副本迁移到另一个节点。
-// 目标节点必须已经以 Raft 节点身份可达（通常以 JoinCluster=true 启动）。
-// 只有目标 promote 成功后才移除源副本；失败时尝试恢复原成员关系。
+// MigrateShard moves a voting replica to a new node. Retry with the same
+// arguments on the current shard leader after a timeout or leadership change.
 func (c *ClusterDB) MigrateShard(shardID uint32, fromNode, toNode uint64, toAddress string) error {
 	if fromNode == toNode {
 		return fmt.Errorf("source and target replica are identical")
@@ -17,106 +21,213 @@ func (c *ClusterDB) MigrateShard(shardID uint32, fromNode, toNode uint64, toAddr
 	if _, err := c.requireShardLeader(shardID); err != nil {
 		return err
 	}
-	before, err := c.ShardMembership(shardID)
+	move := ShardMove{ShardID: shardID, FromNode: fromNode, ToNode: toNode, ToAddress: toAddress}
+	change := migrationChange{Move: move}
+	if !change.valid(c.config.ShardCount) {
+		return ErrInvalidRaftCommand
+	}
+	members, err := c.ShardMembership(shardID)
 	if err != nil {
 		return err
 	}
-	if !containsID(before.Voters, fromNode) {
-		return fmt.Errorf("source replica %d is not a voter in shard %d", fromNode, shardID)
+	_, targetRemoved := members.Removed[toNode]
+	address := members.Addresses[toNode]
+	change.CanStart = containsID(members.Voters, fromNode) &&
+		!containsID(members.Voters, toNode) && !targetRemoved &&
+		(address == "" || address == toAddress)
+	if change.CanStart {
+		c.mu.RLock()
+		progressAddress := c.config.PeerRPC[toNode]
+		c.mu.RUnlock()
+		if progressAddress == "" {
+			return fmt.Errorf("replica %d has no rpc address for migration progress", toNode)
+		}
 	}
-	if containsID(before.Voters, toNode) {
-		return fmt.Errorf("target replica %d is already a voter in shard %d", toNode, shardID)
+	state, err := c.submitMigration(change)
+	if err != nil {
+		return fmt.Errorf("record shard migration: %w", err)
+	}
+	if state == migrationDone {
+		return nil
 	}
 
-	addedLearner := !containsID(before.NonVoters, toNode)
-	if addedLearner {
-		if err := c.AddShardLearner(shardID, toNode, toAddress); err != nil {
-			return fmt.Errorf("add learner: %w", err)
-		}
+	members, err = c.ShardMembership(shardID)
+	if err != nil {
+		return err
 	}
-	if err := c.waitForNonVoter(shardID, toNode, 10*time.Second); err != nil {
-		if addedLearner {
-			_ = c.RemoveShardReplica(shardID, toNode)
+	if _, removed := members.Removed[fromNode]; removed {
+		if !containsID(members.Voters, toNode) || members.Addresses[toNode] != toAddress {
+			return ErrShardMigrationConflict
 		}
-		return fmt.Errorf("wait learner: %w", err)
+		return c.finishMigration(move)
 	}
-	if err := c.waitForLearnerApplied(shardID, toNode, 10*time.Second); err != nil {
-		if addedLearner {
-			_ = c.RemoveShardReplica(shardID, toNode)
-		}
-		return fmt.Errorf("wait learner applied: %w", err)
+	if !containsID(members.Voters, fromNode) {
+		return ErrShardMigrationConflict
+	}
+	if _, removed := members.Removed[toNode]; removed {
+		return ErrShardMigrationConflict
+	}
+	if addr := members.Addresses[toNode]; addr != "" && addr != toAddress {
+		return ErrShardMigrationConflict
 	}
 
-	if err := c.PromoteShardLearner(shardID, toNode, toAddress); err != nil {
-		if addedLearner {
-			_ = c.RemoveShardReplica(shardID, toNode)
+	if !containsID(members.Voters, toNode) {
+		if !containsID(members.NonVoters, toNode) {
+			if err := c.changeShardMembershipAt(members, toNode, toAddress, true, true); err != nil {
+				return fmt.Errorf("add learner: %w", err)
+			}
 		}
-		return fmt.Errorf("promote learner: %w", err)
+		if err := c.waitForLearnerApplied(shardID, toNode, 10*time.Second); err != nil {
+			return fmt.Errorf("wait learner applied: %w", err)
+		}
+		members, err = c.ShardMembership(shardID)
+		if err != nil {
+			return err
+		}
+		if !containsID(members.Voters, fromNode) || members.Addresses[toNode] != toAddress {
+			return ErrShardMigrationConflict
+		}
+		if containsID(members.NonVoters, toNode) {
+			if err := c.changeShardMembershipAt(members, toNode, toAddress, true, false); err != nil {
+				return fmt.Errorf("promote learner: %w", err)
+			}
+			members, err = c.ShardMembership(shardID)
+			if err != nil {
+				return err
+			}
+		}
 	}
-	if err := c.RemoveShardReplica(shardID, fromNode); err != nil {
-		// 如果源仍是 voter，移除新目标以回滚。
-		// 如果移除已经生效，Dragonboat 会把源放入 Removed 集合，此时不能重新加回。
-		if after, mErr := c.ShardMembership(shardID); mErr == nil && containsID(after.Voters, fromNode) {
-			_ = c.RemoveShardReplica(shardID, toNode)
+
+	if !containsID(members.Voters, toNode) || members.Addresses[toNode] != toAddress {
+		return ErrShardMigrationConflict
+	}
+	if _, removed := members.Removed[fromNode]; removed {
+		return c.finishMigration(move)
+	}
+	if !containsID(members.Voters, fromNode) {
+		return ErrShardMigrationConflict
+	}
+	if c.config.NodeID == fromNode {
+		if err := c.transferMigrationLeadership(shardID, toNode); err != nil {
+			return err
 		}
+		return fmt.Errorf("leadership transfer requested for shard %d, retry on its new leader: %w", shardID, ErrNotLeader)
+	}
+	if err := c.changeShardMembershipAt(members, fromNode, "", false, false); err != nil {
 		return fmt.Errorf("remove source replica: %w", err)
 	}
-	if err := c.advanceShardMapEpoch(); err != nil {
-		return fmt.Errorf("advance shard map epoch: %w", err)
+	return c.finishMigration(move)
+}
+
+func (c *ClusterDB) transferMigrationLeadership(shardID uint32, target uint64) error {
+	if _, err := c.requireShardLeader(shardID); err != nil {
+		return err
+	}
+	c.mu.RLock()
+	nodeHost := c.nodeHost
+	c.mu.RUnlock()
+	if nodeHost == nil {
+		return ErrNodeNotStarted
+	}
+	if err := nodeHost.RequestLeaderTransfer(c.config.GroupIDForShard(shardID), target); err != nil {
+		return fmt.Errorf("transfer shard %d leadership: %w", shardID, err)
 	}
 	return nil
 }
 
-func (c *ClusterDB) waitForNonVoter(shardID uint32, nodeID uint64, timeout time.Duration) error {
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		m, err := c.ShardMembership(shardID)
-		if err == nil && containsID(m.NonVoters, nodeID) {
-			return nil
-		}
-		time.Sleep(100 * time.Millisecond)
+func (c *ClusterDB) finishMigration(move ShardMove) error {
+	_, err := c.submitMigration(migrationChange{Move: move, Complete: true})
+	if err != nil {
+		return fmt.Errorf("finalize shard migration: %w", err)
 	}
-	return fmt.Errorf("replica %d did not become a non-voter in shard %d", nodeID, shardID)
+	return nil
 }
 
-func (c *ClusterDB) advanceShardMapEpoch() error {
-	mid := c.config.MetadataGroupID()
-	if mid == 0 {
-		return nil
-	}
+func (c *ClusterDB) submitMigration(change migrationChange) (uint64, error) {
 	c.mu.RLock()
 	nodeHost := c.nodeHost
 	started := c.state && nodeHost != nil
 	c.mu.RUnlock()
 	if !started {
-		return ErrNodeNotStarted
+		return 0, ErrNodeNotStarted
 	}
-	leader, _, valid, err := nodeHost.GetLeaderID(mid)
+	groupID := c.config.MetadataGroupID()
+	if groupID == 0 {
+		data, err := json.Marshal(raftWriteCommand{Command: Command{Op: opShardMigration}, Migration: &change})
+		if err != nil {
+			return 0, err
+		}
+		return syncMigrationProposal(nodeHost, c.config.GroupIDForShard(change.Move.ShardID), data)
+	}
+
+	data, err := json.Marshal(shardMapUpdate{
+		ShardMapMeta: ShardMapMeta{ShardCount: c.config.ShardCount},
+		Migration:    &change,
+	})
 	if err != nil {
-		return err
+		return 0, err
 	}
-	if !valid {
-		return ErrNotLeader
+	leader, _, known, _ := nodeHost.GetLeaderID(groupID)
+	if known && leader == c.config.NodeID {
+		return syncMigrationProposal(nodeHost, groupID, data)
 	}
-	epoch := c.ShardMapEpoch() + 1
-	meta := ShardMapMeta{Epoch: epoch, ShardCount: c.config.ShardCount}
-	data, err := json.Marshal(meta)
-	if err != nil {
-		return err
-	}
-	if leader == c.config.NodeID {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		_, err = nodeHost.SyncPropose(ctx, nodeHost.GetNoOPSession(mid), data)
-		return err
-	}
+
+	// A new data replica may not be a member of the metadata group.
+	// Try the known leader first, then the remaining peers if it has changed.
 	c.mu.RLock()
-	addr := c.config.PeerRPC[leader]
-	c.mu.RUnlock()
-	if addr == "" {
-		return fmt.Errorf("metadata leader %d has no rpc address", leader)
+	peers := make([]uint64, 0, len(c.config.PeerRPC))
+	for id := range c.config.PeerRPC {
+		if id != c.config.NodeID && id != leader {
+			peers = append(peers, id)
+		}
 	}
-	return c.forwardRequest(addr, rpcOpMeta, nil, data)
+	sort.Slice(peers, func(i, j int) bool { return peers[i] < peers[j] })
+	addresses := make([]string, 0, len(peers)+1)
+	if addr := c.config.PeerRPC[leader]; addr != "" {
+		addresses = append(addresses, addr)
+	}
+	for _, id := range peers {
+		if addr := c.config.PeerRPC[id]; addr != "" {
+			addresses = append(addresses, addr)
+		}
+	}
+	c.mu.RUnlock()
+
+	var lastErr error = ErrNotLeader
+	for _, addr := range addresses {
+		payload, err := c.rpcCall(addr, rpcOpMeta, nil, data)
+		if err == nil {
+			if len(payload) != 8 {
+				return 0, fmt.Errorf("invalid migration result")
+			}
+			return migrationResult(binary.BigEndian.Uint64(payload))
+		}
+		if errors.Is(err, ErrShardMigrationConflict) || errors.Is(err, ErrInvalidRaftCommand) || errors.Is(err, ErrClusterUnauthorized) {
+			return 0, err
+		}
+		lastErr = err
+	}
+	return 0, lastErr
+}
+
+func syncMigrationProposal(nodeHost *dragonboat.NodeHost, groupID uint64, data []byte) (uint64, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	result, err := nodeHost.SyncPropose(ctx, nodeHost.GetNoOPSession(groupID), data)
+	if err != nil {
+		return 0, err
+	}
+	if err := raftResultError(result); err != nil {
+		return 0, err
+	}
+	return migrationResult(result.Value)
+}
+
+func migrationResult(value uint64) (uint64, error) {
+	if value != migrationPending && value != migrationDone {
+		return 0, fmt.Errorf("invalid migration result")
+	}
+	return value, nil
 }
 
 func containsID(ids []uint64, id uint64) bool {

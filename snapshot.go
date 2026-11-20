@@ -2,6 +2,8 @@ package knocidb
 
 import (
 	"encoding/binary"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"hash/crc32"
 	"io"
@@ -9,10 +11,12 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/klauspost/compress/zstd"
+	"github.com/knoci/knocidb/util"
 )
 
 const (
@@ -135,200 +139,305 @@ func (db *DB) cleanupSnapshots(snapDir string) {
 	}
 }
 
-// ImportSnapshot 导入快照并恢复数据库，保证跨平台兼容性和原子性操作
+// ImportSnapshot 校验并暂存快照，然后关闭当前实例并替换数据文件。
 func (db *DB) ImportSnapshot(snapPath string) error {
-	if db.closed {
-		return fmt.Errorf("Import snapshot failed: database is closed")
+	if db.fileLock == nil || db.isClosing() {
+		return fmt.Errorf("import snapshot: %w", ErrDBClosed)
 	}
-	if err := db.Close(); err != nil {
-		return fmt.Errorf("Close failed: %v", err)
-	}
-	return importSnapshotToDir(snapPath, db.options.DirPath)
-}
-
-// importSnapshotToDir 把 .ZST 快照解压并原子替换到目标目录。
-// 它不持有 DB，因此可用于 Open 之前的对象存储恢复。
-func importSnapshotToDir(snapPath, dir string) error {
-	// 验证快照文件是否存在
-	if _, err := os.Stat(snapPath); os.IsNotExist(err) {
-		return fmt.Errorf("snapshot file not found: %s", snapPath)
-	}
-	if err := validateSnapshotManifest(snapPath); err != nil {
+	dir := db.options.DirPath
+	stage, err := prepareSnapshotRestore(snapPath, dir)
+	if err != nil {
 		return err
 	}
+	defer os.RemoveAll(stage)
 
-	timestamp := time.Now().Format(snapshotLayout)
-
-	// 创建临时目录用于解压快照
-	tmpDir := filepath.Join(os.TempDir(), "knocidb_import_"+timestamp)
-	if err := os.MkdirAll(tmpDir, os.ModePerm); err != nil {
-		return fmt.Errorf("failed to create temp directory: %v", err)
+	ran, err := db.closeAndRun(func() error { return publishSnapshotRestore(dir, stage) })
+	if !ran {
+		return fmt.Errorf("import snapshot: %w", ErrDBClosed)
 	}
-	defer os.RemoveAll(tmpDir) // 确保临时目录最终被清理
+	return err
+}
 
-	// 打开快照文件
-	f, err := os.Open(snapPath)
-	if err != nil {
-		return fmt.Errorf("failed to open snapshot file: %v", err)
+func (db *DB) isClosing() bool {
+	db.snapshotMu.Lock()
+	defer db.snapshotMu.Unlock()
+	return db.snapshotsClosed
+}
+
+// importSnapshotToDir 在 Open 持有目录锁时供对象存储恢复使用。
+func importSnapshotToDir(snapPath, dir string) error {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
 	}
-	defer f.Close()
-
-	// 创建zstd解码器
-	decoder, err := zstd.NewReader(f)
+	stage, err := prepareSnapshotRestore(snapPath, dir)
 	if err != nil {
-		return fmt.Errorf("failed to create zstd decoder: %v", err)
+		return err
+	}
+	defer os.RemoveAll(stage)
+	return publishSnapshotRestore(dir, stage)
+}
+
+const (
+	snapshotRestoreDir = ".snapshot-restore"
+	snapshotRestoreNew = "new"
+	snapshotRestoreOld = "old"
+	snapshotRestoreLog = "files.json"
+)
+
+func prepareSnapshotRestore(snapPath, dir string) (string, error) {
+	if err := validateSnapshotManifest(snapPath); err != nil {
+		return "", err
+	}
+	archive, err := os.Open(snapPath)
+	if err != nil {
+		return "", err
+	}
+	defer archive.Close()
+
+	stage, err := os.MkdirTemp(dir, ".snapshot-stage-")
+	if err != nil {
+		return "", err
+	}
+	prepared := false
+	defer func() {
+		if !prepared {
+			_ = os.RemoveAll(stage)
+		}
+	}()
+
+	newDir := filepath.Join(stage, snapshotRestoreNew)
+	if err := os.Mkdir(newDir, 0o700); err != nil {
+		return "", err
+	}
+	if err := os.Mkdir(filepath.Join(stage, snapshotRestoreOld), 0o700); err != nil {
+		return "", err
+	}
+	names, err := extractSnapshot(archive, newDir)
+	if err != nil {
+		return "", fmt.Errorf("extract snapshot: %w", err)
+	}
+	journal, err := os.OpenFile(filepath.Join(stage, snapshotRestoreLog), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		return "", err
+	}
+	err = json.NewEncoder(journal).Encode(names)
+	if err == nil {
+		err = journal.Sync()
+	}
+	if err := errors.Join(err, journal.Close()); err != nil {
+		return "", err
+	}
+	if err := errors.Join(util.SyncDir(newDir), util.SyncDir(stage)); err != nil {
+		return "", err
+	}
+	prepared = true
+	return stage, nil
+}
+
+func extractSnapshot(archive io.Reader, dir string) ([]string, error) {
+	decoder, err := zstd.NewReader(archive)
+	if err != nil {
+		return nil, err
 	}
 	defer decoder.Close()
 
-	// 创建CRC计算对象
+	var names []string
 	crc := crc32.NewIEEE()
-	var expectedCRC uint32
-
-	// 读取并解压文件
 	for {
-		// 读取文件名长度
-		nameLen, err := readInt32(decoder)
+		length, err := readInt32(decoder)
 		if err != nil {
-			if err == io.EOF {
-				break // 正常结束
-			}
-			return fmt.Errorf("failed to read file name length: %v", err)
+			return nil, err
 		}
-		if nameLen == -1 {
-			break // 结束标记
+		if length == -1 {
+			break
 		}
-		if nameLen < 0 {
-			return fmt.Errorf("invalid snapshot file name length: %d", nameLen)
+		if length <= 0 || length > 1024 {
+			return nil, fmt.Errorf("invalid snapshot filename length: %d", length)
 		}
-
-		// 读取文件名
-		nameBytes := make([]byte, nameLen)
-		if _, err = io.ReadFull(decoder, nameBytes); err != nil {
-			return fmt.Errorf("failed to read file name: %v", err)
+		rawName := make([]byte, length)
+		if _, err := io.ReadFull(decoder, rawName); err != nil {
+			return nil, err
 		}
-		fileName := string(nameBytes)
-
-		// 读取文件大小
-		fileSize, err := readInt64(decoder)
+		name := string(rawName)
+		if !validSnapshotFilename(name) {
+			return nil, fmt.Errorf("invalid snapshot filename: %q", name)
+		}
+		size, err := readInt64(decoder)
 		if err != nil {
-			return fmt.Errorf("failed to read file size: %v", err)
+			return nil, err
 		}
-		if fileSize < 0 {
-			return fmt.Errorf("invalid snapshot file size: %d", fileSize)
+		if size < 0 {
+			return nil, fmt.Errorf("invalid snapshot filesize: %d", size)
 		}
-
-		// 创建目标文件
-		filePath := filepath.Join(tmpDir, fileName)
-		out, err := os.Create(filePath)
+		_, _ = crc.Write(rawName)
+		_, _ = crc.Write([]byte(strconv.FormatInt(size, 10)))
+		file, err := os.OpenFile(filepath.Join(dir, name), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 		if err != nil {
-			return fmt.Errorf("failed to create file: %v", err)
+			return nil, err
 		}
+		_, err = io.CopyN(file, io.TeeReader(decoder, crc), size)
+		if err == nil {
+			err = file.Sync()
+		}
+		if err := errors.Join(err, file.Close()); err != nil {
+			return nil, fmt.Errorf("write snapshot file %q: %w", name, err)
+		}
+		names = append(names, name)
+	}
+	var expected [4]byte
+	if _, err := io.ReadFull(decoder, expected[:]); err != nil {
+		return nil, err
+	}
+	if crc.Sum32() != binary.LittleEndian.Uint32(expected[:]) {
+		return nil, fmt.Errorf("snapshot CRC mismatch")
+	}
+	// Consume the frame footer so decompression errors are also reported.
+	if n, err := io.ReadFull(decoder, expected[:1]); n != 0 || err != io.EOF {
+		if err != nil {
+			return nil, err
+		}
+		return nil, fmt.Errorf("unexpected data after snapshot checksum")
+	}
+	if len(names) == 0 {
+		return nil, fmt.Errorf("snapshot contains no files")
+	}
+	return names, nil
+}
 
-		// CRC 同样覆盖 name + size + content
-		if _, err = crc.Write(nameBytes); err != nil {
-			_ = out.Close()
-			return fmt.Errorf("failed to calculate CRC for file: %v", err)
-		}
-		if _, err = crc.Write([]byte(fmt.Sprintf("%d", fileSize))); err != nil {
-			_ = out.Close()
-			return fmt.Errorf("failed to calculate CRC for file: %v", err)
-		}
-		if _, err = io.CopyN(out, io.TeeReader(decoder, crc), fileSize); err != nil {
-			_ = out.Close()
-			return fmt.Errorf("failed to copy file content: %v", err)
-		}
-		if err = out.Close(); err != nil {
-			return fmt.Errorf("failed to close file: %v", err)
-		}
+func validSnapshotFilename(name string) bool {
+	return filepath.IsLocal(name) && !strings.HasSuffix(name, ".") && !strings.HasSuffix(name, " ") &&
+		!strings.ContainsAny(name, "/\\:") &&
+		!strings.EqualFold(name, fileLockName) &&
+		!strings.HasPrefix(strings.ToLower(name), snapshotRestoreDir)
+}
+
+// publishSnapshotRestore keeps the rollback journal active until installation
+// and all directory changes are synced.
+func publishSnapshotRestore(dir, stage string) error {
+	active := filepath.Join(dir, snapshotRestoreDir)
+	if _, err := os.Lstat(active); err == nil {
+		return fmt.Errorf("an interrupted snapshot import must be recovered first")
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if err := util.RenameDurable(stage, active); err != nil {
+		return err
 	}
 
-	// 读取并验证CRC校验位
-	crcBytes := make([]byte, 4)
-	if _, err := io.ReadFull(decoder, crcBytes); err != nil {
-		return fmt.Errorf("failed to read CRC value: %v", err)
+	if err := installSnapshotFiles(dir, active); err != nil {
+		return errors.Join(err, recoverSnapshotRestore(dir))
 	}
-	expectedCRC = binary.LittleEndian.Uint32(crcBytes)
-
-	actualCRC := crc.Sum32()
-	if actualCRC != expectedCRC {
-		return fmt.Errorf("CRC check failed: expected %v, got %v", expectedCRC, actualCRC)
+	if err := retireSnapshotRestore(dir, active); err != nil {
+		return errors.Join(err, recoverSnapshotRestore(dir))
 	}
+	return nil
+}
 
-	// 确保数据库目录存在
-	if err := os.MkdirAll(dir, os.ModePerm); err != nil {
-		return fmt.Errorf("failed to create database directory: %v", err)
+func installSnapshotFiles(dir, active string) error {
+	if err := util.SyncDir(dir); err != nil {
+		return err
 	}
-
-	// 创建临时目录用于原子替换
-	tmpReplaceDir := filepath.Join(os.TempDir(), "knocidb_replace_"+timestamp)
-	if err = os.MkdirAll(tmpReplaceDir, os.ModePerm); err != nil {
-		return fmt.Errorf("failed to create temp replace directory: %v", err)
-	}
-	defer os.RemoveAll(tmpReplaceDir)
-
-	// 将当前数据库目录中的文件移动到临时替换目录（用于回滚）
-	dbFiles, err := os.ReadDir(dir)
+	oldDir := filepath.Join(active, snapshotRestoreOld)
+	entries, err := os.ReadDir(dir)
 	if err != nil {
-		return fmt.Errorf("failed to read database directory: %v", err)
+		return err
 	}
-	for _, file := range dbFiles {
-		name := file.Name()
-		if name == fileLockName || file.IsDir() {
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || strings.EqualFold(name, fileLockName) {
 			continue
 		}
-		oldPath := filepath.Join(dir, name)
-		newPath := filepath.Join(tmpReplaceDir, name)
-		if err = os.Rename(oldPath, newPath); err != nil {
-			// 尝试回滚已移动的文件
-			restoreFiles(tmpReplaceDir, dir)
-			return fmt.Errorf("failed to move existing file: %v", err)
+		if err := util.RenameDurable(filepath.Join(dir, name), filepath.Join(oldDir, name)); err != nil {
+			return fmt.Errorf("save previous database file %q: %w", name, err)
 		}
 	}
+	if err := errors.Join(util.SyncDir(oldDir), util.SyncDir(dir)); err != nil {
+		return err
+	}
 
-	// 将解压的文件从临时目录复制到数据库目录
-	tmpFiles, err := os.ReadDir(tmpDir)
+	newDir := filepath.Join(active, snapshotRestoreNew)
+	entries, err = os.ReadDir(newDir)
 	if err != nil {
-		// 尝试回滚
-		restoreFiles(tmpReplaceDir, dir)
-		return fmt.Errorf("failed to read temp directory: %v", err)
+		return err
+	}
+	for _, entry := range entries {
+		name := entry.Name()
+		if err := util.RenameDurable(filepath.Join(newDir, name), filepath.Join(dir, name)); err != nil {
+			return fmt.Errorf("install snapshot file %q: %w", name, err)
+		}
+	}
+	return errors.Join(util.SyncDir(dir), util.SyncDir(newDir))
+}
+
+func recoverSnapshotRestore(dir string) error {
+	active := filepath.Join(dir, snapshotRestoreDir)
+	if _, err := os.Lstat(active); errors.Is(err, os.ErrNotExist) {
+		return nil
+	} else if err != nil {
+		return err
 	}
 
-	for _, file := range tmpFiles {
-		name := file.Name()
-		fromPath := filepath.Join(tmpDir, name)
-		toPath := filepath.Join(dir, name)
-		in, err := os.Open(fromPath)
-		if err != nil {
-			// 尝试回滚
-			restoreFiles(tmpReplaceDir, dir)
-			return fmt.Errorf("failed to open file for copy: %v", err)
+	data, err := os.ReadFile(filepath.Join(active, snapshotRestoreLog))
+	if err != nil {
+		return err
+	}
+	var names []string
+	if err := json.Unmarshal(data, &names); err != nil {
+		return err
+	}
+
+	// A missing staged file was installed. Move it back before restoring any
+	// old files, so a second rollback after interruption is safe to repeat.
+	newDir := filepath.Join(active, snapshotRestoreNew)
+	for _, name := range names {
+		if !validSnapshotFilename(name) {
+			return fmt.Errorf("invalid snapshot journal filename: %q", name)
 		}
-		out, err := os.Create(toPath)
-		if err != nil {
-			inner_err := in.Close()
-			if inner_err != nil {
-				return fmt.Errorf("unexpected error: %w", inner_err)
+		staged := filepath.Join(newDir, name)
+		if _, err := os.Lstat(staged); errors.Is(err, os.ErrNotExist) {
+			if err := util.RenameDurable(filepath.Join(dir, name), staged); err != nil {
+				return fmt.Errorf("roll back snapshot file %q: %w", name, err)
 			}
-			// 尝试回滚
-			restoreFiles(tmpReplaceDir, dir)
-			return fmt.Errorf("failed to create file in database dir: %v", err)
+		} else if err != nil {
+			return err
 		}
-		_, err = io.Copy(out, in)
-		err = in.Close()
-		err = out.Close()
-		if err != nil {
-			// 尝试回滚
-			restoreFiles(tmpReplaceDir, dir)
-			return fmt.Errorf("failed to copy file to database dir: %v", err)
-		}
+	}
+	if err := errors.Join(util.SyncDir(newDir), util.SyncDir(dir)); err != nil {
+		return err
 	}
 
-	// 导入成功，清理临时替换目录
-	err = os.RemoveAll(tmpReplaceDir)
+	oldDir := filepath.Join(active, snapshotRestoreOld)
+	entries, err := os.ReadDir(oldDir)
 	if err != nil {
-		return fmt.Errorf("unexpected error: %w", err)
+		return err
 	}
-	log.Printf("Snapshot imported successfully: %s", snapPath)
+	for _, entry := range entries {
+		name := entry.Name()
+		if err := util.RenameDurable(filepath.Join(oldDir, name), filepath.Join(dir, name)); err != nil {
+			return fmt.Errorf("restore previous database file %q: %w", name, err)
+		}
+	}
+	if err := errors.Join(util.SyncDir(dir), util.SyncDir(oldDir)); err != nil {
+		return err
+	}
+	return retireSnapshotRestore(dir, active)
+}
+
+func retireSnapshotRestore(dir, active string) error {
+	done, err := os.MkdirTemp(dir, ".snapshot-done-")
+	if err != nil {
+		return err
+	}
+	if err := util.RenameDurable(active, filepath.Join(done, "restore")); err != nil {
+		_ = os.Remove(done)
+		return err
+	}
+	if err := errors.Join(util.SyncDir(done), util.SyncDir(dir)); err != nil {
+		return err
+	}
+	if err := os.RemoveAll(done); err != nil {
+		log.Printf("remove completed snapshot restore directory: %v", err)
+	}
 	return nil
 }
 
@@ -360,24 +469,4 @@ func readInt64(r io.Reader) (int64, error) {
 		return 0, err
 	}
 	return int64(binary.LittleEndian.Uint64(buf)), nil
-}
-
-// restoreFiles 从源目录恢复文件到目标目录，用于导入快照失败时的回滚操作
-func restoreFiles(srcDir, dstDir string) {
-	files, err := os.ReadDir(srcDir)
-	if err != nil {
-		log.Printf("failed to read source directory for restore: %v", err)
-		return
-	}
-	for _, file := range files {
-		name := file.Name()
-		if file.IsDir() {
-			continue
-		}
-		srcPath := filepath.Join(srcDir, name)
-		dstPath := filepath.Join(dstDir, name)
-		if err := os.Rename(srcPath, dstPath); err != nil {
-			log.Printf("failed to restore file %s: %v", name, err)
-		}
-	}
 }

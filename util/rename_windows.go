@@ -1,4 +1,4 @@
-package wal
+package util
 
 import (
 	"os"
@@ -8,7 +8,8 @@ import (
 	"golang.org/x/sys/windows"
 )
 
-func publishSegmentFile(source, target string) error {
+// RenameDurable moves a file or directory with write-through on Windows.
+func RenameDurable(source, target string) error {
 	from, err := windowsSegmentPath(source)
 	if err != nil {
 		return err
@@ -19,8 +20,13 @@ func publishSegmentFile(source, target string) error {
 	}
 	err = windows.MoveFileEx(from, to, windows.MOVEFILE_REPLACE_EXISTING|windows.MOVEFILE_WRITE_THROUGH)
 	if err != nil {
-		return &os.LinkError{Op: "publish segment", Old: source, New: target, Err: err}
+		return &os.LinkError{Op: "rename", Old: source, New: target, Err: err}
 	}
+	return nil
+}
+
+// SyncDir is covered by write-through renames on Windows.
+func SyncDir(string) error {
 	return nil
 }
 

@@ -30,7 +30,7 @@ func main() {
 	defer func() { _ = db.Close() }()
 
 	var lisAddr string
-	if (*tlsCert != "" && *tlsKey != "") || *token != "" || (*mtls && *tlsCA != "") {
+	if *tlsCert != "" || *tlsKey != "" || *token != "" || *mtls || *tlsCA != "" {
 		_, lis, err := knocigrpc.StartSecure(*addr, db, knocigrpc.ServerSecurityOptions{
 			TLSCertFile:       *tlsCert,
 			TLSKeyFile:        *tlsKey,

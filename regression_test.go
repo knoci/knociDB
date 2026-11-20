@@ -361,6 +361,15 @@ func TestRegressionRaftSnapshotSelfContained(t *testing.T) {
 	}
 	sm := NewKVStateMachine(1, 1, srcDB)
 	defer sm.Close()
+	move := ShardMove{FromNode: 1, ToNode: 2, ToAddress: "127.0.0.1:8002"}
+	migration := raftWriteCommand{
+		Command:   Command{Op: opShardMigration},
+		Migration: &migrationChange{Move: move, CanStart: true},
+	}
+	result, err := sm.Update(createTestEntry(t, 1, migration))
+	if err != nil || raftResultError(result) != nil || result.Value != migrationPending {
+		t.Fatalf("record migration before snapshot: %+v, %v", result, err)
+	}
 
 	var buf bytes.Buffer
 	if err := sm.SaveSnapshot(&buf, nil, nil); err != nil {
@@ -385,6 +394,11 @@ func TestRegressionRaftSnapshotSelfContained(t *testing.T) {
 	v, err := dstSM.db.Get([]byte("snap-k"))
 	if err != nil || !bytes.Equal(v, []byte("snap-v")) {
 		t.Fatalf("snapshot data: %q %v", v, err)
+	}
+	migration.Migration = &migrationChange{Move: move, Complete: true}
+	result, err = dstSM.Update(createTestEntry(t, 2, migration))
+	if err != nil || raftResultError(result) != nil || result.Value != migrationDone {
+		t.Fatalf("resume migration from snapshot: %+v, %v", result, err)
 	}
 }
 func TestRegressionRecoverCompactionTemp(t *testing.T) {

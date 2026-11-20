@@ -1,17 +1,18 @@
 package knocidb
 
 import (
+	"bytes"
 	"context"
 	"sort"
 	"time"
 
 	"github.com/cespare/xxhash/v2"
+	"github.com/lni/dragonboat/v4"
 )
 
 type clusterShard struct {
 	id      uint32
 	groupID uint64
-	db      *DB
 	sm      *KVStateMachine
 }
 
@@ -85,34 +86,38 @@ func (c *ClusterDB) leaderForShard(shard uint32) (uint64, error) {
 	return leader, nil
 }
 
-func (c *ClusterDB) dbForShard(shard uint32) (*DB, error) {
+func (c *ClusterDB) stateMachineForShard(shard uint32) (*KVStateMachine, error) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	if c.nodeHost == nil || !c.state || int(shard) >= len(c.shards) {
 		return nil, ErrNodeNotStarted
 	}
-	return c.shards[shard].db, nil
+	return c.shards[shard].sm, nil
 }
 
-// Scan 在单分片布局下返回 shard 0 的迭代器。
-// 跨分片扫描尚未实现合并迭代器，因此直接返回错误。
+// Scan 在单分片布局下扫描本地副本，区间包含 start 和 end，空边界表示无界。
+// 调用方应在使用完毕后关闭迭代器。
 func (c *ClusterDB) Scan(start, end []byte) (*Iterator, error) {
 	if c.config.ShardCount != 1 {
 		return nil, ErrCrossShardScan
 	}
-	db, err := c.dbForShard(0)
+	sm, err := c.stateMachineForShard(0)
 	if err != nil {
 		return nil, err
+	}
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	db, ok := sm.db.(*DB)
+	if !ok {
+		return nil, ErrUnsupportedIndex
 	}
 	it, err := db.NewIterator(IteratorOptions{})
 	if err != nil {
 		return nil, err
 	}
-	if len(start) > 0 {
-		it.Seek(start)
-	} else {
-		it.Rewind()
-	}
+	it.startKey = bytes.Clone(start)
+	it.endKey = bytes.Clone(end)
+	it.Rewind()
 	return it, nil
 }
 
@@ -153,12 +158,13 @@ func (c *ClusterDB) Members() ([]Member, error) {
 
 // ShardMembership 描述一个固定分片 group 的 voter/non-voter 视图。
 type ShardMembership struct {
-	ShardID   uint32
-	GroupID   uint64
-	Voters    []uint64
-	NonVoters []uint64
-	Removed   map[uint64]struct{}
-	Addresses map[uint64]string
+	ShardID        uint32
+	GroupID        uint64
+	ConfigChangeID uint64
+	Voters         []uint64
+	NonVoters      []uint64
+	Removed        map[uint64]struct{}
+	Addresses      map[uint64]string
 }
 
 // ShardMembership 返回指定分片 Raft group 的成员信息。
@@ -177,13 +183,14 @@ func (c *ClusterDB) ShardMembership(shardID uint32) (*ShardMembership, error) {
 	if err != nil {
 		return nil, err
 	}
-	out := &ShardMembership{ShardID: shardID, GroupID: groupID, Addresses: make(map[uint64]string), Removed: make(map[uint64]struct{})}
+	out := &ShardMembership{ShardID: shardID, GroupID: groupID, ConfigChangeID: m.ConfigChangeID, Addresses: make(map[uint64]string), Removed: make(map[uint64]struct{})}
 	for id, addr := range m.Nodes {
 		out.Voters = append(out.Voters, id)
 		out.Addresses[id] = addr
 	}
-	for id := range m.NonVotings {
+	for id, addr := range m.NonVotings {
 		out.NonVoters = append(out.NonVoters, id)
+		out.Addresses[id] = addr
 	}
 	for id := range m.Removed {
 		out.Removed[id] = struct{}{}
@@ -214,16 +221,36 @@ func (c *ClusterDB) changeShardMembership(shardID uint32, nodeID uint64, address
 	if _, err := c.requireShardLeader(shardID); err != nil {
 		return err
 	}
-	groupID := c.config.GroupIDForShard(shardID)
+	members, err := c.ShardMembership(shardID)
+	if err != nil {
+		return err
+	}
+	return c.changeShardMembershipAt(members, nodeID, address, add, nonVoting)
+}
+
+func (c *ClusterDB) changeShardMembershipAt(members *ShardMembership, nodeID uint64, address string, add, nonVoting bool) error {
+	if _, err := c.requireShardLeader(members.ShardID); err != nil {
+		return err
+	}
+	c.mu.RLock()
+	nodeHost := c.nodeHost
+	c.mu.RUnlock()
+	if nodeHost == nil {
+		return ErrNodeNotStarted
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
+	return changeReplica(ctx, nodeHost, members.GroupID, members.ConfigChangeID, nodeID, address, add, nonVoting)
+}
+
+func changeReplica(ctx context.Context, nodeHost *dragonboat.NodeHost, groupID, configChangeID, nodeID uint64, address string, add, nonVoting bool) error {
 	switch {
 	case add && nonVoting:
-		return c.nodeHost.SyncRequestAddNonVoting(ctx, groupID, nodeID, address, 0)
+		return nodeHost.SyncRequestAddNonVoting(ctx, groupID, nodeID, address, configChangeID)
 	case add:
-		return c.nodeHost.SyncRequestAddReplica(ctx, groupID, nodeID, address, 0)
+		return nodeHost.SyncRequestAddReplica(ctx, groupID, nodeID, address, configChangeID)
 	default:
-		return c.nodeHost.SyncRequestDeleteReplica(ctx, groupID, nodeID, 0)
+		return nodeHost.SyncRequestDeleteReplica(ctx, groupID, nodeID, configChangeID)
 	}
 }
 

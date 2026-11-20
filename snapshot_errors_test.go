@@ -2,9 +2,12 @@ package knocidb
 
 import (
 	"bytes"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/knoci/knocidb/util"
 )
 
 func TestLatestSnapshotFile(t *testing.T) {
@@ -93,24 +96,141 @@ func TestCleanupSnapshotsRemovesManifest(t *testing.T) {
 	}
 }
 
-func TestRestoreFiles(t *testing.T) {
-	base := t.TempDir()
-	src := filepath.Join(base, "src")
-	dst := filepath.Join(base, "dst")
-	if err := os.MkdirAll(src, 0o700); err != nil {
+func TestSnapshotImportValidationKeepsDatabaseOpen(t *testing.T) {
+	db := openRegressionDB(t, nil)
+	defer db.Close()
+	if err := db.Put([]byte("old"), []byte("value")); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.MkdirAll(dst, 0o700); err != nil {
+	if err := db.ImportSnapshot(filepath.Join(t.TempDir(), "missing.ZST")); err == nil {
+		t.Fatal("expected import to fail")
+	}
+	checkRestoredKey(t, db, "old", "value")
+	other, err := Open(db.GetOptions())
+	if err == nil {
+		_ = other.Close()
+	}
+	if !errors.Is(err, ErrDatabaseIsUsing) {
+		t.Fatalf("database must still hold its lock: %v", err)
+	}
+}
+
+func TestSnapshotImportHoldsLockThroughReplacement(t *testing.T) {
+	db := openRegressionDB(t, nil)
+	defer db.Close()
+	ran, err := db.closeAndRun(func() error {
+		other, err := Open(db.GetOptions())
+		if err == nil {
+			_ = other.Close()
+		}
+		return err
+	})
+	if !ran || !errors.Is(err, ErrDatabaseIsUsing) {
+		t.Fatalf("replacement must hold the database lock: %v, %v", ran, err)
+	}
+}
+
+func TestSnapshotImportRollsBackPartialInstall(t *testing.T) {
+	db, archive := snapshotRestoreFixture(t)
+	options := db.GetOptions()
+	obstruction := filepath.Join(options.DirPath, "z-conflict")
+	if err := os.Mkdir(obstruction, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(src, "a"), []byte("a"), 0o600); err != nil {
+	if err := db.ImportSnapshot(archive); err == nil {
+		t.Fatal("expected conflicting directory to interrupt the install")
+	}
+	reopened, err := Open(options)
+	if err != nil {
 		t.Fatal(err)
 	}
-	restoreFiles(src, dst)
-	if _, err := os.Stat(filepath.Join(dst, "a")); err != nil {
+	defer reopened.Close()
+	checkRestoredKey(t, reopened, "old", "before")
+	checkRestoredKey(t, reopened, "new", "")
+	if st, err := os.Stat(obstruction); err != nil || !st.IsDir() {
+		t.Fatalf("existing directory was not preserved: %v, %v", st, err)
+	}
+	if _, err := os.Stat(filepath.Join(options.DirPath, snapshotRestoreDir)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("active restore journal was not retired: %v", err)
+	}
+}
+
+func TestOpenRollsBackInterruptedSnapshotImport(t *testing.T) {
+	db, archive := snapshotRestoreFixture(t)
+	options := db.GetOptions()
+	dir := options.DirPath
+	ran, err := db.closeAndRun(func() error {
+		stage, err := prepareSnapshotRestore(archive, dir)
+		if err != nil {
+			return err
+		}
+		active := filepath.Join(dir, snapshotRestoreDir)
+		if err := util.RenameDurable(stage, active); err != nil {
+			return err
+		}
+		if err := installSnapshotFiles(dir, active); err != nil {
+			return err
+		}
+		// The first rollback move has completed, but the journal is still active.
+		return util.RenameDurable(filepath.Join(dir, commitLogName), filepath.Join(active, snapshotRestoreNew, commitLogName))
+	})
+	if !ran || err != nil {
+		t.Fatalf("simulate interrupted install: %v, %v", ran, err)
+	}
+	reopened, err := Open(options)
+	if err != nil {
 		t.Fatal(err)
 	}
-	restoreFiles(filepath.Join(base, "missing"), dst)
+	defer reopened.Close()
+	checkRestoredKey(t, reopened, "old", "before")
+	checkRestoredKey(t, reopened, "new", "")
+	if err := reopened.ImportSnapshot(archive); err != nil {
+		t.Fatalf("retry import: %v", err)
+	}
+	restored, err := Open(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer restored.Close()
+	checkRestoredKey(t, restored, "old", "")
+	checkRestoredKey(t, restored, "new", "after")
+}
+
+func snapshotRestoreFixture(t *testing.T) (*DB, string) {
+	t.Helper()
+	source := openRegressionDB(t, nil)
+	t.Cleanup(func() { _ = source.Close() })
+	if err := source.Put([]byte("new"), []byte("after")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(source.GetOptions().DirPath, "z-conflict"), []byte("fixture"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := source.ExportSnapshot(); err != nil {
+		t.Fatal(err)
+	}
+	archive, err := latestSnapshotFile(source.GetOptions().SnapshotPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db := openRegressionDB(t, nil)
+	t.Cleanup(func() { _ = db.Close() })
+	if err := db.Put([]byte("old"), []byte("before")); err != nil {
+		t.Fatal(err)
+	}
+	return db, archive
+}
+
+func checkRestoredKey(t *testing.T, db *DB, key, expected string) {
+	t.Helper()
+	value, err := db.Get([]byte(key))
+	if expected == "" {
+		if !errors.Is(err, ErrKeyNotFound) {
+			t.Fatalf("get %q: %q, %v, want ErrKeyNotFound", key, value, err)
+		}
+	} else if err != nil || string(value) != expected {
+		t.Fatalf("get %q: %q, %v, want %q", key, value, err, expected)
+	}
 }
 
 func TestExportSnapshotEmptyPath(t *testing.T) {

@@ -36,6 +36,49 @@ type BatchCommand struct {
 	BatchID  uint64    `json:"batch_id"` // 批处理ID
 }
 
+type raftWriteCommand struct {
+	Command
+	Commands  []Command        `json:"commands"`
+	Migration *migrationChange `json:"migration,omitempty"`
+}
+
+func validateRaftWrite(cmd Command) error {
+	if cmd.Op != OpPut && cmd.Op != OpDelete {
+		return ErrInvalidRaftCommand
+	}
+	if len(cmd.Key) == 0 {
+		return ErrKeyIsEmpty
+	}
+	return nil
+}
+
+// Update reserves its error return for unrecoverable storage failures.
+func rejectedRaftResult(err error) statemachine.Result {
+	return statemachine.Result{Data: []byte(err.Error())}
+}
+
+func raftResultError(result statemachine.Result) error {
+	if len(result.Data) == 0 {
+		return nil
+	}
+	return decodeRaftError(string(result.Data))
+}
+
+func decodeRaftError(message string) error {
+	switch message {
+	case ErrInvalidRaftCommand.Error():
+		return ErrInvalidRaftCommand
+	case ErrKeyIsEmpty.Error():
+		return ErrKeyIsEmpty
+	case ErrStaleShardMapEpoch.Error():
+		return ErrStaleShardMapEpoch
+	case ErrShardMigrationConflict.Error():
+		return ErrShardMigrationConflict
+	default:
+		return errors.New(message)
+	}
+}
+
 // KVStateMachine 实现了Dragonboat的statemachine.IStateMachine接口
 // 它将数据库操作与Raft共识机制集成
 type KVStateMachine struct {
@@ -43,7 +86,16 @@ type KVStateMachine struct {
 	nodeID       uint64
 	db           KVEngine // 数据库核心接口
 	appliedIndex uint64
+	migrations   shardMigrations
 	mu           sync.RWMutex
+}
+
+type kvSnapshotMetadata struct {
+	AppliedIndex uint64           `json:"applied_index"`
+	ClusterID    uint64           `json:"cluster_id"`
+	NodeID       uint64           `json:"node_id"`
+	Timestamp    uint64           `json:"timestamp"`
+	Migrations   *shardMigrations `json:"migrations,omitempty"`
 }
 
 // NewKVStateMachine 创建一个新的KV状态机实例
@@ -76,8 +128,7 @@ func (s *KVStateMachine) Lookup(query interface{}) (interface{}, error) {
 	return s.db.Get(cmd.Key)
 }
 
-// Update 实现了statemachine.IStateMachine接口的Update方法
-// 用于应用Raft日志条目到状态机
+// AppliedIndex 返回最后处理的应用日志索引。
 func (s *KVStateMachine) AppliedIndex() uint64 {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -88,71 +139,66 @@ func (s *KVStateMachine) Update(entry statemachine.Entry) (statemachine.Result, 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	var processedCount uint64 = 0 // 统计处理的命令数量
-
-	// 检查是否已经应用过该条目
 	if entry.Index <= s.appliedIndex {
-		return statemachine.Result{Value: processedCount}, nil
+		return statemachine.Result{}, nil
 	}
-
-	// 先解析公共的 op 字段，再决定反序列化成 Command 还是 BatchCommand。
-	var envelope struct {
-		Op uint32 `json:"op"`
+	reject := func(err error) (statemachine.Result, error) {
+		s.appliedIndex = entry.Index
+		return rejectedRaftResult(err), nil
 	}
-	if err := json.Unmarshal(entry.Cmd, &envelope); err != nil {
-		return statemachine.Result{}, fmt.Errorf("failed to unmarshal operation: %v", err)
+	var write raftWriteCommand
+	if err := json.Unmarshal(entry.Cmd, &write); err != nil {
+		return reject(ErrInvalidRaftCommand)
 	}
-
-	switch envelope.Op {
+	var processedCount uint64
+	switch write.Op {
 	case OpPut, OpDelete:
-		var cmd Command
-		if err := json.Unmarshal(entry.Cmd, &cmd); err != nil {
-			return statemachine.Result{}, fmt.Errorf("failed to unmarshal command: %v", err)
+		if err := validateRaftWrite(write.Command); err != nil {
+			return reject(err)
 		}
-		switch cmd.Op {
-		case OpPut:
-			if err := s.db.Put(cmd.Key, cmd.Value); err != nil {
-				return statemachine.Result{}, fmt.Errorf("put failed: %v", err)
+		if write.Op == OpPut {
+			if err := s.db.Put(write.Key, write.Value); err != nil {
+				return statemachine.Result{}, fmt.Errorf("put failed: %w", err)
 			}
-		case OpDelete:
-			if err := s.db.Delete(cmd.Key); err != nil {
-				return statemachine.Result{}, fmt.Errorf("delete failed: %v", err)
+		} else {
+			if err := s.db.Delete(write.Key); err != nil {
+				return statemachine.Result{}, fmt.Errorf("delete failed: %w", err)
 			}
 		}
-		processedCount++
-
+		processedCount = 1
 	case OpBatch:
-		var batchCmd BatchCommand
-		if err := json.Unmarshal(entry.Cmd, &batchCmd); err != nil {
-			return statemachine.Result{}, fmt.Errorf("failed to unmarshal batch command: %v", err)
+		for _, cmd := range write.Commands {
+			if err := validateRaftWrite(cmd); err != nil {
+				return reject(err)
+			}
 		}
 		batch := s.db.NewBatch(DefaultBatchOptions)
-		// Commit 成功会解锁；失败/提前 return 时由 Close 兜底释放 db.mu
 		defer batch.Close()
-		for _, command := range batchCmd.Commands {
-			switch command.Op {
-			case OpPut:
-				if err := batch.Put(command.Key, command.Value); err != nil {
-					return statemachine.Result{}, fmt.Errorf("batch put failed: %v", err)
+		for _, cmd := range write.Commands {
+			if cmd.Op == OpPut {
+				if err := batch.Put(cmd.Key, cmd.Value); err != nil {
+					return statemachine.Result{}, fmt.Errorf("batch put failed: %w", err)
 				}
-			case OpDelete:
-				if err := batch.Delete(command.Key); err != nil {
-					return statemachine.Result{}, fmt.Errorf("batch delete failed: %v", err)
+			} else {
+				if err := batch.Delete(cmd.Key); err != nil {
+					return statemachine.Result{}, fmt.Errorf("batch delete failed: %w", err)
 				}
-			default:
-				return statemachine.Result{}, fmt.Errorf("unknown batch operation: %v", command.Op)
 			}
-			processedCount++
 		}
 		if err := batch.Commit(); err != nil {
-			return statemachine.Result{}, fmt.Errorf("batch commit failed: %v", err)
+			return statemachine.Result{}, fmt.Errorf("batch commit failed: %w", err)
 		}
-
+		processedCount = uint64(len(write.Commands))
+	case opShardMigration:
+		if write.Migration == nil || !write.Migration.valid(1) {
+			return reject(ErrInvalidRaftCommand)
+		}
+		result, _ := s.migrations.apply(*write.Migration)
+		s.appliedIndex = entry.Index
+		return result, nil
 	default:
-		return statemachine.Result{}, fmt.Errorf("unknown operation: %v", envelope.Op)
+		return reject(ErrInvalidRaftCommand)
 	}
-
-	// 更新已应用的索引
 	s.appliedIndex = entry.Index
 	return statemachine.Result{Value: processedCount}, nil
 }
@@ -184,11 +230,14 @@ func (s *KVStateMachine) SaveSnapshot(w io.Writer, fc statemachine.ISnapshotFile
 	s.db = db
 
 	// Write appliedIndex and other metadata to snapshot
-	metadata := map[string]uint64{
-		"applied_index": s.appliedIndex,
-		"cluster_id":    s.clusterID,
-		"node_id":       s.nodeID,
-		"timestamp":     uint64(time.Now().Unix()),
+	metadata := kvSnapshotMetadata{
+		AppliedIndex: s.appliedIndex,
+		ClusterID:    s.clusterID,
+		NodeID:       s.nodeID,
+		Timestamp:    uint64(time.Now().Unix()),
+	}
+	if !s.migrations.empty() {
+		metadata.Migrations = &s.migrations
 	}
 
 	// Serialize metadata
@@ -278,7 +327,7 @@ func (s *KVStateMachine) RecoverFromSnapshot(r io.Reader, files []statemachine.S
 	}
 
 	// 解析元数据
-	var metadata map[string]uint64
+	var metadata kvSnapshotMetadata
 	if err := json.Unmarshal(metadataBytes, &metadata); err != nil {
 		return fmt.Errorf("unmarshal matadata failed: %w", err)
 	}
@@ -330,9 +379,11 @@ func (s *KVStateMachine) RecoverFromSnapshot(r io.Reader, files []statemachine.S
 		}
 	}
 
-	// 使用KnociDB的导入功能恢复数据库状态 ImportSnapshot会自动关闭数据库
+	// 导入在快照校验通过后才关闭数据库。
 	if err = s.db.ImportSnapshot(importPath); err != nil {
-		// 导入失败，尝试重新打开数据库
+		if local, ok := s.db.(*DB); ok && !local.isClosing() {
+			return fmt.Errorf("import snapshot failed: %w", err)
+		}
 		db, openErr := Open(options)
 		if openErr != nil {
 			return fmt.Errorf("reopen database failed: %v, import snapshot failed: %w", openErr, err)
@@ -349,8 +400,10 @@ func (s *KVStateMachine) RecoverFromSnapshot(r io.Reader, files []statemachine.S
 	s.db = db
 
 	// 恢复appliedIndex
-	if index, ok := metadata["applied_index"]; ok {
-		s.appliedIndex = index
+	s.appliedIndex = metadata.AppliedIndex
+	s.migrations = shardMigrations{}
+	if metadata.Migrations != nil {
+		s.migrations = *metadata.Migrations
 	}
 
 	return nil
@@ -358,6 +411,8 @@ func (s *KVStateMachine) RecoverFromSnapshot(r io.Reader, files []statemachine.S
 
 // Close 实现了statemachine.IStateMachine接口的Close方法
 func (s *KVStateMachine) Close() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	return s.db.Close()
 }
 

@@ -17,12 +17,18 @@ type ShardMapStateMachine struct {
 	mu         sync.RWMutex
 	epoch      uint64
 	shardCount int
+	migrations shardMigrations
 }
 
 // ShardMapMeta 是 ShardMapStateMachine 使用的 JSON 载荷。
 type ShardMapMeta struct {
 	Epoch      uint64 `json:"epoch"`
 	ShardCount int    `json:"shard_count"`
+}
+
+type shardMapUpdate struct {
+	ShardMapMeta
+	Migration *migrationChange `json:"migration,omitempty"`
 }
 
 func NewShardMapStateMachine(epoch uint64, shardCount int) *ShardMapStateMachine {
@@ -39,17 +45,27 @@ func (s *ShardMapStateMachine) Lookup(query interface{}) (interface{}, error) {
 }
 
 func (s *ShardMapStateMachine) Update(entry statemachine.Entry) (statemachine.Result, error) {
-	var meta ShardMapMeta
-	if err := json.Unmarshal(entry.Cmd, &meta); err != nil {
-		return statemachine.Result{}, err
-	}
-	if meta.ShardCount <= 0 {
-		return statemachine.Result{}, fmt.Errorf("invalid shard count")
+	var meta shardMapUpdate
+	if err := json.Unmarshal(entry.Cmd, &meta); err != nil || meta.ShardCount <= 0 {
+		return rejectedRaftResult(ErrInvalidRaftCommand), nil
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if meta.Migration != nil {
+		if meta.Epoch != 0 || meta.ShardCount != s.shardCount || !meta.Migration.valid(s.shardCount) {
+			return rejectedRaftResult(ErrInvalidRaftCommand), nil
+		}
+		result, completed := s.migrations.apply(*meta.Migration)
+		if completed {
+			s.epoch++
+		}
+		return result, nil
+	}
+	if meta.Epoch == 0 {
+		return rejectedRaftResult(ErrInvalidRaftCommand), nil
+	}
 	if meta.Epoch < s.epoch {
-		return statemachine.Result{}, fmt.Errorf("stale shard map epoch")
+		return rejectedRaftResult(ErrStaleShardMapEpoch), nil
 	}
 	s.epoch = meta.Epoch
 	s.shardCount = meta.ShardCount
@@ -67,8 +83,10 @@ func (s *ShardMapStateMachine) SaveSnapshot(w io.Writer, _ statemachine.ISnapsho
 	var buf [16]byte
 	binary.BigEndian.PutUint64(buf[0:8], s.epoch)
 	binary.BigEndian.PutUint64(buf[8:16], uint64(s.shardCount))
-	_, err := w.Write(buf[:])
-	return err
+	if _, err := w.Write(buf[:]); err != nil || s.migrations.empty() {
+		return err
+	}
+	return json.NewEncoder(w).Encode(s.migrations)
 }
 
 func (s *ShardMapStateMachine) RecoverFromSnapshot(r io.Reader, _ []statemachine.SnapshotFile, done <-chan struct{}) error {
@@ -86,9 +104,14 @@ func (s *ShardMapStateMachine) RecoverFromSnapshot(r io.Reader, _ []statemachine
 	if epoch == 0 || count == 0 {
 		return fmt.Errorf("invalid shard map snapshot")
 	}
+	var migrations shardMigrations
+	if err := json.NewDecoder(r).Decode(&migrations); err != nil && err != io.EOF {
+		return fmt.Errorf("read snapshot migrations: %w", err)
+	}
 	s.mu.Lock()
 	s.epoch = epoch
 	s.shardCount = int(count)
+	s.migrations = migrations
 	s.mu.Unlock()
 	return nil
 }
@@ -101,7 +124,15 @@ func (s *ShardMapStateMachine) GetHash() (uint64, error) {
 	var buf [16]byte
 	binary.BigEndian.PutUint64(buf[0:8], s.epoch)
 	binary.BigEndian.PutUint64(buf[8:16], uint64(s.shardCount))
-	return xxhash.Sum64(buf[:]), nil
+	if s.migrations.empty() {
+		return xxhash.Sum64(buf[:]), nil
+	}
+	hash := xxhash.New()
+	_, _ = hash.Write(buf[:])
+	if err := json.NewEncoder(hash).Encode(s.migrations); err != nil {
+		return 0, err
+	}
+	return hash.Sum64(), nil
 }
 
 func (s *ShardMapStateMachine) Meta() ShardMapMeta {
