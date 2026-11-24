@@ -152,6 +152,41 @@ func TestS3StorageOperations(t *testing.T) {
 	})
 }
 
+func TestNewObjectStorageFromConfigYAML(t *testing.T) {
+	dir := t.TempDir()
+	origDir, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = os.Chdir(origDir)
+	})
+	cfg := `object_storage:
+  type: s3
+  endpoint: http://127.0.0.1:9000
+  region: us-east-1
+  bucket: test-bucket
+  accesskey: ak
+  secretkey: sk # inline comment
+`
+	if err := os.WriteFile(filepath.Join(dir, "config.yaml"), []byte(cfg), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	storage, err := NewObjectStorage()
+	if err != nil {
+		t.Fatalf("NewObjectStorage failed: %v", err)
+	}
+	if storage == nil {
+		t.Fatal("expected non-nil storage")
+	}
+	if err := storage.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestNewObjectStorageConfigErrors(t *testing.T) {
 	if _, err := NewObjectStorageWithConfig(ObjectStorageConfig{Type: "unknown"}); err == nil {
 		t.Fatal("unknown storage type should fail")

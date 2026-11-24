@@ -3,8 +3,10 @@ package main
 import (
 	"bufio"
 	"context"
+	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -466,6 +468,10 @@ func main() {
 			fmt.Print("knocidb> ")
 			line, err := reader.ReadString('\n')
 			if err != nil {
+				if errors.Is(err, io.EOF) {
+					running = false
+					break
+				}
 				fmt.Printf("error scan %v\n", err)
 				continue
 			}

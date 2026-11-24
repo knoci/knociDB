@@ -7,8 +7,7 @@ import (
 	"os"
 	"testing"
 
-	"github.com/bwmarrin/snowflake"
-	"github.com/dgraph-io/badger/v4/y"
+	"github.com/knoci/knocidb/internal/arenaskl"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -99,8 +98,6 @@ func TestMemTablePutAllKindsEntries(t *testing.T) {
 		Sync:       false,
 		DisableWal: false,
 	}
-	node, err := snowflake.NewNode(1)
-	require.NoError(t, err)
 
 	logs := []*LogRecord{
 		{Key: []byte("key 0"), Value: []byte("value 0"), Type: LogRecordNormal},
@@ -125,7 +122,7 @@ func TestMemTablePutAllKindsEntries(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err = table.putBatch(tt.args.entry, node.Generate(), writeOpts)
+			err = table.putBatch(tt.args.entry, nextBatchID(), writeOpts)
 			assert.NoError(t, err)
 		})
 	}
@@ -156,8 +153,6 @@ func TestMemTablePutBatch(t *testing.T) {
 		Sync:       false,
 		DisableWal: false,
 	}
-	node, err := snowflake.NewNode(1)
-	require.NoError(t, err)
 
 	pendingWrites := make(map[string]*LogRecord)
 	val := util.RandomValue(512)
@@ -167,7 +162,7 @@ func TestMemTablePutBatch(t *testing.T) {
 	}
 
 	t.Run("test memory table put batch", func(t *testing.T) {
-		err = table.putBatch(pendingWrites, node.Generate(), writeOpts)
+		err = table.putBatch(pendingWrites, nextBatchID(), writeOpts)
 		assert.NoError(t, err)
 	})
 
@@ -197,8 +192,6 @@ func TestMemTablePutBatchReopen(t *testing.T) {
 		Sync:       false,
 		DisableWal: false,
 	}
-	node, err := snowflake.NewNode(1)
-	require.NoError(t, err)
 
 	pendingWrites := make(map[string]*LogRecord)
 	val := util.RandomValue(512)
@@ -207,7 +200,7 @@ func TestMemTablePutBatchReopen(t *testing.T) {
 		pendingWrites[string(log.Key)] = log
 	}
 
-	err = table.putBatch(pendingWrites, node.Generate(), writeOpts)
+	err = table.putBatch(pendingWrites, nextBatchID(), writeOpts)
 	require.NoError(t, err)
 
 	t.Run("test memory table put batch after reopening", func(t *testing.T) {
@@ -215,7 +208,7 @@ func TestMemTablePutBatchReopen(t *testing.T) {
 		require.NoError(t, err)
 		table, err = openMemtable(opts)
 		require.NoError(t, err)
-		err = table.putBatch(pendingWrites, node.Generate(), writeOpts)
+		err = table.putBatch(pendingWrites, nextBatchID(), writeOpts)
 		require.NoError(t, err)
 	})
 
@@ -245,8 +238,6 @@ func TestMemTableGet(t *testing.T) {
 		Sync:       false,
 		DisableWal: false,
 	}
-	node, err := snowflake.NewNode(1)
-	require.NoError(t, err)
 
 	writeLogs := map[string]*LogRecord{
 		"key 0": {Key: []byte("key 0"), Value: []byte("value 0"), Type: LogRecordNormal},
@@ -259,7 +250,7 @@ func TestMemTableGet(t *testing.T) {
 		"key 2": {Key: []byte("key 2"), Value: []byte(""), Type: LogRecordDeleted},
 	}
 
-	err = table.putBatch(writeLogs, node.Generate(), writeOpts)
+	err = table.putBatch(writeLogs, nextBatchID(), writeOpts)
 	require.NoError(t, err)
 	t.Run("get existing log", func(t *testing.T) {
 		for keyStr, log := range writeLogs {
@@ -269,7 +260,7 @@ func TestMemTableGet(t *testing.T) {
 		}
 	})
 
-	err = table.putBatch(deleteLogs, node.Generate(), writeOpts)
+	err = table.putBatch(deleteLogs, nextBatchID(), writeOpts)
 	require.NoError(t, err)
 	t.Run("get deleted log", func(t *testing.T) {
 		for keyStr, log := range deleteLogs {
@@ -303,8 +294,6 @@ func TestMemTableGetReopen(t *testing.T) {
 		Sync:       false,
 		DisableWal: false,
 	}
-	node, err := snowflake.NewNode(1)
-	require.NoError(t, err)
 	t.Run("get existing log reopen", func(t *testing.T) {
 		var table *memtable
 		table, err = openMemtable(opts)
@@ -314,7 +303,7 @@ func TestMemTableGetReopen(t *testing.T) {
 			"":      {Key: nil, Value: []byte("value 1"), Type: LogRecordNormal},
 			"key 2": {Key: []byte("key 2"), Value: []byte(""), Type: LogRecordNormal},
 		}
-		err = table.putBatch(writeLogs, node.Generate(), writeOpts)
+		err = table.putBatch(writeLogs, nextBatchID(), writeOpts)
 		require.NoError(t, err)
 		err = table.close()
 		require.NoError(t, err)
@@ -339,7 +328,7 @@ func TestMemTableGetReopen(t *testing.T) {
 			"":      {Key: nil, Value: []byte(""), Type: LogRecordDeleted},
 			"key 2": {Key: []byte("key 2"), Value: []byte(""), Type: LogRecordDeleted},
 		}
-		err = table.putBatch(deleteLogs, node.Generate(), writeOpts)
+		err = table.putBatch(deleteLogs, nextBatchID(), writeOpts)
 		require.NoError(t, err)
 
 		for keyStr, log := range deleteLogs {
@@ -418,8 +407,6 @@ func TestMemTableSync(t *testing.T) {
 		Sync:       false,
 		DisableWal: false,
 	}
-	node, err := snowflake.NewNode(1)
-	require.NoError(t, err)
 
 	pendingWrites := make(map[string]*LogRecord)
 	val := util.RandomValue(512)
@@ -427,7 +414,7 @@ func TestMemTableSync(t *testing.T) {
 		log := &LogRecord{Key: util.GetTestKey(int64(i)), Value: val}
 		pendingWrites[string(log.Key)] = log
 	}
-	err = table.putBatch(pendingWrites, node.Generate(), writeOpts)
+	err = table.putBatch(pendingWrites, nextBatchID(), writeOpts)
 	require.NoError(t, err)
 
 	t.Run("test memtable delete wal", func(t *testing.T) {
@@ -491,7 +478,7 @@ func TestNewMemtableIterator(t *testing.T) {
 	options := IteratorOptions{
 		Reverse: false,
 	}
-	iter := newMemtableIterator(options, table)
+	iter := newMemtableIterator(options, table, 0)
 	require.NoError(t, err)
 
 	err = iter.Close()
@@ -521,8 +508,6 @@ func Test_memtableIterator(t *testing.T) {
 		Sync:       false,
 		DisableWal: false,
 	}
-	node, err := snowflake.NewNode(1)
-	require.NoError(t, err)
 	writeLogs := map[string]*LogRecord{
 		"key 0": {Key: []byte("key 0"), Value: []byte("value 0"), Type: LogRecordNormal},
 		"key 1": {Key: nil, Value: []byte("value 1"), Type: LogRecordNormal},
@@ -533,21 +518,21 @@ func Test_memtableIterator(t *testing.T) {
 		"key 3": {Key: nil, Value: []byte("key 3"), Type: LogRecordNormal},
 		"abc 1": {Key: []byte("abc 1"), Value: []byte(""), Type: LogRecordNormal},
 	}
-	err = table.putBatch(writeLogs, node.Generate(), writeOpts)
+	err = table.putBatch(writeLogs, nextBatchID(), writeOpts)
 	require.NoError(t, err)
 
 	iteratorOptions := IteratorOptions{
 		Reverse: false,
 	}
-	itr := newMemtableIterator(iteratorOptions, table)
+	itr := newMemtableIterator(iteratorOptions, table, 0)
 	require.NoError(t, err)
 	var prev []byte
 	itr.Rewind()
 	for itr.Valid() {
 		currKey := itr.Key()
 		assert.True(t, prev == nil || bytes.Compare(prev, currKey) == -1)
-		assert.Equal(t, writeLogs[string(currKey)].Value, itr.Value().(y.ValueStruct).Value)
-		assert.Equal(t, writeLogs[string(currKey)].Type, itr.Value().(y.ValueStruct).Meta)
+		assert.Equal(t, writeLogs[string(currKey)].Value, itr.Value().(arenaskl.ValueStruct).Value)
+		assert.Equal(t, writeLogs[string(currKey)].Type, itr.Value().(arenaskl.ValueStruct).Meta)
 		prev = currKey
 		itr.Next()
 	}
@@ -556,22 +541,22 @@ func Test_memtableIterator(t *testing.T) {
 
 	iteratorOptions.Reverse = true
 	prev = nil
-	itr = newMemtableIterator(iteratorOptions, table)
+	itr = newMemtableIterator(iteratorOptions, table, 0)
 	require.NoError(t, err)
 	itr.Rewind()
 	for itr.Valid() {
 		currKey := itr.Key()
 		assert.True(t, prev == nil || bytes.Compare(prev, currKey) == 1)
 		prev = currKey
-		assert.Equal(t, writeLogs[string(currKey)].Value, itr.Value().(y.ValueStruct).Value)
-		assert.Equal(t, writeLogs[string(currKey)].Type, itr.Value().(y.ValueStruct).Meta)
+		assert.Equal(t, writeLogs[string(currKey)].Value, itr.Value().(arenaskl.ValueStruct).Value)
+		assert.Equal(t, writeLogs[string(currKey)].Type, itr.Value().(arenaskl.ValueStruct).Meta)
 		itr.Next()
 	}
 	err = itr.Close()
 	require.NoError(t, err)
 
 	iteratorOptions.Reverse = false
-	itr = newMemtableIterator(iteratorOptions, table)
+	itr = newMemtableIterator(iteratorOptions, table, 0)
 	require.NoError(t, err)
 	itr.Seek([]byte("key 0"))
 	assert.Equal(t, []byte("key 0"), itr.Key())
@@ -584,7 +569,7 @@ func Test_memtableIterator(t *testing.T) {
 	require.NoError(t, err)
 
 	iteratorOptions.Reverse = true
-	itr = newMemtableIterator(iteratorOptions, table)
+	itr = newMemtableIterator(iteratorOptions, table, 0)
 	require.NoError(t, err)
 	itr.Seek([]byte("key 4"))
 	assert.Equal(t, []byte("key 2"), itr.Key())
@@ -599,12 +584,12 @@ func Test_memtableIterator(t *testing.T) {
 	require.NoError(t, err)
 
 	// prefix
-	err = table.putBatch(writeLogs2, node.Generate(), writeOpts)
+	err = table.putBatch(writeLogs2, nextBatchID(), writeOpts)
 	require.NoError(t, err)
 
 	iteratorOptions.Reverse = false
 	iteratorOptions.Prefix = []byte("not valid")
-	itr = newMemtableIterator(iteratorOptions, table)
+	itr = newMemtableIterator(iteratorOptions, table, 0)
 	require.NoError(t, err)
 	itr.Rewind()
 	assert.False(t, itr.Valid())
@@ -613,12 +598,12 @@ func Test_memtableIterator(t *testing.T) {
 
 	iteratorOptions.Reverse = false
 	iteratorOptions.Prefix = []byte("abc")
-	itr = newMemtableIterator(iteratorOptions, table)
+	itr = newMemtableIterator(iteratorOptions, table, 0)
 	require.NoError(t, err)
 	itr.Rewind()
 	for itr.Valid() {
 		assert.True(t, bytes.HasPrefix(itr.Key(), iteratorOptions.Prefix))
-		assert.Equal(t, writeLogs2[string(itr.Key())].Value, itr.Value().(y.ValueStruct).Value)
+		assert.Equal(t, writeLogs2[string(itr.Key())].Value, itr.Value().(arenaskl.ValueStruct).Value)
 		itr.Next()
 	}
 	err = itr.Close()

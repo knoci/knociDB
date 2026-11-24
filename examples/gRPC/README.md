@@ -38,8 +38,8 @@ go run ./examples/gRPC/server \
 ```
 
 Notes:
-- With `--mtls` and `--tls-ca`, the client must present a certificate.
-- With `--token`, all RPCs must carry the token or return `Unauthenticated`.
+- `--mtls` requires a client CA. Clients must present a certificate and key.
+- `--token` requires TLS. RPCs without a valid token return `Unauthenticated`.
 
 ## Run Client
 
@@ -49,15 +49,19 @@ Start interactive client (no TLS/auth):
 go run ./examples/gRPC/client --addr 127.0.0.1:50051
 ```
 
-TLS/mTLS + Token:
+mTLS + Token:
 
 ```bash
 go run ./examples/gRPC/client \
   --addr localhost:8443 \
   --tls-ca ca.crt \
   --tls-server-name localhost \
+  --client-cert client.crt \
+  --client-key client.key \
   --token secret
 ```
+
+For one-way TLS, omit the client certificate and key. Use `--tls` without `--tls-ca` to verify the server with system trust roots.
 
 Commands: `HELP`, `GET key`, `PUT key value`, `DEL key [key...]`, `SCAN start end`, `BEGIN`, `BPUT key value`, `BDEL key`, `COMMIT`, `DISCARD`, `EXIT`.
 

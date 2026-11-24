@@ -2,6 +2,8 @@
 
 这是一个交互式命令行客户端，允许用户直接连接和操作KnociDB数据库。
 
+> **生产部署提示：** 如需无交互单机 gRPC 服务或 Multi-Raft 集群守护进程（内置 Prometheus `/metrics`、`/healthz`、`/readyz`、`/debug/pprof/`、`slog` 结构化日志与容器镜像支持），请使用统一服务端入口 [`cmd/knocidb`](../../cmd/knocidb/main.go)。
+
 ## 功能特点
 
 - 支持基本的CRUD操作（GET、PUT、DEL等）

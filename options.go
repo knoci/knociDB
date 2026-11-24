@@ -126,11 +126,11 @@ const (
 	GB = 1024 * MB
 )
 
-// 默认选项
+// 默认选项（纯静态默认值，包初始化阶段不创建任何临时目录，避免 import 泄漏空目录）
 var DefaultOptions = Options{
-	DirPath:                        tempDBDir(),
-	SnapshotPath:                   tempSnapDir(),
-	ClusterPath:                    tempClusterDir(),
+	DirPath:                        filepath.Join(os.TempDir(), "knocidb-data"),
+	SnapshotPath:                   filepath.Join(os.TempDir(), "knocidb-snapshot"),
+	ClusterPath:                    filepath.Join(os.TempDir(), "knocidb-cluster"),
 	MemtableSize:                   64 * MB,
 	MemtableNums:                   15,
 	Sync:                           false,
@@ -153,6 +153,17 @@ var DefaultOptions = Options{
 	BloomFilterFalsePositiveRate:   0.01,
 	BloomFilterSaveIntervalSeconds: 30,
 	BloomFilterSaveChangeThreshold: 1000,
+}
+
+// NewDefaultOptions 返回指向指定数据目录的默认配置副本，推荐用于生产环境初始化。
+func NewDefaultOptions(dirPath string) Options {
+	opts := DefaultOptions
+	if dirPath != "" {
+		opts.DirPath = dirPath
+		opts.SnapshotPath = filepath.Join(dirPath, "snapshots")
+		opts.ClusterPath = filepath.Join(dirPath, "cluster")
+	}
+	return opts
 }
 
 var DefaultBatchOptions = BatchOptions{
@@ -186,8 +197,16 @@ type ClusterOptions struct {
 	ElectionRTTMs uint64
 	// HeartbeatRTTMs 是心跳超时，单位为心跳间隔的倍数
 	HeartbeatRTTMs uint64
-	// SnapshotIntervalSeconds 是自动创建快照的间隔，单位为秒
+	// SnapshotIntervalSeconds 兼容旧配置字段；当 SnapshotEntries 为 0 时回退使用。
 	SnapshotIntervalSeconds uint64
+	// SnapshotEntries 指定每提交多少条 Raft 日志触发一次快照，默认 100000（0 表示禁用自动快照）。
+	SnapshotEntries uint64
+	// CompactionOverhead 指定快照后保留的 Raft 日志条数，默认 10000。
+	CompactionOverhead uint64
+	// DeploymentID 隔离不同集群的 Raft 网络消息，默认 1。
+	DeploymentID uint64
+	// MigrationTimeout 等待 learner 追平日志的超时时间，默认 60s。
+	MigrationTimeout time.Duration
 	// Sync 指定节点是同步还是异步更新状态
 	Sync bool
 
@@ -196,10 +215,18 @@ type ClusterOptions struct {
 	// PeerRPC 是 NodeID -> 内部转发 RPC 地址的映射。
 	PeerRPC map[uint64]string
 	// RPCSecret 是内部转发 RPC 的共享密钥；为空表示不鉴权。
-	// 密钥以明文传输，生产环境应部署在私网/VPN 中，并等待后续 mTLS 支持。
 	RPCSecret string
 	// RPCTimeout 是内部转发 RPC 的超时时间，默认 5s。
 	RPCTimeout time.Duration
+
+	// MutualTLS 为 Dragonboat Raft 传输层和内部转发 RPC 同时启用双向 TLS (mTLS)。
+	MutualTLS bool
+	// CAFile 是用于校验对端证书的 CA 证书文件路径（MutualTLS=true 时必填）。
+	CAFile string
+	// CertFile 是本节点服务端/客户端 TLS 证书文件路径（MutualTLS=true 时必填）。
+	CertFile string
+	// KeyFile 是本节点 TLS 私钥文件路径（MutualTLS=true 时必填）。
+	KeyFile string
 
 	// ShardCount 是固定预分片的 Raft Group 数量，默认 1。
 	ShardCount int
@@ -207,24 +234,45 @@ type ClusterOptions struct {
 	ShardMapEpoch uint64
 	// IsLearner 让本节点以 non-voting 成员启动，等待 leader 提升。
 	IsLearner bool
-	// OrderedConfigChange 要求成员变更携带当前配置版本。仅在新建集群时启用，
-	// 所有节点必须使用相同的设置，避免改变历史成员变更日志的回放语义。
+	// OrderedConfigChange 要求成员变更携带当前配置版本，默认 true。
 	OrderedConfigChange bool
 }
 
 // GetNodeHostOptions 返回Dragonboat节点主机配置
 func (c *ClusterOptions) GetNodeHostOptions() config.NodeHostConfig {
+	deploymentID := c.DeploymentID
+	if deploymentID == 0 {
+		deploymentID = 1
+	}
 	return config.NodeHostConfig{
 		RaftAddress:    c.RaftAddress,
 		NodeHostDir:    filepath.Join(c.DataDir, "nodehost"),
 		RTTMillisecond: c.TickMs,
 		WALDir:         filepath.Join(c.DataDir, "wal"),
-		DeploymentID:   1,
+		DeploymentID:   deploymentID,
+		MutualTLS:      c.MutualTLS,
+		CAFile:         c.CAFile,
+		CertFile:       c.CertFile,
+		KeyFile:        c.KeyFile,
 	}
 }
 
 // GetRaftConfig 返回 Dragonboat 的 Raft 配置。
 func (c *ClusterOptions) GetRaftConfig() config.Config {
+	snapshotEntries := c.SnapshotEntries
+	if snapshotEntries == 0 && c.SnapshotIntervalSeconds > 0 {
+		snapshotEntries = c.SnapshotIntervalSeconds
+	}
+	compactionOverhead := c.CompactionOverhead
+	if compactionOverhead == 0 {
+		compactionOverhead = 10000
+	}
+	if snapshotEntries > 0 && compactionOverhead >= snapshotEntries {
+		compactionOverhead = snapshotEntries / 2
+		if compactionOverhead == 0 {
+			compactionOverhead = 1
+		}
+	}
 	return config.Config{
 		ReplicaID:               c.NodeID,
 		ShardID:                 c.ClusterID,
@@ -232,8 +280,8 @@ func (c *ClusterOptions) GetRaftConfig() config.Config {
 		HeartbeatRTT:            c.HeartbeatRTTMs,
 		CheckQuorum:             true,
 		OrderedConfigChange:     c.OrderedConfigChange,
-		SnapshotEntries:         c.SnapshotIntervalSeconds,
-		CompactionOverhead:      5,
+		SnapshotEntries:         snapshotEntries,
+		CompactionOverhead:      compactionOverhead,
 		IsNonVoting:             c.IsLearner,
 		SnapshotCompressionType: config.Snappy,
 		EntryCompressionType:    config.Snappy,
@@ -254,11 +302,16 @@ func DefaultClusterOptions(nodeID, clusterID uint64, raftAddress, dataDir string
 		TickMs:                  100,
 		ElectionRTTMs:           10,
 		HeartbeatRTTMs:          1,
-		SnapshotIntervalSeconds: 3600, // 默认每小时创建一次快照
+		SnapshotIntervalSeconds: 3600,
+		SnapshotEntries:         100000,
+		CompactionOverhead:      10000,
+		DeploymentID:            1,
+		MigrationTimeout:        60 * time.Second,
 		Sync:                    true,
 		RPCTimeout:              5 * time.Second,
 		ShardCount:              1,
 		ShardMapEpoch:           1,
+		OrderedConfigChange:     true,
 	}
 	opt.InitialMembers[nodeID] = raftAddress
 	return opt
@@ -267,6 +320,12 @@ func DefaultClusterOptions(nodeID, clusterID uint64, raftAddress, dataDir string
 func (c *ClusterOptions) applyDefaults() {
 	if c.RPCTimeout <= 0 {
 		c.RPCTimeout = 5 * time.Second
+	}
+	if c.MigrationTimeout <= 0 {
+		c.MigrationTimeout = 60 * time.Second
+	}
+	if c.DeploymentID == 0 {
+		c.DeploymentID = 1
 	}
 	if c.ShardCount <= 0 {
 		c.ShardCount = 1

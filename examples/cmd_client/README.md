@@ -2,6 +2,8 @@
 
 This is an interactive command line client that allows users to directly connect to and operate the KnociDB database.
 
+> **Production Note:** For headless standalone gRPC or Multi-Raft cluster server deployments (with Prometheus `/metrics`, `/healthz`, `/readyz`, `/debug/pprof/`, `slog` JSON logging, and Docker support), use the unified server entrypoint under [`cmd/knocidb`](../../cmd/knocidb/main.go).
+
 ## Features
 
 - Supports basic CRUD operations (GET, PUT, DEL, etc.)

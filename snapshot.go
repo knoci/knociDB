@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/klauspost/compress/zstd"
@@ -26,22 +27,38 @@ const (
 	snapshotExpire = 365 * 24 * time.Hour
 )
 
+var snapshotSeq atomic.Uint64
+
+func nextSnapshotStamp() string {
+	now := time.Now().UTC()
+	seq := snapshotSeq.Add(1)
+	return fmt.Sprintf("%s.%09d-%06d", now.Format(snapshotLayout), now.Nanosecond(), seq%1000000)
+}
+
+func parseSnapshotTimestamp(name string) (time.Time, error) {
+	base := strings.TrimSuffix(name, snapshotExt)
+	if len(base) >= len(snapshotLayout) {
+		return time.Parse(snapshotLayout, base[:len(snapshotLayout)])
+	}
+	return time.Parse(snapshotLayout, base)
+}
+
 // ExportSnapshot 导出离线快照。导出会关闭数据库，调用方需要之后重新 Open。
 func (db *DB) ExportSnapshot() error {
-	if db.closed {
+	if db.closed.Load() {
 		return fmt.Errorf("export snapshot failed: database is closed")
-	}
-	if err := db.Close(); err != nil {
-		return fmt.Errorf("export snapshot failed: close database: %w", err)
 	}
 	if db.options.SnapshotPath == "" {
 		return fmt.Errorf("snapshot path is empty")
+	}
+	if err := db.Close(); err != nil {
+		return fmt.Errorf("export snapshot failed: close database: %w", err)
 	}
 	if err := os.MkdirAll(db.options.SnapshotPath, os.ModePerm); err != nil {
 		return fmt.Errorf("create snapshot directory: %w", err)
 	}
 
-	timestamp := time.Now().Format(snapshotLayout)
+	timestamp := nextSnapshotStamp()
 	snapFile := filepath.Join(db.options.SnapshotPath, timestamp+snapshotExt)
 	tmpCopyDir := filepath.Join(db.options.SnapshotPath, "tmp_snapshot_copy_"+timestamp)
 	if err := os.MkdirAll(tmpCopyDir, os.ModePerm); err != nil {
@@ -71,6 +88,11 @@ func (db *DB) ExportSnapshot() error {
 	if err := writeSnapshotArchive(tmpCopyDir, snapFile); err != nil {
 		return fmt.Errorf("write snapshot archive: %w", err)
 	}
+	if manifest, err := buildSnapshotManifest(snapFile, tmpCopyDir); err == nil {
+		if err := writeSnapshotManifest(snapFile+snapshotManifestExt, manifest); err != nil {
+			return fmt.Errorf("write snapshot manifest: %w", err)
+		}
+	}
 	log.Printf("Snapshot exported: %s", snapFile)
 	if err := uploadSnapshotWithOptions(db.options, snapFile); err != nil {
 		return fmt.Errorf("upload snapshot to object storage failed: %w", err)
@@ -79,7 +101,8 @@ func (db *DB) ExportSnapshot() error {
 	return nil
 }
 
-// latestSnapshotFile 返回快照目录中文件名最大的 .ZST 文件。
+// latestSnapshotFile 返回快照目录中文件名最大的正式 .ZST 快照文件，
+// 跳过 recover-*.ZST 等临时恢复文件。
 func latestSnapshotFile(snapDir string) (string, error) {
 	files, err := os.ReadDir(snapDir)
 	if err != nil {
@@ -87,8 +110,9 @@ func latestSnapshotFile(snapDir string) (string, error) {
 	}
 	var names []string
 	for _, f := range files {
-		if !f.IsDir() && strings.HasSuffix(f.Name(), snapshotExt) {
-			names = append(names, f.Name())
+		name := f.Name()
+		if !f.IsDir() && strings.HasSuffix(name, snapshotExt) && !strings.HasPrefix(name, "recover-") {
+			names = append(names, name)
 		}
 	}
 	if len(names) == 0 {
@@ -107,14 +131,14 @@ func (db *DB) cleanupSnapshots(snapDir string) {
 	}
 	var snaps []os.DirEntry
 	for _, f := range files {
-		if strings.HasSuffix(f.Name(), snapshotExt) {
+		if !f.IsDir() && strings.HasSuffix(f.Name(), snapshotExt) && !strings.HasPrefix(f.Name(), "recover-") {
 			snaps = append(snaps, f)
 		}
 	}
 	sort.Slice(snaps, func(i, j int) bool {
 		return snaps[i].Name() < snaps[j].Name()
 	})
-	now := time.Now()
+	now := time.Now().UTC()
 	var toDelete []string
 	for i, f := range snaps {
 		name := f.Name()
@@ -122,7 +146,7 @@ func (db *DB) cleanupSnapshots(snapDir string) {
 			toDelete = append(toDelete, filepath.Join(snapDir, name))
 			continue
 		}
-		ts, err := time.Parse(snapshotLayout, strings.TrimSuffix(name, snapshotExt))
+		ts, err := parseSnapshotTimestamp(name)
 		if err == nil && now.Sub(ts) > snapshotExpire {
 			toDelete = append(toDelete, filepath.Join(snapDir, name))
 		}

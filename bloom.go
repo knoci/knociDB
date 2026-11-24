@@ -248,7 +248,10 @@ func (bf *BloomFilter) Clear() {
 func (bf *BloomFilter) EstimateFalsePositiveRate() float64 {
 	bf.mu.RLock()
 	defer bf.mu.RUnlock()
+	return bf.estimateFalsePositiveRateLocked()
+}
 
+func (bf *BloomFilter) estimateFalsePositiveRateLocked() float64 {
 	if bf.filter == nil || bf.size == 0 {
 		return 0.0
 	}
@@ -394,7 +397,7 @@ func (bf *BloomFilter) GetStats() map[string]interface{} {
 	if bf.filter != nil {
 		stats["capacity"] = bf.filter.Cap()
 		stats["hash_functions"] = bf.filter.K()
-		stats["false_positive_rate"] = bf.EstimateFalsePositiveRate()
+		stats["false_positive_rate"] = bf.estimateFalsePositiveRateLocked()
 	} else {
 		stats["capacity"] = 0
 		stats["hash_functions"] = 0
@@ -412,6 +415,7 @@ type BloomFilterManager struct {
 	saveInterval  time.Duration
 	saveThreshold int
 	stopCh        chan struct{}
+	autoSaveWG    sync.WaitGroup
 	started       bool
 }
 
@@ -465,19 +469,11 @@ func (bfm *BloomFilterManager) GetFilter(partitionID int) *BloomFilter {
 	return filter
 }
 
-// AddKey 向指定分区添加键
+// AddKey 向指定分区添加键（仅更新内存位图，避免在启动重建或刷盘热路径中同步 fsync 落盘）。
 func (bfm *BloomFilterManager) AddKey(key []byte) {
 	partitionID := int(bfm.options.keyHashFunction(key) % uint64(bfm.options.PartitionNum))
 	filter := bfm.GetFilter(partitionID)
 	filter.Add(key)
-	if bfm.saveThreshold > 0 {
-		filter.mu.RLock()
-		shouldSave := filter.dirty && int(filter.dirtyCount) >= bfm.saveThreshold
-		filter.mu.RUnlock()
-		if shouldSave {
-			_ = filter.Save()
-		}
-	}
 }
 
 // TestKey 检查键是否可能存在于指定分区
@@ -529,8 +525,10 @@ func (bfm *BloomFilterManager) StartAutoSave() {
 	bfm.started = true
 	stopCh := bfm.stopCh
 	interval := bfm.saveInterval
+	bfm.autoSaveWG.Add(1)
 	bfm.mu.Unlock()
 	go func() {
+		defer bfm.autoSaveWG.Done()
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 		for {
@@ -553,6 +551,7 @@ func (bfm *BloomFilterManager) StopAutoSave() {
 	bfm.started = false
 	close(bfm.stopCh)
 	bfm.mu.Unlock()
+	bfm.autoSaveWG.Wait()
 }
 
 // ClearAll 清空所有布隆过滤器

@@ -2,7 +2,6 @@ package knocidb
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -32,20 +31,24 @@ var (
 	ErrClusterUnauthorized = errors.New("cluster rpc unauthorized")
 )
 
-// ClusterDB 管理单 Raft Group 集群节点和共识操作。
+// ClusterDB 管理多 Raft Group 集群节点和共识操作。
 type ClusterDB struct {
 	nodeHost        *dragonboat.NodeHost
 	config          ClusterOptions
 	dbOptions       Options
 	mu              sync.RWMutex
-	leaderID        uint64
+	leaderID        atomic.Uint64
 	stateMachine    *KVStateMachine
 	shards          []*clusterShard
 	leaderIDs       []uint64
 	metadataGroupID uint64
 	metadataSM      *ShardMapStateMachine
-	state           bool
+	state           atomic.Bool
 	Sync            bool // 是否使用同步模式进行操作
+
+	stopCh    chan struct{}
+	stopOnce  sync.Once
+	monitorWG sync.WaitGroup
 
 	rpcListener net.Listener
 	rpcWG       sync.WaitGroup
@@ -57,7 +60,7 @@ type ClusterDB struct {
 	forwardedOps atomic.Uint64
 }
 
-// OpenCluster 打开一个单 Raft Group 的集群节点。
+// OpenCluster 打开一个 Raft 集群节点。
 func OpenCluster(config ClusterOptions, dboption Options) (*ClusterDB, error) {
 	config.applyDefaults()
 	if err := ValidateClusterOptions(&config); err != nil {
@@ -77,13 +80,17 @@ func OpenCluster(config ClusterOptions, dboption Options) (*ClusterDB, error) {
 		nodeHost:  nodeHost,
 		config:    config,
 		dbOptions: dboption,
-		leaderID:  0,
-		state:     false,
 		Sync:      config.Sync,
+		stopCh:    make(chan struct{}),
 	}
 
 	if err = rdb.start(); err != nil {
-		nodeHost.Close()
+		rdb.mu.Lock()
+		if rdb.nodeHost != nil {
+			rdb.nodeHost.Close()
+			rdb.nodeHost = nil
+		}
+		rdb.mu.Unlock()
 		return nil, err
 	}
 	if config.RPCAddress != "" {
@@ -107,15 +114,24 @@ func (rdb *ClusterDB) start() error {
 	rdb.leaderIDs = make([]uint64, shardCount)
 	rdb.shards = make([]*clusterShard, 0, shardCount)
 
-	closeShardDBs := func() {
-		for _, sh := range rdb.shards {
-			_ = sh.sm.Close()
+	// 失败时必须先关闭 nodeHost 停止活跃 Raft 副本，再关闭尚未被 Raft 接管的本地 shard DB。
+	cleanupOnFailure := func(startedReplicas int) {
+		if startedReplicas > 0 && rdb.nodeHost != nil {
+			rdb.nodeHost.Close()
+			rdb.nodeHost = nil
+		}
+		for i := startedReplicas; i < len(rdb.shards); i++ {
+			_ = rdb.shards[i].sm.Close()
 		}
 		rdb.shards = nil
 	}
 
+	startedReplicas := 0
 	for i := 0; i < shardCount; i++ {
 		dbOptions := rdb.dbOptions
+		// Multi-Raft 分片禁用本地墙钟 TTL 后台清扫，改为由 Raft 日志中的绝对时间戳确定性判定过期，
+		// 彻底杜绝副本间因时钟漂移导致状态分叉。
+		dbOptions.TTLScanInterval = 0
 		if shardCount > 1 {
 			dbOptions.DirPath = filepath.Join(rdb.dbOptions.DirPath, fmt.Sprintf("shard-%d", i))
 			if rdb.dbOptions.SnapshotPath != "" {
@@ -131,7 +147,7 @@ func (rdb *ClusterDB) start() error {
 		}
 		db, err := Open(dbOptions)
 		if err != nil {
-			closeShardDBs()
+			cleanupOnFailure(startedReplicas)
 			return fmt.Errorf("open database for shard %d failed: %w", i, err)
 		}
 		groupID := rdb.config.GroupIDForShard(uint32(i))
@@ -147,18 +163,19 @@ func (rdb *ClusterDB) start() error {
 
 		rc := rdb.config.GetRaftConfig()
 		rc.ShardID = groupID
-		factory := func(clusterID uint64, nodeID uint64) statemachine.IStateMachine {
-			return shard.sm
+		onDiskFactory := func(clusterID uint64, nodeID uint64) statemachine.IOnDiskStateMachine {
+			return shard.sm.asOnDisk()
 		}
 		join := rdb.config.JoinCluster
 		initialMembers := rdb.config.InitialMembers
 		if join {
 			initialMembers = nil
 		}
-		if err := rdb.nodeHost.StartReplica(initialMembers, join, factory, rc); err != nil {
-			closeShardDBs()
+		if err := rdb.nodeHost.StartOnDiskReplica(initialMembers, join, onDiskFactory, rc); err != nil {
+			cleanupOnFailure(startedReplicas)
 			return fmt.Errorf("start raft group %d (shard %d) failed: %w", groupID, i, err)
 		}
+		startedReplicas++
 	}
 
 	if metadataID := rdb.config.MetadataGroupID(); metadataID != 0 {
@@ -171,27 +188,39 @@ func (rdb *ClusterDB) start() error {
 			initialMembers = nil
 		}
 		if err := rdb.nodeHost.StartReplica(initialMembers, rdb.config.JoinCluster, factory, rc); err != nil {
-			closeShardDBs()
+			cleanupOnFailure(startedReplicas)
 			return fmt.Errorf("start metadata group %d failed: %w", metadataID, err)
 		}
 		rdb.metadataGroupID = metadataID
 		rdb.metadataSM = sm
 	}
 
-	go rdb.leaderMonitor()
-	rdb.state = true
+	rdb.state.Store(true)
+	rdb.monitorWG.Add(1)
+	go func() {
+		defer rdb.monitorWG.Done()
+		rdb.leaderMonitor()
+	}()
 	return nil
 }
 
 func (rdb *ClusterDB) Close() error {
-	if !rdb.state {
+	if !rdb.state.Load() {
 		return ErrClusterClosed
 	}
 	return rdb.stop()
 }
 
-// stop 停止本地 RPC、Raft 副本和 NodeHost。
+// stop 停止后台监控、本地 RPC、Raft 副本和 NodeHost。
 func (rdb *ClusterDB) stop() error {
+	rdb.state.Store(false)
+	rdb.stopOnce.Do(func() {
+		if rdb.stopCh != nil {
+			close(rdb.stopCh)
+		}
+	})
+	rdb.monitorWG.Wait()
+
 	rdb.mu.Lock()
 	if rdb.rpcListener != nil {
 		_ = rdb.rpcListener.Close()
@@ -207,7 +236,6 @@ func (rdb *ClusterDB) stop() error {
 		rdb.nodeHost.Close()
 		rdb.nodeHost = nil
 	}
-	rdb.state = false
 	return nil
 }
 
@@ -218,39 +246,36 @@ func (rdb *ClusterDB) leaderMonitor() {
 
 	for {
 		select {
+		case <-rdb.stopCh:
+			return
 		case <-ticker.C:
 			rdb.mu.RLock()
 			nodeHost := rdb.nodeHost
 			shards := append([]*clusterShard(nil), rdb.shards...)
 			rdb.mu.RUnlock()
-			if nodeHost == nil {
+			if nodeHost == nil || !rdb.state.Load() {
 				return
 			}
 
 			changed := false
-			leaders := make([]uint64, len(shards))
-			for i, sh := range shards {
+			for _, sh := range shards {
+				select {
+				case <-rdb.stopCh:
+					return
+				default:
+				}
 				leaderID, _, valid, err := nodeHost.GetLeaderID(sh.groupID)
 				if err != nil || !valid {
 					continue
 				}
-				leaders[i] = leaderID
+				sh.leaderID.Store(leaderID)
 				if sh.id == 0 {
-					rdb.mu.Lock()
-					oldLeaderID := rdb.leaderID
-					rdb.leaderID = leaderID
-					rdb.mu.Unlock()
+					oldLeaderID := rdb.leaderID.Swap(leaderID)
 					if oldLeaderID != leaderID {
 						changed = true
 					}
 				}
 			}
-
-			rdb.mu.Lock()
-			if len(rdb.leaderIDs) == len(leaders) {
-				copy(rdb.leaderIDs, leaders)
-			}
-			rdb.mu.Unlock()
 
 			if changed {
 				log.Printf("Leader changed on shard 0")
@@ -272,11 +297,13 @@ type ClusterStats struct {
 // Stats 返回当前节点的轻量运行状态，可用于监控和健康检查。
 func (rdb *ClusterDB) Stats() ClusterStats {
 	rdb.mu.RLock()
-	defer rdb.mu.RUnlock()
+	hasNodeHost := rdb.nodeHost != nil
+	rdb.mu.RUnlock()
+	leaderID := rdb.leaderID.Load()
 	return ClusterStats{
 		NodeID:       rdb.config.NodeID,
-		LeaderID:     rdb.leaderID,
-		IsLeader:     rdb.state && rdb.nodeHost != nil && rdb.leaderID != 0 && rdb.leaderID == rdb.config.NodeID,
+		LeaderID:     leaderID,
+		IsLeader:     rdb.state.Load() && hasNodeHost && leaderID != 0 && leaderID == rdb.config.NodeID,
 		RPCRequests:  rdb.rpcRequests.Load(),
 		RPCErrors:    rdb.rpcErrors.Load(),
 		ForwardedOps: rdb.forwardedOps.Load(),
@@ -286,9 +313,10 @@ func (rdb *ClusterDB) Stats() ClusterStats {
 // IsLeader 检查当前节点是否是Leader
 func (rdb *ClusterDB) IsLeader() bool {
 	rdb.mu.RLock()
-	defer rdb.mu.RUnlock()
-
-	return rdb.state && rdb.nodeHost != nil && rdb.leaderID != 0 && rdb.leaderID == rdb.config.NodeID
+	hasNodeHost := rdb.nodeHost != nil
+	rdb.mu.RUnlock()
+	leaderID := rdb.leaderID.Load()
+	return rdb.state.Load() && hasNodeHost && leaderID != 0 && leaderID == rdb.config.NodeID
 }
 
 // GetLeaderID 获取 shard 0 的 Leader NodeID。
@@ -296,107 +324,226 @@ func (rdb *ClusterDB) GetLeaderID() (uint64, error) {
 	return rdb.leaderForShard(0)
 }
 
+// RegisterPeerRPC 动态注册或更新指定节点的内部转发 RPC 地址，支持运行期扩缩容与分片迁移。
+func (rdb *ClusterDB) RegisterPeerRPC(nodeID uint64, rpcAddr string) {
+	rdb.mu.Lock()
+	defer rdb.mu.Unlock()
+	if rdb.config.PeerRPC == nil {
+		rdb.config.PeerRPC = make(map[uint64]string)
+	}
+	if rpcAddr == "" {
+		delete(rdb.config.PeerRPC, nodeID)
+	} else {
+		rdb.config.PeerRPC[nodeID] = rpcAddr
+	}
+}
+
+// PeerRPCAddress 返回已知的对端内部 RPC 地址。
+func (rdb *ClusterDB) PeerRPCAddress(nodeID uint64) (string, bool) {
+	rdb.mu.RLock()
+	defer rdb.mu.RUnlock()
+	addr, ok := rdb.config.PeerRPC[nodeID]
+	return addr, ok && addr != ""
+}
+
 // putLocal 在当前节点通过 Raft 共识写入键值对。
 func (rdb *ClusterDB) putLocal(key, value []byte, shard uint32) error {
-	return rdb.proposeWrite(Command{Op: OpPut, Key: key, Value: value}, shard)
+	return rdb.proposeWriteContext(context.Background(), Command{Op: OpPut, Key: key, Value: value}, shard)
+}
+
+func (rdb *ClusterDB) putLocalWithExpireAt(ctx context.Context, key, value []byte, expireAt int64, shard uint32) error {
+	return rdb.proposeWriteContext(ctx, Command{Op: OpPut, Key: key, Value: value, ExpireAt: expireAt}, shard)
 }
 
 // deleteLocal 在当前节点通过 Raft 共识删除键。
 func (rdb *ClusterDB) deleteLocal(key []byte, shard uint32) error {
-	return rdb.proposeWrite(Command{Op: OpDelete, Key: key}, shard)
+	return rdb.proposeWriteContext(context.Background(), Command{Op: OpDelete, Key: key}, shard)
 }
 
 func (rdb *ClusterDB) proposeWrite(cmd Command, shard uint32) error {
+	return rdb.proposeWriteContext(context.Background(), cmd, shard)
+}
+
+func (rdb *ClusterDB) proposeWriteContext(ctx context.Context, cmd Command, shard uint32) error {
 	if err := validateRaftWrite(cmd); err != nil {
 		return err
 	}
-	data, err := json.Marshal(cmd)
-	if err != nil {
-		return err
-	}
-	return rdb.proposeData(shard, data, 5*time.Second)
+	data := encodeRaftCommand(cmd)
+	return rdb.proposeDataContext(ctx, shard, data, 5*time.Second)
 }
 
 func (rdb *ClusterDB) proposeData(shard uint32, data []byte, timeout time.Duration) error {
+	return rdb.proposeDataContext(context.Background(), shard, data, timeout)
+}
+
+func (rdb *ClusterDB) proposeDataContext(ctx context.Context, shard uint32, data []byte, defaultTimeout time.Duration) error {
 	rdb.mu.RLock()
 	nodeHost := rdb.nodeHost
-	started := rdb.state && nodeHost != nil
+	started := rdb.state.Load() && nodeHost != nil
 	rdb.mu.RUnlock()
 	if !started {
 		return ErrNodeNotStarted
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	session := nodeHost.GetNoOPSession(rdb.config.GroupIDForShard(shard))
 	if rdb.Sync {
-		ctx, cancel := context.WithTimeout(context.Background(), timeout)
-		defer cancel()
-		result, err := nodeHost.SyncPropose(ctx, session, data)
+		callCtx := ctx
+		var cancel context.CancelFunc
+		if _, hasDeadline := ctx.Deadline(); !hasDeadline {
+			callCtx, cancel = context.WithTimeout(ctx, defaultTimeout)
+			defer cancel()
+		}
+		result, err := nodeHost.SyncPropose(callCtx, session, data)
 		if err != nil {
 			return err
 		}
 		return raftResultError(result)
 	}
 
+	timeout := defaultTimeout
+	if deadline, ok := ctx.Deadline(); ok {
+		if rem := time.Until(deadline); rem > 0 {
+			timeout = rem
+		} else {
+			return ErrTimeout
+		}
+	}
 	rs, err := nodeHost.Propose(session, data, timeout)
 	if err != nil {
 		return err
 	}
-	res := <-rs.ResultC()
 	defer rs.Release()
-	switch {
-	case res.Completed():
-		return raftResultError(res.GetResult())
-	case res.Timeout():
-		return ErrTimeout
-	case res.Terminated():
+	select {
+	case <-ctx.Done():
 		return ErrCanceled
-	default:
-		return errors.New("raft proposal did not complete")
+	case res := <-rs.ResultC():
+		switch {
+		case res.Completed():
+			return raftResultError(res.GetResult())
+		case res.Timeout():
+			return ErrTimeout
+		case res.Terminated():
+			return ErrCanceled
+		default:
+			return errors.New("raft proposal did not complete")
+		}
 	}
 }
 
-// getLocal 在当前节点通过 Raft ReadIndex 读取键值。
-func (rdb *ClusterDB) getLocal(key []byte, shard uint32) ([]byte, error) {
-	if rdb.nodeHost == nil || !rdb.state {
-		return nil, ErrNodeNotStarted
+func (rdb *ClusterDB) readIndexBarrier(ctx context.Context, shard uint32) error {
+	rdb.mu.RLock()
+	nodeHost := rdb.nodeHost
+	started := rdb.state.Load() && nodeHost != nil
+	rdb.mu.RUnlock()
+	if !started {
+		return ErrNodeNotStarted
 	}
-	groupID := rdb.config.GroupIDForShard(shard)
-	// 创建查询命令
-	cmd := Command{
-		Key: key,
+	if ctx == nil {
+		ctx = context.Background()
 	}
-
-	// 序列化命令
-	data, err := json.Marshal(cmd)
+	timeout := 5 * time.Second
+	if deadline, ok := ctx.Deadline(); ok {
+		if rem := time.Until(deadline); rem > 0 {
+			timeout = rem
+		} else {
+			return ErrTimeout
+		}
+	}
+	rs, err := nodeHost.ReadIndex(rdb.config.GroupIDForShard(shard), timeout)
 	if err != nil {
-		return nil, err
+		return err
 	}
+	defer rs.Release()
+	select {
+	case <-ctx.Done():
+		return ErrCanceled
+	case res := <-rs.ResultC():
+		if res.Completed() {
+			return nil
+		}
+		if res.Timeout() {
+			return ErrTimeout
+		}
+		if res.Terminated() {
+			return ErrCanceled
+		}
+		return errors.New("ReadIndex failed")
+	}
+}
 
-	// 根据Sync字段决定使用同步还是异步模式
-	if rdb.Sync {
-		// 使用同步ReadIndex方法
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		result, err := rdb.nodeHost.SyncRead(ctx, groupID, data)
+// getLocal 在当前节点通过 Raft ReadIndex（零 JSON 直传 raftLookupKey）读取键值。
+func (rdb *ClusterDB) getLocal(key []byte, shard uint32) ([]byte, error) {
+	return rdb.getLocalContext(context.Background(), key, shard, ReadLinearizable)
+}
+
+func (rdb *ClusterDB) getLocalContext(ctx context.Context, key []byte, shard uint32, consistency ReadConsistency) ([]byte, error) {
+	if consistency == ReadStaleLocal {
+		sm, err := rdb.stateMachineForShard(shard)
 		if err != nil {
 			return nil, err
 		}
+		res, err := sm.Lookup(raftLookupKey(key))
+		if err != nil {
+			return nil, err
+		}
+		val, ok := res.([]byte)
+		if !ok {
+			return nil, errors.New("invalid type")
+		}
+		return val, nil
+	}
 
-		// 处理结果
+	rdb.mu.RLock()
+	nodeHost := rdb.nodeHost
+	started := rdb.state.Load() && nodeHost != nil
+	rdb.mu.RUnlock()
+	if !started {
+		return nil, ErrNodeNotStarted
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	groupID := rdb.config.GroupIDForShard(shard)
+	query := raftLookupKey(key)
+
+	if rdb.Sync {
+		callCtx := ctx
+		var cancel context.CancelFunc
+		if _, hasDeadline := ctx.Deadline(); !hasDeadline {
+			callCtx, cancel = context.WithTimeout(ctx, 5*time.Second)
+			defer cancel()
+		}
+		result, err := nodeHost.SyncRead(callCtx, groupID, query)
+		if err != nil {
+			return nil, err
+		}
 		value, ok := result.([]byte)
 		if !ok {
 			return nil, errors.New("invalid type")
 		}
-
 		return value, nil
-	} else {
-		// 使用异步ReadIndex方法
-		rs, err := rdb.nodeHost.ReadIndex(groupID, 5*time.Second)
-		if err != nil {
-			return nil, err
-		}
+	}
 
-		// 等待ReadIndex操作完成
-		res := <-rs.ResultC()
+	timeout := 5 * time.Second
+	if deadline, ok := ctx.Deadline(); ok {
+		if rem := time.Until(deadline); rem > 0 {
+			timeout = rem
+		} else {
+			return nil, ErrTimeout
+		}
+	}
+	rs, err := nodeHost.ReadIndex(groupID, timeout)
+	if err != nil {
+		return nil, err
+	}
+	defer rs.Release()
+
+	select {
+	case <-ctx.Done():
+		return nil, ErrCanceled
+	case res := <-rs.ResultC():
 		if !res.Completed() {
 			if res.Timeout() {
 				return nil, ErrTimeout
@@ -406,27 +553,23 @@ func (rdb *ClusterDB) getLocal(key []byte, shard uint32) ([]byte, error) {
 			}
 			return nil, errors.New("ReadIndex failed")
 		}
-
-		// 执行本地读取
-		result, err := rdb.nodeHost.ReadLocalNode(rs, data)
-		if err != nil {
-			return nil, err
-		}
-
-		// 处理结果
-		value, ok := result.([]byte)
-		if !ok {
-			return nil, errors.New("invalid type")
-		}
-		rs.Release()
-		return value, nil
 	}
+
+	result, err := nodeHost.ReadLocalNode(rs, query)
+	if err != nil {
+		return nil, err
+	}
+	value, ok := result.([]byte)
+	if !ok {
+		return nil, errors.New("invalid type")
+	}
+	return value, nil
 }
 
 // BatchWrite 通过 Raft 共识批量写入。所有命令必须落在同一个 shard。
 func (rdb *ClusterDB) BatchWrite(commands []Command, batchID uint64) error {
 	rdb.mu.RLock()
-	started := rdb.state && rdb.nodeHost != nil
+	started := rdb.state.Load() && rdb.nodeHost != nil
 	rdb.mu.RUnlock()
 	if !started {
 		return ErrNodeNotStarted
@@ -439,10 +582,7 @@ func (rdb *ClusterDB) BatchWrite(commands []Command, batchID uint64) error {
 		return err
 	}
 	batchCmd := BatchCommand{Op: OpBatch, Commands: commands, BatchID: batchID}
-	data, err := json.Marshal(batchCmd)
-	if err != nil {
-		return err
-	}
+	data := encodeRaftBatchCommand(batchCmd)
 	var lastErr error
 	for attempt := 0; attempt < 5; attempt++ {
 		if _, addr, ok := rdb.forwardTarget(shard); ok {
@@ -484,58 +624,58 @@ func (rdb *ClusterDB) shardForBatch(commands []Command) (uint32, error) {
 // GetClusterMembership 获取集群成员信息
 func (rdb *ClusterDB) GetClusterMembership() (map[uint64]string, error) {
 	rdb.mu.RLock()
-	defer rdb.mu.RUnlock()
+	nodeHost := rdb.nodeHost
+	started := rdb.state.Load() && nodeHost != nil
+	rdb.mu.RUnlock()
 
-	if rdb.nodeHost == nil || !rdb.state {
+	if !started {
 		return nil, ErrNodeNotStarted
 	}
 
-	// 根据Sync字段决定使用同步还是异步模式
 	if rdb.Sync {
-		// 直接使用同步方法获取成员信息
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 
-		membership, err := rdb.nodeHost.SyncGetShardMembership(ctx, rdb.config.ClusterID)
+		membership, err := nodeHost.SyncGetShardMembership(ctx, rdb.config.ClusterID)
 		if err != nil {
 			return nil, err
 		}
-
-		return membership.Nodes, nil
-	} else {
-		// 使用异步ReadIndex方法确保线性一致性，然后获取成员信息
-		rs, err := rdb.nodeHost.ReadIndex(rdb.config.ClusterID, 5*time.Second)
-		if err != nil {
-			return nil, err
-		}
-
-		// 等待ReadIndex操作完成
-		res := <-rs.ResultC()
-		if !res.Completed() {
-			if res.Timeout() {
-				return nil, ErrTimeout
-			}
-			if res.Terminated() {
-				return nil, ErrCanceled
-			}
-			return nil, errors.New("get cluster membership failed")
-		}
-		rs.Release()
-
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-
-		membership, err := rdb.nodeHost.SyncGetShardMembership(ctx, rdb.config.ClusterID)
-		if err != nil {
-			return nil, err
-		}
-
 		return membership.Nodes, nil
 	}
+
+	rs, err := nodeHost.ReadIndex(rdb.config.ClusterID, 5*time.Second)
+	if err != nil {
+		return nil, err
+	}
+	defer rs.Release()
+
+	res := <-rs.ResultC()
+	if !res.Completed() {
+		if res.Timeout() {
+			return nil, ErrTimeout
+		}
+		if res.Terminated() {
+			return nil, ErrCanceled
+		}
+		return nil, errors.New("get cluster membership failed")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	membership, err := nodeHost.SyncGetShardMembership(ctx, rdb.config.ClusterID)
+	if err != nil {
+		return nil, err
+	}
+	return membership.Nodes, nil
 }
 
 func (rdb *ClusterDB) requireLeaderAll() error {
-	if rdb.nodeHost == nil || !rdb.state {
+	rdb.mu.RLock()
+	nodeHost := rdb.nodeHost
+	started := rdb.state.Load() && nodeHost != nil
+	rdb.mu.RUnlock()
+	if !started {
 		return ErrNodeNotStarted
 	}
 	for i := 0; i < rdb.config.ShardCount; i++ {
@@ -548,7 +688,7 @@ func (rdb *ClusterDB) requireLeaderAll() error {
 		}
 	}
 	if mid := rdb.config.MetadataGroupID(); mid != 0 {
-		leader, _, valid, err := rdb.nodeHost.GetLeaderID(mid)
+		leader, _, valid, err := nodeHost.GetLeaderID(mid)
 		if err != nil {
 			return err
 		}
@@ -563,52 +703,58 @@ func (rdb *ClusterDB) changeMembership(add bool, nonVoting bool, nodeID uint64, 
 	if err := rdb.requireLeaderAll(); err != nil {
 		return err
 	}
-	rdb.mu.Lock()
-	defer rdb.mu.Unlock()
-	if rdb.nodeHost == nil || !rdb.state {
+	rdb.mu.RLock()
+	nodeHost := rdb.nodeHost
+	started := rdb.state.Load() && nodeHost != nil
+	rdb.mu.RUnlock()
+	if !started {
 		return ErrNodeNotStarted
 	}
 	for _, groupID := range rdb.groupIDs() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		members, err := rdb.nodeHost.SyncGetShardMembership(ctx, groupID)
+		members, err := nodeHost.SyncGetShardMembership(ctx, groupID)
 		cancel()
 		if err != nil {
 			return err
 		}
 		if rdb.Sync {
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-			err := changeReplica(ctx, rdb.nodeHost, groupID, members.ConfigChangeID, nodeID, address, add, nonVoting)
+			err := changeReplica(ctx, nodeHost, groupID, members.ConfigChangeID, nodeID, address, add, nonVoting)
 			cancel()
 			if err != nil {
 				return err
 			}
 			continue
 		}
-		var rs *dragonboat.RequestState
-		switch {
-		case add && nonVoting:
-			rs, err = rdb.nodeHost.RequestAddNonVoting(groupID, nodeID, address, members.ConfigChangeID, 30*time.Second)
-		case add:
-			rs, err = rdb.nodeHost.RequestAddReplica(groupID, nodeID, address, members.ConfigChangeID, 30*time.Second)
-		default:
-			rs, err = rdb.nodeHost.RequestDeleteReplica(groupID, nodeID, members.ConfigChangeID, 30*time.Second)
-		}
-		if err != nil {
+		if err := func() error {
+			var rs *dragonboat.RequestState
+			var reqErr error
+			switch {
+			case add && nonVoting:
+				rs, reqErr = nodeHost.RequestAddNonVoting(groupID, nodeID, address, members.ConfigChangeID, 30*time.Second)
+			case add:
+				rs, reqErr = nodeHost.RequestAddReplica(groupID, nodeID, address, members.ConfigChangeID, 30*time.Second)
+			default:
+				rs, reqErr = nodeHost.RequestDeleteReplica(groupID, nodeID, members.ConfigChangeID, 30*time.Second)
+			}
+			if reqErr != nil {
+				return reqErr
+			}
+			defer rs.Release()
+			res := <-rs.ResultC()
+			if res.Completed() {
+				return nil
+			}
+			if res.Timeout() {
+				return ErrTimeout
+			}
+			if res.Terminated() {
+				return ErrCanceled
+			}
+			return errors.New("membership change failed")
+		}(); err != nil {
 			return err
 		}
-		res := <-rs.ResultC()
-		if res.Completed() {
-			rs.Release()
-			continue
-		}
-		if res.Timeout() {
-			return ErrTimeout
-		}
-		if res.Terminated() {
-			return ErrCanceled
-		}
-		rs.Release()
-		return errors.New("membership change failed")
 	}
 	return nil
 }

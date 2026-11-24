@@ -378,7 +378,7 @@ func TestCommitLogPruning(t *testing.T) {
 	records := map[string]*LogRecord{
 		string(unfinished): {Key: unfinished, Value: []byte("discard"), Type: LogRecordNormal},
 	}
-	if err := db.shardFor(unfinished).active.prepareBatch(records, globalBatchIDNode.Generate(), WriteOptions{Sync: true}, 2); err != nil {
+	if err := db.shardFor(unfinished).active.prepareBatch(records, nextBatchID(), WriteOptions{Sync: true}, 2); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.Close(); err != nil {
@@ -548,10 +548,18 @@ func TestBatchIDsAreUnique(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	seen := make(map[uint64]struct{})
+	seen := make(map[uint64]struct{}, count)
 	for _, sh := range db.shards {
-		for id := range sh.active.batchIDs {
-			seen[id] = struct{}{}
+		reader := sh.active.wal.NewReader()
+		for {
+			chunk, _, err := reader.Next()
+			if err != nil {
+				break
+			}
+			rec := decodeLogRecord(chunk)
+			if rec != nil && rec.Type == LogRecordNormal {
+				seen[rec.BatchID] = struct{}{}
+			}
 		}
 	}
 	if len(seen) != count {

@@ -11,6 +11,9 @@ import (
 type KVServiceServer interface {
 	Get(context.Context, *wrapperspb.BytesValue) (*wrapperspb.BytesValue, error)
 	Put(context.Context, *wrapperspb.BytesValue) (*emptypb.Empty, error)
+	PutWithTTL(context.Context, *wrapperspb.BytesValue) (*emptypb.Empty, error)
+	GetTTL(context.Context, *wrapperspb.BytesValue) (*wrapperspb.Int64Value, error)
+	Persist(context.Context, *wrapperspb.BytesValue) (*wrapperspb.BoolValue, error)
 	Delete(context.Context, *wrapperspb.BytesValue) (*emptypb.Empty, error)
 	// Batch 客户端流：接收多条操作（Put/Delete），在服务端批量提交
 	Batch(KVService_BatchServer) error
@@ -34,6 +37,18 @@ var KVService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "Put",
 			Handler:    _KVService_Put_Handler,
+		},
+		{
+			MethodName: "PutWithTTL",
+			Handler:    _KVService_PutWithTTL_Handler,
+		},
+		{
+			MethodName: "GetTTL",
+			Handler:    _KVService_GetTTL_Handler,
+		},
+		{
+			MethodName: "Persist",
+			Handler:    _KVService_Persist_Handler,
 		},
 		{
 			MethodName: "Delete",
@@ -89,6 +104,63 @@ func _KVService_Put_Handler(srv interface{}, ctx context.Context, dec func(inter
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(KVServiceServer).Put(ctx, req.(*wrapperspb.BytesValue))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+// _KVService_PutWithTTL_Handler 服务端处理 PutWithTTL 的入口
+func _KVService_PutWithTTL_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(wrapperspb.BytesValue)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(KVServiceServer).PutWithTTL(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: "/knocidb.KVService/PutWithTTL",
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(KVServiceServer).PutWithTTL(ctx, req.(*wrapperspb.BytesValue))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+// _KVService_GetTTL_Handler 服务端处理 GetTTL 的入口
+func _KVService_GetTTL_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(wrapperspb.BytesValue)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(KVServiceServer).GetTTL(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: "/knocidb.KVService/GetTTL",
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(KVServiceServer).GetTTL(ctx, req.(*wrapperspb.BytesValue))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+// _KVService_Persist_Handler 服务端处理 Persist 的入口
+func _KVService_Persist_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(wrapperspb.BytesValue)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(KVServiceServer).Persist(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: "/knocidb.KVService/Persist",
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(KVServiceServer).Persist(ctx, req.(*wrapperspb.BytesValue))
 	}
 	return interceptor(ctx, in, info, handler)
 }

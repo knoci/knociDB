@@ -10,28 +10,27 @@
 ### English | [中文](README_CN.md) | [日本語](README_JP.md)
 
 ## Features
-- ⚡ **High-performance** key-value storage
-- 🔄 **Batch operations** with ACD guarantees
-- 🌲 **B+Tree index** support
-- 🌐 **Sharded ClusterDB** multiple Raft groups with hash routing and leader-aware forwarding
-- 💾 **Object tier** snapshots + cold VLOG segments (S3/R2/COS/OSS)
-- 📋 **Atomic DB manifest** file inventory and generation tracking
-- 🔌 **gRPC support** client-stream Batch, server-stream Scan, optional auth/TLS
-- 🧩 **Redis-compatible subset** strings/hash/list/set/zset, TTL, SCAN, Pub/Sub, cluster protocol
+- ⚡ **Ultra-fast embedded engine**: custom MVCC Arena Skiplist (`arenaskl`), pipelined WAL Group Commit + 32 KB block cache, zero-freeze snapshot iterators, and O(log N) prefix seeks
+- 🔄 **Atomic batches & embedded TTL**: cross-shard ACD batch commits and zero-sidecar embedded `ExpireAt` metadata without `TTL.DB` write amplification
+- 🌲 **B+Tree index & online CAS compaction**: single-transaction sorted flushes (`ApplyBatch`) and lock-free `CompareAndSwapBatch` compaction concurrent with writes and flushes
+- 🌐 **Production Multi-Raft (`ClusterDB`)**: Dragonboat `IOnDiskStateMachine`, non-blocking streaming `KRS2` snapshots, compact binary Raft codec, mTLS, configurable `ReadConsistency`, `BatchID` idempotency, and Raft-deterministic TTL
+- 💾 **Object tier & atomic manifest**: cold VLOG segment offloading and snapshots on S3/R2/COS/OSS with durable atomic manifest tracking
+- 🔌 **gRPC v2 & observability**: `PutWithTTL`/`GetTTL`/`Persist`, paginated `ScanLimit`, `grpc.health.v1`, Server Reflection, `DB.Stats()`, `/metrics` (Prometheus), `/healthz`, `/readyz`, `/debug/pprof/`, unified `cmd/knocidb`, and `Dockerfile`
 
 ## Quick Start
 ```go
 package main
 
 import (
+	"fmt"
 	"time"
+
 	"github.com/knoci/knocidb"
 )
 
 // this file shows how to use the basic operations of knociDB
 func main() {
-	options := knocidb.DefaultOptions
-	options.DirPath = "/tmp/knocidb_basic"
+	options := knocidb.NewDefaultOptions("/tmp/knocidb_basic")
 
 	// open database
 	db, err := knocidb.Open(options)
@@ -43,8 +42,7 @@ func main() {
 	}()
 
 	// put a key
-	err = db.Put([]byte("name"), []byte("knocidb"))
-	if err != nil {
+	if err := db.Put([]byte("name"), []byte("knocidb")); err != nil {
 		panic(err)
 	}
 
@@ -53,32 +51,37 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
-	println(string(val))
+	fmt.Println(string(val))
 
-	// put a key with TTL
-	err = db.PutWithTTL([]byte("session"), []byte("alive"), 30*time.Second)
-	if err != nil {
+	// put a key with embedded-metadata TTL
+	if err := db.PutWithTTL([]byte("session"), []byte("alive"), 30*time.Second); err != nil {
 		panic(err)
 	}
 
 	// read remaining TTL
-	ttl, ok, err := db.GetTTL([]byte("session"))
-	if err != nil {
+	if ttl, ok, err := db.GetTTL([]byte("session")); err != nil {
 		panic(err)
-	}
-	if ok {
-		println(ttl.String())
+	} else if ok {
+		fmt.Println(ttl.String())
 	}
 
+	// inspect live engine metrics
+	stats := db.Stats()
+	fmt.Printf("shards=%d seq=%d\n", stats.Shards, stats.Sequence)
+
 	// delete a key
-	err = db.Delete([]byte("name"))
-	if err != nil {
+	if err := db.Delete([]byte("name")); err != nil {
 		panic(err)
 	}
 }
 ```
 
 ## Examples
+🚀 For headless standalone gRPC or Multi-Raft cluster server deployments (with Prometheus `/metrics`, `/healthz`, `/readyz`, `/debug/pprof/`), use `cmd/knocidb` or the included `Dockerfile`:
+```bash
+$ go run ./cmd/knocidb --mode=standalone --data-dir=./data --grpc-addr=:9090 --admin-addr=:9091
+```
+
 💡 For Cluster usage, please check out usage examples in the `examples/cluster` directory, and you can get the specific method of using Cluster through the README document.
 ```bash
 $ cd examples/cluster
@@ -87,7 +90,7 @@ $ go build -o cluster-example main.go
 
 Set `config.ShardCount` before `OpenCluster` to create multiple fixed Raft groups.
 
-🔆 If you want to  experience more features of knociDB, there is a cmd implementation client in the  `examples/cmd_client`, you can obtain the specific method of using cmd_client through the README document in the file.
+🔆 If you want to experience more features of knociDB, there is a cmd implementation client in `examples/cmd_client`, and you can obtain the specific method of using `cmd_client` through its README.
 
 ```bash
 $ cd examples/cmd_client
@@ -103,23 +106,15 @@ $ cd ../client
 $ go run main.go --addr 127.0.0.1:50051
 ```
 
-🧩 For the Redis-compatible subset, see `examples/redis`. It supports strings, hashes, lists, sets, sorted sets, TTL, SCAN and Pub/Sub.
-```bash
-$ cd examples/redis
-$ go run main.go --dir ./redis_data --addr 127.0.0.1:6379
-
-$ redis-cli -p 6379
-```
-
 ## Performance
 
-knociDB delivers strong read throughput and efficient large-value bulk loads: tests show about **2.1× LevelDB random reads** and **9.8× sequential reads**. Single-key writes are not the fastest in every case, but batch writes are fast, and the engine supports WAL crash recovery, atomic batches, a B+Tree index, an object tier, and sharded multi-Raft.
+The upgraded knociDB v2 engine (zero-GC-pointer flat-offset MVCC Arena Skiplist, zero-alloc WAL batch encoding, WAL block cache, embedded TTL, and zero-freeze iterators) delivers strong read and write throughput: tests show about **2.32× LevelDB random reads** and **9.78× sequential reads** (leading all tested Go embedded engines in both read metrics), alongside WAL crash recovery, atomic batches, online CAS compaction, object tiering, and production sharded Multi-Raft.
 
 **📖 Throughput**
 
 | Engine        | Sequential write | Random write | Random read | Sequential read |
 | ------------- | ---------------: | -----------: | ----------: | --------------: |
-| 🟢 **knociDB** |           228.6k |       172.2k | 🥇 **1.27M** |     🥇 **3.07M** |
+| 🟢 **knociDB** |           240.9k |       198.2k | 🥇 **1.42M** |     🥇 **3.06M** |
 | LevelDB       |           294.0k |       205.4k |        610k |            313k |
 | LotusDB       |           289.8k |       213.3k |        543k |            145k |
 | BadgerDB      |           141.5k |       116.8k |        205k |            304k |
@@ -129,31 +124,31 @@ knociDB delivers strong read throughput and efficient large-value bulk loads: te
 
 | Engine        | Batch write |
 | ------------- | ----------: |
-| 🟢 **knociDB** |   **96.2k** |
+| 🟢 **knociDB** |   **89.7k** |
 | BadgerDB      |       89.1k |
 | BoltDB        |      103.7k |
 | LevelDB       |       62.7k |
 
-<sub><i><span style="color:#777">Windows, Go 1.24.4, single thread, no fsync. Throughput: 100k keys × 1 KB, 50k random reads/writes (median of three runs). Bulk load: 20k keys × 16 KB, batches of 100 (best of three runs). Results are workload-specific; BoltDB uses per-key Update for throughput and batch transactions for bulk load.</span></i></sub>
+<sub><i><span style="color:#777">Windows, Go 1.24.4, single thread, no fsync. Throughput: 100k keys × 1 KB, 50k random reads/writes (median of three warmed runs on upgraded knociDB). Bulk load: 20k keys × 16 KB, batches of 100 (best of three runs). Results are workload-specific; BoltDB uses per-key Update for throughput and batch transactions for bulk load. Also see `go test -bench . -benchmem ./benchmark` (`BenchmarkPut`: 2,900 ns/op, 0 allocs/op; `BenchmarkGet`: 202.9 ns/op, 0 allocs/op; `BenchmarkParallelPutGet`: 612.3 ns/op, 0 allocs/op; `BenchmarkBatch` 100 ops: 116.7 µs/op on i9-13980HX).</span></i></sub>
 
 **💡 Feature comparison**
 
-| Feature             | knociDB           | BadgerDB       | RocksDB | BoltDB | LevelDB | LotusDB        |
-| ------------------- | ----------------- | -------------- | ------- | ------ | ------- | -------------- |
-| Storage design      | B+Tree + ValueLog | LSM + ValueLog | LSM     | B+Tree | LSM     | LSM + ValueLog |
-| Pure Go             | ✅                 | ✅              | ❌       | ✅      | ✅       | ✅              |
-| Embeddable          | ✅                 | ✅              | ✅       | ✅      | ✅       | ✅              |
-| Sorted KV iteration | ✅                 | ✅              | ✅       | ✅      | ✅       | ✅              |
-| Atomic batch        | ✅                 | ✅              | ✅       | ✅      | ✅       | ➖              |
-| ACID transactions   | ❌                 | ✅              | ✅       | ✅      | ❌       | ❌              |
-| TTL                 | ✅                 | ✅              | ➖       | ❌      | ❌       | ➖              |
-| Snapshots           | ✅                 | ✅              | ✅       | ✅      | ✅       | ➖              |
-| Key-value-version   | ❌                 | ✅              | ❌       | ❌      | ❌       | ❌              |
-| Sharded multi-Raft  | ✅                 | ❌              | ❌       | ❌      | ❌       | ❌              |
-| Object/cold tier    | ✅                 | ❌              | ❌       | ❌      | ❌       | ❌              |
-| Redis + gRPC        | ✅                 | ❌              | ❌       | ❌      | ❌       | ❌              |
+| Feature             | knociDB                  | BadgerDB       | RocksDB | BoltDB | LevelDB | LotusDB        |
+| ------------------- | ------------------------ | -------------- | ------- | ------ | ------- | -------------- |
+| Storage design      | B+Tree + ValueLog (MVCC) | LSM + ValueLog | LSM     | B+Tree | LSM     | LSM + ValueLog |
+| Pure Go             | ✅                        | ✅              | ❌       | ✅      | ✅       | ✅              |
+| Embeddable          | ✅                        | ✅              | ✅       | ✅      | ✅       | ✅              |
+| Sorted KV iteration | ✅ (zero-freeze MVCC)     | ✅              | ✅       | ✅      | ✅       | ✅              |
+| Atomic batch        | ✅                        | ✅              | ✅       | ✅      | ✅       | ➖              |
+| ACID transactions   | ❌                        | ✅              | ✅       | ✅      | ❌       | ❌              |
+| TTL                 | ✅ (embedded metadata)    | ✅              | ➖       | ❌      | ❌       | ➖              |
+| Snapshots           | ✅ (online streaming)     | ✅              | ✅       | ✅      | ✅       | ➖              |
+| Key-value-version   | ➖ (internal MVCC)        | ✅              | ❌       | ❌      | ❌       | ❌              |
+| Sharded multi-Raft  | ✅ (`IOnDiskStateMachine`)| ❌              | ❌       | ❌      | ❌       | ❌              |
+| Object/cold tier    | ✅                        | ❌              | ❌       | ❌      | ❌       | ❌              |
+| gRPC                | ✅ (v2 + Health/Reflect)  | ❌              | ❌       | ❌      | ❌       | ❌              |
 
-<sub><i><span style="color:#777">✅ supported · ❌ not supported · ➖ limited or not first-class</span></i></sub>
+<sub><i><span style="color:#777">✅ supported · ❌ not supported · ➖ limited, internal, or not first-class</span></i></sub>
 
 ## Info
 

@@ -11,6 +11,9 @@ import (
 type KVServiceClient interface {
 	Get(context.Context, *wrapperspb.BytesValue, ...grpc.CallOption) (*wrapperspb.BytesValue, error)
 	Put(context.Context, *wrapperspb.BytesValue, ...grpc.CallOption) (*emptypb.Empty, error)
+	PutWithTTL(context.Context, *wrapperspb.BytesValue, ...grpc.CallOption) (*emptypb.Empty, error)
+	GetTTL(context.Context, *wrapperspb.BytesValue, ...grpc.CallOption) (*wrapperspb.Int64Value, error)
+	Persist(context.Context, *wrapperspb.BytesValue, ...grpc.CallOption) (*wrapperspb.BoolValue, error)
 	Delete(context.Context, *wrapperspb.BytesValue, ...grpc.CallOption) (*emptypb.Empty, error)
 	// Batch 客户端流：发送多条 Put/Delete 操作
 	Batch(context.Context, ...grpc.CallOption) (KVService_BatchClient, error)
@@ -38,6 +41,33 @@ func (c *kvServiceClient) Get(ctx context.Context, in *wrapperspb.BytesValue, op
 func (c *kvServiceClient) Put(ctx context.Context, in *wrapperspb.BytesValue, opts ...grpc.CallOption) (*emptypb.Empty, error) {
 	out := new(emptypb.Empty)
 	err := c.cc.Invoke(ctx, "/knocidb.KVService/Put", in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *kvServiceClient) PutWithTTL(ctx context.Context, in *wrapperspb.BytesValue, opts ...grpc.CallOption) (*emptypb.Empty, error) {
+	out := new(emptypb.Empty)
+	err := c.cc.Invoke(ctx, "/knocidb.KVService/PutWithTTL", in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *kvServiceClient) GetTTL(ctx context.Context, in *wrapperspb.BytesValue, opts ...grpc.CallOption) (*wrapperspb.Int64Value, error) {
+	out := new(wrapperspb.Int64Value)
+	err := c.cc.Invoke(ctx, "/knocidb.KVService/GetTTL", in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *kvServiceClient) Persist(ctx context.Context, in *wrapperspb.BytesValue, opts ...grpc.CallOption) (*wrapperspb.BoolValue, error) {
+	out := new(wrapperspb.BoolValue)
+	err := c.cc.Invoke(ctx, "/knocidb.KVService/Persist", in, out, opts...)
 	if err != nil {
 		return nil, err
 	}

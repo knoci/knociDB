@@ -1,0 +1,92 @@
+syntax = "proto3";
+
+package knocidb.v2;
+
+option go_package = "github.com/knoci/knocidb/proto/knocidb/v2;knocidbv2";
+
+import "google/protobuf/empty.proto";
+
+// KVService defines the canonical KnociDB v2 gRPC API.
+service KVService {
+  rpc Get(GetRequest) returns (GetResponse);
+  rpc Put(PutRequest) returns (google.protobuf.Empty);
+  rpc PutWithTTL(PutWithTTLRequest) returns (google.protobuf.Empty);
+  rpc GetTTL(GetTTLRequest) returns (GetTTLResponse);
+  rpc Persist(PersistRequest) returns (PersistResponse);
+  rpc Delete(DeleteRequest) returns (google.protobuf.Empty);
+  rpc Batch(stream BatchOp) returns (google.protobuf.Empty);
+  rpc Scan(ScanRequest) returns (stream KeyValue);
+}
+
+enum ReadConsistency {
+  READ_CONSISTENCY_LINEARIZABLE = 0;
+  READ_CONSISTENCY_FOLLOWER_INDEX = 1;
+  READ_CONSISTENCY_STALE_LOCAL = 2;
+}
+
+message GetRequest {
+  bytes key = 1;
+  ReadConsistency consistency = 2;
+}
+
+message GetResponse {
+  bytes value = 1;
+}
+
+message PutRequest {
+  bytes key = 1;
+  bytes value = 2;
+}
+
+message PutWithTTLRequest {
+  bytes key = 1;
+  bytes value = 2;
+  int64 ttl_ms = 3;
+}
+
+message GetTTLRequest {
+  bytes key = 1;
+}
+
+message GetTTLResponse {
+  int64 ttl_ms = 1;
+  bool has_ttl = 2;
+}
+
+message PersistRequest {
+  bytes key = 1;
+}
+
+message PersistResponse {
+  bool persisted = 1;
+}
+
+message DeleteRequest {
+  bytes key = 1;
+}
+
+message BatchOp {
+  enum OpType {
+    OP_TYPE_UNSPECIFIED = 0;
+    OP_TYPE_PUT = 1;
+    OP_TYPE_DELETE = 2;
+  }
+  OpType op = 1;
+  bytes key = 2;
+  bytes value = 3;
+  int64 ttl_ms = 4;
+}
+
+message ScanRequest {
+  bytes start = 1;
+  bytes end = 2;
+  uint32 limit = 3;
+  bytes prefix = 4;
+  bool reverse = 5;
+  ReadConsistency consistency = 6;
+}
+
+message KeyValue {
+  bytes key = 1;
+  bytes value = 2;
+}

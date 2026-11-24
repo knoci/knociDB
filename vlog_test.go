@@ -2,7 +2,6 @@ package knocidb
 
 import (
 	"github.com/knoci/knocidb/util"
-	"github.com/knoci/knocidb/wal"
 	"os"
 	"testing"
 
@@ -355,8 +354,8 @@ func TestValueLogMultiSegmentFiles(t *testing.T) {
 		want       error
 	}{
 		{"1 segment files", 1, 1, nil},
-		{"3 segment files", 3, 1, wal.ErrPendingSizeTooLarge},
-		{"5 segment files", 5, 1, wal.ErrPendingSizeTooLarge},
+		{"3 segment files", 3, 3, nil},
+		{"5 segment files", 5, 5, nil},
 	}
 
 	for _, tt := range tests {

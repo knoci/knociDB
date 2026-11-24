@@ -23,11 +23,21 @@ type DiskIO struct {
 }
 
 func (io *DiskIO) Init() {
+	if io.windowSize <= 0 {
+		io.windowSize = 10
+	}
+	if io.samplingInterval <= 0 {
+		io.samplingInterval = 100
+	}
 	io.samplingWindow = make([]uint64, io.windowSize)
 	io.windowPoint = 0
+	io.freeFlag = true
 }
 
 func (io *DiskIO) Monitor() error {
+	if io.windowSize <= 0 || len(io.samplingWindow) == 0 {
+		io.Init()
+	}
 	var ioStart disk.IOCountersStat
 	var ioEnd disk.IOCountersStat
 	var err error
@@ -44,8 +54,11 @@ func (io *DiskIO) Monitor() error {
 		return err
 	}
 
-	// IoTime 是自系统启动以来设备的活动时间，我们在采样期间获取它
-	ioTime := ioEnd.IoTime - ioStart.IoTime
+	// IoTime 是自系统启动以来设备的活动时间，防止计数器回绕产生无符号下溢。
+	var ioTime uint64
+	if ioEnd.IoTime >= ioStart.IoTime {
+		ioTime = ioEnd.IoTime - ioStart.IoTime
+	}
 
 	// 设置时间并将指针移动到下一个槽位
 	io.samplingWindow[io.windowPoint] = ioTime
@@ -89,12 +102,16 @@ func GetDiskIOInfo(targetPath string) (disk.IOCountersStat, error) {
 	}
 
 	var targetDevice string
+	bestLen := -1
 
-	// 查找目标路径所在的挂载点
+	// 查找目标路径所在的最长匹配挂载点（正确处理 / 与 /data/nvme 等嵌套挂载）。
 	for _, partition := range partitions {
 		if isPathOnDevice(targetPath, partition.Mountpoint) {
-			targetDevice = partition.Device
-			break
+			cleanMount := filepath.Clean(partition.Mountpoint)
+			if len(cleanMount) > bestLen {
+				bestLen = len(cleanMount)
+				targetDevice = partition.Device
+			}
 		}
 	}
 
@@ -137,9 +154,15 @@ func isPathOnDevice(path, mountpoint string) bool {
 		return false
 	}
 
-	// 确保路径已标准化以进行比较
+	// 确保路径已标准化并以目录边界匹配（防止 /data 误匹配 /data2）。
 	absPath = filepath.Clean(absPath)
 	absMountpoint = filepath.Clean(absMountpoint)
-
+	if absPath == absMountpoint {
+		return true
+	}
+	sep := string(filepath.Separator)
+	if !strings.HasSuffix(absMountpoint, sep) {
+		absMountpoint += sep
+	}
 	return strings.HasPrefix(absPath, absMountpoint)
 }

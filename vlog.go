@@ -23,8 +23,8 @@ const (
 type valueLog struct {
 	walFiles      []*wal.WAL
 	dpTables      []*discardtable
-	discardNumber uint32
-	totalNumber   uint32
+	discardNumber uint64
+	totalNumber   uint64
 	options       valueLogOptions
 
 	statsMu sync.Mutex
@@ -47,10 +47,10 @@ type valueLogOptions struct {
 	compactBatchCapacity int
 
 	// 已废弃的数量
-	discardtableNumber uint32
+	discardtableNumber uint64
 
 	// 总数量
-	totalNumber uint32
+	totalNumber uint64
 }
 
 // 为值日志打开 WAL 文件，将打开多个 WAL 文件用于并发读写
@@ -103,10 +103,25 @@ func (vlog *valueLog) activeSegmentNames() map[string]struct{} {
 }
 
 func openValueLog(options valueLogOptions) (*valueLog, error) {
+	// 清理上次崩溃可能遗留的压缩暂存目录。
+	if entries, err := os.ReadDir(options.dirPath); err == nil {
+		for _, entry := range entries {
+			if entry.IsDir() && strings.HasPrefix(entry.Name(), ".vlog-compact-") {
+				_ = os.RemoveAll(filepath.Join(options.dirPath, entry.Name()))
+			}
+		}
+	}
+
 	var walFiles []*wal.WAL
 	var dpTables []*discardtable
+	closeOpened := func() {
+		for _, w := range walFiles {
+			_ = w.Close()
+		}
+	}
 	for i := 0; i < int(options.partitionNum); i++ {
 		if err := recoverValueLogTempFiles(options.dirPath, i); err != nil {
+			closeOpened()
 			return nil, err
 		}
 		vLogWal, err := wal.Open(wal.Options{
@@ -115,8 +130,10 @@ func openValueLog(options valueLogOptions) (*valueLog, error) {
 			SegmentFileExt: fmt.Sprintf(valueLogFileExt, i),
 			Sync:           false, // 手动同步
 			BytesPerSync:   0,     // 与 Sync 相同
+			BlockCacheSize: 16 * wal.MB,
 		})
 		if err != nil {
+			closeOpened()
 			return nil, err
 		}
 		walFiles = append(walFiles, vLogWal)
@@ -154,11 +171,11 @@ func (vlog *valueLog) read(pos *KeyPosition) (*ValueLogRecord, error) {
 
 // 将vlog记录写入，它将被写入相应的分区
 func (vlog *valueLog) writeBatch(records []*ValueLogRecord) ([]*KeyPosition, error) {
+	if len(records) == 0 {
+		return nil, nil
+	}
 	// 按分区对记录进行分组
 	partitionRecords := make([][]*ValueLogRecord, vlog.options.partitionNum)
-	vlog.statsMu.Lock()
-	vlog.totalNumber += uint32(len(records))
-	vlog.statsMu.Unlock()
 	for _, record := range records {
 		// 获取并收集分区号。
 		p := vlog.getKeyPartition(record.key)
@@ -176,37 +193,40 @@ func (vlog *valueLog) writeBatch(records []*ValueLogRecord) ([]*KeyPosition, err
 		part := i
 		// 协程异步写入，统一channel收集
 		g.Go(func() error {
-			var err error
-			defer func() {
-				if err != nil {
-					// 清除wal日志写缓冲区。
-					vlog.walFiles[part].ClearPendingWrites()
-				}
-			}()
-
-			var keyPositions []*KeyPosition
+			encoded := make([][]byte, 0, len(partitionRecords[part]))
 			for _, record := range partitionRecords[part] {
 				select {
 				case <-ctx.Done():
-					err = ctx.Err()
-					return err
+					return ctx.Err()
 				default:
-					// 写入wal日志写缓冲区。
-					vlog.walFiles[part].PendingWrites(encodeValueLogRecord(record))
+					encoded = append(encoded, encodeValueLogRecord(record))
 				}
 			}
-			// 全部写入并且获得在wal的segment中位置信息。
-			positions, err := vlog.walFiles[part].WriteAll()
+			// 使用无状态 WriteBatch 写入，避免 PendingWrites/WriteAll 状态共享竞态；
+			// 若单批超过段大小，降级为逐条写入以自动轮转段文件。
+			positions, err := vlog.walFiles[part].WriteBatch(encoded)
 			if err != nil {
-				return err
+				if err == wal.ErrPendingSizeTooLarge {
+					positions = make([]*wal.ChunkPosition, 0, len(encoded))
+					for _, data := range encoded {
+						pos, werr := vlog.walFiles[part].Write(data)
+						if werr != nil {
+							return werr
+						}
+						positions = append(positions, pos)
+					}
+				} else {
+					return err
+				}
 			}
-			// 把在wal的segment中位置信息填入key在vlog中位置信息
-			for i, pos := range positions {
+			keyPositions := make([]*KeyPosition, 0, len(positions))
+			for idx, pos := range positions {
 				keyPositions = append(keyPositions, &KeyPosition{
-					key:       partitionRecords[part][i].key,
+					key:       partitionRecords[part][idx].key,
 					partition: uint32(part),
-					uid:       partitionRecords[part][i].uid,
+					uid:       partitionRecords[part][idx].uid,
 					position:  pos,
+					expireAt:  partitionRecords[part][idx].expireAt,
 				})
 			}
 			pChan <- keyPositions
@@ -223,6 +243,10 @@ func (vlog *valueLog) writeBatch(records []*ValueLogRecord) ([]*KeyPosition, err
 	for pos := range pChan {
 		keyPositions = append(keyPositions, pos...)
 	}
+
+	vlog.statsMu.Lock()
+	vlog.totalNumber += uint64(len(records))
+	vlog.statsMu.Unlock()
 
 	return keyPositions, nil
 }
@@ -268,11 +292,15 @@ func (vlog *valueLog) cleanDiscardTable() {
 	for i := 0; i < int(vlog.options.partitionNum); i++ {
 		vlog.dpTables[i].clean()
 	}
-	vlog.totalNumber -= vlog.discardNumber
+	if vlog.totalNumber >= vlog.discardNumber {
+		vlog.totalNumber -= vlog.discardNumber
+	} else {
+		vlog.totalNumber = 0
+	}
 	vlog.discardNumber = 0
 }
 
-func (vlog *valueLog) stats() (uint32, uint32) {
+func (vlog *valueLog) stats() (uint64, uint64) {
 	vlog.statsMu.Lock()
 	defer vlog.statsMu.Unlock()
 	return vlog.totalNumber, vlog.discardNumber

@@ -7,16 +7,14 @@ import (
 	"io"
 	"log"
 	"os"
-	"os/signal"
 	"path/filepath"
 	"sync"
-	"syscall"
+	"sync/atomic"
 	"time"
 
 	"github.com/knoci/knocidb/util"
 	"github.com/knoci/knocidb/wal"
 
-	"github.com/dgraph-io/badger/v4/y"
 	"github.com/google/uuid"
 	"golang.org/x/sync/errgroup"
 
@@ -36,20 +34,22 @@ type DB struct {
 	vlog             *valueLog           // 值日志
 	bloomManager     *BloomFilterManager // 布隆过滤器管理器
 	fileLock         *flock.Flock        // 文件锁，防止多个进程使用相同的数据库目录
-	flushChan        chan *memtable      // 用于通知刷新协程将内存表刷新到磁盘
+	flushChan        chan *memtable      // 兼容保留字段（每分片由独立有序 flusher 驱动）
+	flushStopCh      chan struct{}       // 优雅关闭每分片有序刷新协程
+	flushWorkerWG    sync.WaitGroup      // 等待所有分片刷新协程排空退出
 	flushLock        sync.RWMutex        // 刷新闸门：flush 读锁，compact/snapshot/close 写锁
 	flushErrMu       sync.RWMutex        // 保护 flush 失败状态
 	flushErr         error               // 首次 flush 失败后进入 fail-fast 状态
-	flushWG          sync.WaitGroup      // 快照迭代器触发的后台 flush
+	flushWG          sync.WaitGroup      // 后台 flush 兼容等待组
 	vlogGuard        sync.RWMutex        // 防止读者仍持有旧索引位置时回收 ValueLog 段
 	diskIO           *DiskIO             // 监控磁盘的 IO 状态并在适当时允许自动压缩
 	compactChan      chan discardState   // 用于通知需要压缩的分片
 	mu               sync.RWMutex
-	closed           bool
+	closed           atomic.Bool
 	closeOnce        sync.Once
 	closeErr         error
 	bgWG             sync.WaitGroup // 自动压缩/IO 监控协程
-	closeflushChan   chan struct{}  // 用于优雅地关闭刷新监听协程
+	closeflushChan   chan struct{}  // 兼容保留字段
 	closeCompactChan chan struct{}  // 用于优雅地关闭自动压缩监听协程
 	options          Options
 	batchPool        sync.Pool // 批处理池，用于减少内存分配开销
@@ -59,7 +59,7 @@ type DB struct {
 	objectTierWG   sync.WaitGroup
 
 	// 记录打开过的 memtable，Close 时兜底关闭，避免 flush 竞态遗留 WAL 句柄。
-	memtables   map[uint32]*memtable
+	memtables   map[uint64]*memtable
 	memtablesMu sync.Mutex
 	manifestMu  sync.Mutex
 	commitLog   *commitLog
@@ -67,9 +67,14 @@ type DB struct {
 	batchRefMu sync.Mutex
 	batchRefs  map[uint64]int
 
-	ttl     *ttlStore
-	ttlStop chan struct{}
-	ttlWG   sync.WaitGroup
+	seq         atomic.Uint64 // MVCC 逻辑写序列号（单调递增），支撑零冻结一致性迭代器
+	activeIters atomic.Int64  // 当前打开的 MVCC 快照迭代器数量；为 0 时同键覆写可直接原位原子替换
+	compactMu   sync.Mutex    // 仅串行化并发 Compaction / Close / Snapshot 文件拷贝，不阻塞常规刷盘
+
+	ttl      *ttlStore   // 兼容字段（保留给历史测试与快照兼容检查，新路径默认 nil）
+	ttlIndex *ttlTracker // 轻量内存 TTL 跟踪器（元数据已内嵌至 WAL/Memtable/BPTree）
+	ttlStop  chan struct{}
+	ttlWG    sync.WaitGroup
 
 	snapshotMu      sync.Mutex
 	snapshotWG      sync.WaitGroup
@@ -77,6 +82,7 @@ type DB struct {
 	snapshotRunning bool
 
 	manifestGeneration uint64
+	manifestCreatedAt  time.Time
 }
 
 // Open 使用指定的选项打开数据库。
@@ -138,17 +144,6 @@ func Open(options Options) (*DB, error) {
 		return nil, err
 	}
 
-	// TTL 旁路索引：独立 bbolt 文件，随快照一起复制。
-	ttl, err := openTTLStore(options.DirPath)
-	if err != nil {
-		return nil, err
-	}
-	defer func() {
-		if !opened {
-			_ = ttl.close()
-		}
-	}()
-
 	// 如果不存在则创建废弃元数据文件，读取废弃数量
 	discardMetaPath := filepath.Join(options.DirPath, discardMetaName)
 	discardNumber, totalEntryNumber, err := loadDiscardEntryMeta(discardMetaPath)
@@ -156,22 +151,42 @@ func Open(options Options) (*DB, error) {
 		return nil, err
 	}
 
-	// 打开所有内存表
+	manifestInfo, manifestErr := readDBManifestInfo(options.DirPath)
+	if manifestErr != nil {
+		log.Printf("read manifest failed: %v", manifestErr)
+	}
+
+	// 打开提交日志与所有内存表
 	commitLog, committed, legacy, err := openCommitLog(options.DirPath, options.Sync)
 	if err != nil {
 		return nil, err
 	}
+	defer func() {
+		if !opened {
+			_ = commitLog.close()
+		}
+	}()
+	// 如果 MANIFEST 明确记录该库已启用 COMMIT 日志，缺失 COMMIT 不允许静默降级为 legacy 回放未提交事务。
+	if legacy && manifestInfo != nil && manifestInfo.HasCommitLog {
+		legacy = false
+	}
+
 	memtables, seen, err := openMemtables(options, committed, legacy)
 	if err != nil {
-		_ = commitLog.close()
 		return nil, err
 	}
+	defer func() {
+		if !opened {
+			for _, t := range memtables {
+				_ = t.close()
+			}
+		}
+	}()
 	if legacy {
 		// 旧版本 DB 没有 COMMIT 文件：把现有 WAL 批次补记为已提交，
 		// 避免升级后第一次重启丢失旧数据。
 		for id := range seen {
 			if err := commitLog.append(id, true); err != nil {
-				_ = commitLog.close()
 				return nil, err
 			}
 		}
@@ -186,6 +201,11 @@ func Open(options Options) (*DB, error) {
 	if err != nil {
 		return nil, err
 	}
+	defer func() {
+		if !opened {
+			_ = index.Close()
+		}
+	}()
 
 	// 打开值日志
 	vlog, err := openValueLog(valueLogOptions{
@@ -200,6 +220,11 @@ func Open(options Options) (*DB, error) {
 	if err != nil {
 		return nil, err
 	}
+	defer func() {
+		if !opened {
+			_ = vlog.close()
+		}
+	}()
 
 	// 初始化磁盘IO
 	diskIO := new(DiskIO)
@@ -222,12 +247,17 @@ func Open(options Options) (*DB, error) {
 			SaveChangeThreshold: options.BloomFilterSaveChangeThreshold,
 		}
 		bloomManager = NewBloomFilterManager(bloomOptions)
+		defer func() {
+			if !opened {
+				bloomManager.StopAutoSave()
+			}
+		}()
 	}
 
-	memtableMap := make(map[uint32]*memtable, len(memtables))
+	memtableMap := make(map[uint64]*memtable, len(memtables))
 	shards := make([]*shard, options.PartitionNum)
 	for i := range shards {
-		shards[i] = &shard{id: uint32(i)}
+		shards[i] = newShard(uint32(i))
 	}
 	for _, table := range memtables {
 		memtableMap[table.options.tableID] = table
@@ -243,9 +273,15 @@ func Open(options Options) (*DB, error) {
 		s.immu = s.immu[:len(s.immu)-1]
 	}
 
-	manifestGeneration, manifestErr := readDBManifest(options.DirPath)
-	if manifestErr != nil {
-		log.Printf("read manifest failed: %v", manifestErr)
+	var manifestGeneration uint64
+	var manifestCreatedAt time.Time
+	if manifestInfo != nil {
+		manifestGeneration = manifestInfo.Generation
+		manifestCreatedAt = manifestInfo.CreatedAt
+	}
+	flushBuf := options.MemtableNums - 1
+	if flushBuf < 1 {
+		flushBuf = 1
 	}
 	db := &DB{
 		shards:             shards,
@@ -255,7 +291,8 @@ func Open(options Options) (*DB, error) {
 		vlog:               vlog,
 		bloomManager:       bloomManager,
 		fileLock:           fileLock,
-		flushChan:          make(chan *memtable, options.MemtableNums-1),
+		flushChan:          make(chan *memtable, flushBuf),
+		flushStopCh:        make(chan struct{}),
 		compactChan:        make(chan discardState, 1),
 		closeflushChan:     make(chan struct{}),
 		closeCompactChan:   make(chan struct{}),
@@ -265,8 +302,18 @@ func Open(options Options) (*DB, error) {
 		memtables:          memtableMap,
 		commitLog:          commitLog,
 		batchRefs:          make(map[uint64]int),
-		ttl:                ttl,
+		ttlIndex:           newTTLTracker(),
 		manifestGeneration: manifestGeneration,
+		manifestCreatedAt:  manifestCreatedAt,
+	}
+	db.seq.Store(1)
+	// 先从持久化 BPTree 索引（最旧层）加载带 TTL 的键，再按 memtable 顺序覆盖更新。
+	if bt, ok := index.(*BPTree); ok {
+		if err := bt.forEachTTL(func(key []byte, expireAt int64) {
+			db.ttlIndex.set(key, expireAt)
+		}); err != nil {
+			log.Printf("rebuild ttl tracker from index failed: %v", err)
+		}
 	}
 	for _, table := range memtables {
 		for id := range table.batchIDs {
@@ -275,6 +322,17 @@ func Open(options Options) (*DB, error) {
 				db.batchRefs[id]++
 			}
 		}
+		// 从恢复的内存表重建内存 TTL 跟踪器（覆盖旧索引状态）
+		it := table.skl.NewIterator(false, 0)
+		for it.Rewind(); it.Valid(); it.Next() {
+			vs := it.Value()
+			if vs.Meta == LogRecordDeleted || vs.ExpireAt <= 0 {
+				db.ttlIndex.remove(it.Key())
+			} else {
+				db.ttlIndex.set(it.Key(), vs.ExpireAt)
+			}
+		}
+		_ = it.Close()
 	}
 
 	if tier != nil {
@@ -295,16 +353,24 @@ func Open(options Options) (*DB, error) {
 		log.Printf("rebuild bloom filters failed: %v", err)
 	}
 
-	// 如果在打开数据库时有一些不可变内存表，将它们刷新到磁盘
+	// 如果在打开数据库时有一些不可变内存表，复制切片后按序刷新到磁盘，
+	// 避免 flushMemtableE 原位修改 s.immu 导致跳表或重复刷新。
 	for _, s := range db.shards {
-		for _, table := range s.immu {
+		pending := append([]*memtable(nil), s.immu...)
+		for _, table := range pending {
 			db.flushMemtable(table)
 		}
 	}
 
-	// 异步启动刷新内存表的协程，
-	// 当活跃内存表已满时，带有新写入的内存表将被刷新到磁盘。
-	go db.listenMemtableFlush()
+	// 为每个分片启动单独的有序刷新协程，严格按 FIFO 顺序将 immutable memtable 刷盘。
+	for _, s := range db.shards {
+		shardRef := s
+		db.flushWorkerWG.Add(1)
+		go func() {
+			defer db.flushWorkerWG.Done()
+			db.runShardFlusher(shardRef)
+		}()
+	}
 
 	if err := db.writeDBManifest(); err != nil {
 		log.Printf("write manifest failed: %v", err)
@@ -387,31 +453,55 @@ func (db *DB) ttlSweeper() {
 		case <-db.ttlStop:
 			return
 		case now := <-ticker.C:
-			keys, err := db.ttl.expired(now.UnixMilli())
-			if err != nil {
-				log.Printf("ttl scan failed: %v", err)
-				continue
-			}
-			const ttlDeleteBatchSize = 256
-			for start := 0; start < len(keys); start += ttlDeleteBatchSize {
-				end := start + ttlDeleteBatchSize
-				if end > len(keys) {
-					end = len(keys)
+			nowMs := now.UnixMilli()
+			keys := db.ttlIndex.expired(nowMs)
+			for _, key := range keys {
+				if db.closed.Load() {
+					return
 				}
-				batch := db.NewBatch(DefaultBatchOptions)
-				for _, key := range keys[start:end] {
-					if err := batch.Delete(key); err != nil {
-						log.Printf("ttl delete prepare failed: %v", err)
-						break
-					}
-				}
-				if err := batch.Commit(); err != nil {
-					log.Printf("ttl delete batch failed: %v", err)
-					break
-				}
+				db.sweepExpiredKey(key, nowMs)
 			}
 		}
 	}
+}
+
+// sweepExpiredKey 在单分片写锁内二次校验键确实仍处于已过期状态后再写墓碑，彻底消除 TTL Sweeper TOCTOU 误删。
+func (db *DB) sweepExpiredKey(key []byte, nowMs int64) {
+	s := db.shardFor(key)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if db.closed.Load() {
+		return
+	}
+	_, _, expireAt, found, err := db.getLiveRecordLocked(s, key, nowMs, false)
+	if err != nil {
+		return
+	}
+	if found {
+		// 键已被并发续期或覆盖为无 TTL，更新/清理跟踪器即可，绝不误删！
+		if expireAt <= 0 {
+			db.ttlIndex.remove(key)
+		} else {
+			db.ttlIndex.set(key, expireAt)
+		}
+		return
+	}
+	if expireAt <= 0 {
+		// 键已不存在或已被删除
+		db.ttlIndex.remove(key)
+		return
+	}
+	// 确认仍然过期（found == false && expireAt > 0 && expireAt <= nowMs），写入墓碑。
+	if err := db.waitMemtableSpace(s); err != nil {
+		return
+	}
+	record := &LogRecord{Key: key, Type: LogRecordDeleted}
+	batchID := nextBatchID()
+	if err := s.active.prepareRecord(record, batchID, 1, DefaultWriteOptions); err != nil {
+		return
+	}
+	s.active.applyRecordWithMode(record, db.seq.Add(1), db.activeIters.Load() == 0)
+	db.ttlIndex.remove(key)
 }
 
 func (db *DB) uploadColdSegments(skipActive bool) {
@@ -487,26 +577,18 @@ func (db *DB) closeInternal() error {
 	close(db.closeCompactChan)
 	db.bgWG.Wait()
 
-	select {
-	case _, ok := <-db.flushChan:
-		if !ok {
-			// channel 已经关闭
-		} else {
-			// channel 未关闭，可以安全关闭
-			close(db.flushChan)
-		}
-	default:
-		// channel 未关闭且为空，可以安全关闭
-		close(db.flushChan)
-	}
-	<-db.closeflushChan
-
-	// 拒绝新迭代器并等待它们触发的快照 flush 完成。
+	// 先置 closed 并过一遍所有分片写锁，确保不会再有新写入或迭代器轮转 memtable。
 	shards := db.lockAllShards()
-	db.closed = true
+	db.closed.Store(true)
 	db.unlockAllShards(shards)
+
+	// 停止并排空所有分片有序刷新协程，确保所有已入队的 immutable memtable 刷盘完成。
+	close(db.flushStopCh)
+	db.flushWorkerWG.Wait()
 	db.flushWG.Wait()
 
+	db.compactMu.Lock()
+	defer db.compactMu.Unlock()
 	db.flushLock.Lock()
 	defer db.flushLock.Unlock()
 
@@ -612,28 +694,112 @@ func (db *DB) Put(key []byte, value []byte) error {
 
 // PutWithOptions 将键值对写入数据库。单条写入直接走 WAL + memtable，不创建 Batch。
 func (db *DB) PutWithOptions(key []byte, value []byte, options WriteOptions) error {
+	return db.putWithOptionsAndTTL(key, value, options, 0)
+}
+
+func (db *DB) putWithOptionsAndTTL(key []byte, value []byte, options WriteOptions, expireAt int64) error {
 	if len(key) == 0 {
 		return ErrKeyIsEmpty
 	}
-	if db.closed {
+	if db.closed.Load() {
 		return ErrDBClosed
 	}
 	s := db.shardFor(key)
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if db.closed {
+	if db.closed.Load() {
 		return ErrDBClosed
 	}
 	if err := db.waitMemtableSpace(s); err != nil {
 		return err
 	}
-	record := &LogRecord{Key: key, Value: value, Type: LogRecordNormal}
-	batchID := globalBatchIDNode.Generate()
+	recType := LogRecordNormal
+	if value != nil && len(value) == 0 {
+		recType = LogRecordNormalEmpty
+	}
+	record := &LogRecord{Key: key, Value: value, Type: recType, ExpireAt: expireAt}
+	batchID := nextBatchID()
 	if err := s.active.prepareRecord(record, batchID, 1, options); err != nil {
 		return err
 	}
-	s.active.applyRecord(record)
+	s.active.applyRecordWithMode(record, db.seq.Add(1), db.activeIters.Load() == 0)
+	if expireAt > 0 {
+		db.ttlIndex.set(key, expireAt)
+	} else {
+		db.ttlIndex.remove(key)
+	}
 	return nil
+}
+
+// getLiveRecordLocked 在调用方持有 s.mu（读锁或写锁）的前提下查询键的最新状态。
+// 当 now == 0 时仅在命中 ExpireAt > 0 记录后才惰性读取系统时钟，消除非 TTL 热路径上的时钟开销；
+// 当键已过期时返回 found=false, expireAt>0（且 expireAt <= now），便于 ttlSweeper 区分“已过期”与“不存在/已删除”。
+func (db *DB) getLiveRecordLocked(s *shard, key []byte, now int64, needValue bool) ([]byte, bool, int64, bool, error) {
+	for i := len(s.immu); i >= 0; i-- {
+		var table *memtable
+		if i == len(s.immu) {
+			table = s.active
+		} else {
+			table = s.immu[i]
+		}
+		vs, ok := table.getEntry(key)
+		if !ok {
+			continue
+		}
+		if vs.Meta == LogRecordDeleted {
+			return nil, false, 0, false, nil
+		}
+		if vs.ExpireAt > 0 {
+			if now == 0 {
+				now = time.Now().UnixMilli()
+			}
+			if vs.ExpireAt <= now {
+				return nil, false, vs.ExpireAt, false, nil
+			}
+		}
+		if vs.Meta == LogRecordNormalEmpty {
+			return []byte{}, true, vs.ExpireAt, true, nil
+		}
+		if len(vs.Value) == 0 {
+			// Put(key, nil) 与历史 memtable.getWithState 保持一致：LogRecordNormal 且长度为 0 视为不可读（继续向下或返回 NotFound）
+			continue
+		}
+		if !needValue {
+			return nil, false, vs.ExpireAt, true, nil
+		}
+		return vs.Value, false, vs.ExpireAt, true, nil
+	}
+	if db.bloomManager != nil && !db.bloomManager.TestKey(key) {
+		return nil, false, 0, false, nil
+	}
+	db.vlogGuard.RLock()
+	defer db.vlogGuard.RUnlock()
+	position, err := db.index.Get(key)
+	if err != nil {
+		return nil, false, 0, false, err
+	}
+	if position == nil {
+		return nil, false, 0, false, nil
+	}
+	if position.expireAt > 0 {
+		if now == 0 {
+			now = time.Now().UnixMilli()
+		}
+		if position.expireAt <= now {
+			return nil, false, position.expireAt, false, nil
+		}
+	}
+	if !needValue {
+		return nil, false, position.expireAt, true, nil
+	}
+	record, err := db.vlog.read(position)
+	if err != nil {
+		return nil, false, 0, false, err
+	}
+	if len(record.value) == 0 {
+		return []byte{}, true, position.expireAt, true, nil
+	}
+	return record.value, false, position.expireAt, true, nil
 }
 
 // Get 从数据库获取指定键的值。
@@ -641,53 +807,26 @@ func (db *DB) Get(key []byte) ([]byte, error) {
 	if len(key) == 0 {
 		return nil, ErrKeyIsEmpty
 	}
-	if db.closed {
+	if db.closed.Load() {
 		return nil, ErrDBClosed
-	}
-	if db.ttl != nil {
-		expired, err := db.ttl.isExpired(key, time.Now().UnixMilli())
-		if err != nil {
-			return nil, err
-		}
-		if expired {
-			return nil, ErrKeyNotFound
-		}
 	}
 	s := db.shardFor(key)
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	if db.closed {
+	if db.closed.Load() {
 		return nil, ErrDBClosed
 	}
-	for _, table := range s.memTables() {
-		deleted, empty, value := table.getWithState(key)
-		if deleted {
-			return nil, ErrKeyNotFound
-		}
-		if empty {
-			return []byte{}, nil
-		}
-		if len(value) != 0 {
-			return value, nil
-		}
-	}
-	if db.bloomManager != nil && !db.bloomManager.TestKey(key) {
-		return nil, ErrKeyNotFound
-	}
-	db.vlogGuard.RLock()
-	defer db.vlogGuard.RUnlock()
-	position, err := db.index.Get(key)
+	val, empty, _, found, err := db.getLiveRecordLocked(s, key, 0, true)
 	if err != nil {
 		return nil, err
 	}
-	if position == nil {
+	if !found {
 		return nil, ErrKeyNotFound
 	}
-	record, err := db.vlog.read(position)
-	if err != nil {
-		return nil, err
+	if empty {
+		return []byte{}, nil
 	}
-	return record.value, nil
+	return val, nil
 }
 
 // Delete 使用默认写入选项进行删除。
@@ -700,42 +839,44 @@ func (db *DB) DeleteWithOptions(key []byte, options WriteOptions) error {
 	if len(key) == 0 {
 		return ErrKeyIsEmpty
 	}
-	if db.closed {
+	if db.closed.Load() {
 		return ErrDBClosed
 	}
 	s := db.shardFor(key)
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if db.closed {
+	if db.closed.Load() {
 		return ErrDBClosed
 	}
 	if err := db.waitMemtableSpace(s); err != nil {
 		return err
 	}
 	record := &LogRecord{Key: key, Type: LogRecordDeleted}
-	batchID := globalBatchIDNode.Generate()
+	batchID := nextBatchID()
 	if err := s.active.prepareRecord(record, batchID, 1, options); err != nil {
 		return err
 	}
-	s.active.applyRecord(record)
+	s.active.applyRecordWithMode(record, db.seq.Add(1), db.activeIters.Load() == 0)
+	db.ttlIndex.remove(key)
 	return nil
 }
 
-// Exist 检查指定的键是否存在于数据库中。
-// 实际上，它会打开一个新的批处理并提交它。
-// 你可以认为这个批处理只有一个Exist操作。
+// Exist 检查指定的键是否存在于数据库中（无需读取 ValueLog）。
 func (db *DB) Exist(key []byte) (bool, error) {
-	batch, ok := db.batchPool.Get().(*Batch)
-	if !ok {
-		panic("batchPoll.Get failed")
+	if len(key) == 0 {
+		return false, ErrKeyIsEmpty
 	}
-	batch.init(true, false, true, db)
-	defer func() {
-		_ = batch.Commit()
-		batch.reset()
-		db.batchPool.Put(batch)
-	}()
-	return batch.Exist(key)
+	if db.closed.Load() {
+		return false, ErrDBClosed
+	}
+	s := db.shardFor(key)
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if db.closed.Load() {
+		return false, ErrDBClosed
+	}
+	_, _, _, found, err := db.getLiveRecordLocked(s, key, 0, false)
+	return found, err
 }
 
 // validateOptions 验证给定的选项。
@@ -749,6 +890,9 @@ func validateOptions(options *Options) error {
 	if options.MemtableNums <= 0 {
 		options.MemtableNums = DefaultOptions.MemtableNums
 	}
+	if options.MemtableNums < 2 {
+		options.MemtableNums = 2
+	}
 	if options.PartitionNum <= 0 {
 		options.PartitionNum = DefaultOptions.PartitionNum
 	}
@@ -759,14 +903,26 @@ func validateOptions(options *Options) error {
 	if options.ValueLogFileSize < int64(options.MemtableSize) {
 		options.ValueLogFileSize = int64(options.MemtableSize)
 	}
+	if options.KeyHashFunction == nil {
+		options.KeyHashFunction = DefaultOptions.KeyHashFunction
+	}
+	if options.WaitMemSpaceTimeout <= 0 {
+		options.WaitMemSpaceTimeout = DefaultOptions.WaitMemSpaceTimeout
+	}
+	if options.CompactBatchCapacity <= 0 {
+		options.CompactBatchCapacity = DefaultOptions.CompactBatchCapacity
+	}
 	return nil
 }
 
-// waitMemtableSpace 等待内存表中的空间。
-// 如果活跃内存表已满，它将由后台协程刷新到磁盘。
-// 但如果刷新速度慢于写入速度，内存表中可能没有空间。
-// 因此写入操作将等待内存表中的空间，超时时间由 WaitMemSpaceTimeout 指定。
+// waitMemtableSpace 等待单分片内存表空间（调用方持有 s.mu.Lock）。
 func (db *DB) waitMemtableSpace(s *shard) error {
+	return db.waitMemtableSpaceLocked([]*shard{s}, s)
+}
+
+// waitMemtableSpaceLocked 等待指定分片内存表空间；调用方必须按升序持有 lockedShards 全部写锁。
+// 若分片不可变队列已满，先按逆序释放 lockedShards 等待刷新腾出空间再按升序重新加锁，杜绝与 flushMemtableE 死锁。
+func (db *DB) waitMemtableSpaceLocked(lockedShards []*shard, s *shard) error {
 	if err := db.flushError(); err != nil {
 		return err
 	}
@@ -774,29 +930,68 @@ func (db *DB) waitMemtableSpace(s *shard) error {
 		return nil
 	}
 
-	timer := time.NewTimer(db.options.WaitMemSpaceTimeout)
-	defer timer.Stop()
-	select {
-	case db.flushChan <- s.active:
-		s.immu = append(s.immu, s.active)
-		options := s.active.options
-		options.tableID = makeTableID(s.id, (options.tableID&0xffff)+1)
-		table, err := openMemtable(options)
-		if err != nil {
-			return err
-		}
-		s.active = table
-		if s.id == 0 {
-			db.activeMem = table
-			db.immuMems = s.immu
-		}
-		db.memtablesMu.Lock()
-		db.memtables[table.options.tableID] = table
-		db.memtablesMu.Unlock()
-	case <-timer.C:
-		return ErrWaitMemtableSpaceTimeOut
+	maxImmu := db.options.MemtableNums - 1
+	if maxImmu < 1 {
+		maxImmu = 1
 	}
 
+	var timer *time.Timer
+	defer func() {
+		if timer != nil {
+			timer.Stop()
+		}
+	}()
+
+	for len(s.immu) >= maxImmu {
+		s.notifyFlush()
+		if timer == nil {
+			timer = time.NewTimer(db.options.WaitMemSpaceTimeout)
+		}
+		for i := len(lockedShards) - 1; i >= 0; i-- {
+			lockedShards[i].mu.Unlock()
+		}
+		var timedOut bool
+		select {
+		case <-s.spaceFreed:
+		case <-db.flushStopCh:
+		case <-timer.C:
+			timedOut = true
+		}
+		for _, ls := range lockedShards {
+			ls.mu.Lock()
+		}
+		if db.closed.Load() {
+			return ErrDBClosed
+		}
+		if err := db.flushError(); err != nil {
+			return err
+		}
+		if !s.active.isFull() {
+			return nil
+		}
+		if timedOut && len(s.immu) >= maxImmu {
+			return ErrWaitMemtableSpaceTimeOut
+		}
+	}
+
+	nextOpts := s.active.options
+	nextOpts.legacyExt = false
+	nextOpts.legacyID = 0
+	nextOpts.tableID = nextTableID(s.id, nextOpts.tableID)
+	table, err := openMemtable(nextOpts)
+	if err != nil {
+		return err
+	}
+	s.immu = append(s.immu, s.active)
+	s.active = table
+	if s.id == 0 {
+		db.activeMem = table
+		db.immuMems = s.immu
+	}
+	db.memtablesMu.Lock()
+	db.memtables[table.options.tableID] = table
+	db.memtablesMu.Unlock()
+	s.notifyFlush()
 	return nil
 }
 
@@ -841,23 +1036,31 @@ func (db *DB) flushMemtableE(table *memtable) error {
 	s.flushMu.Lock()
 	defer s.flushMu.Unlock()
 
-	sklIter := table.skl.NewIterator()
+	sklIter := table.skl.NewIterator(false, 0)
 	var deletedKeys [][]byte
 	var logRecords []*ValueLogRecord
+	nowMs := time.Now().UnixMilli()
 
-	// 遍历内存表中的所有记录，将它们分为已删除的键和日志记录
-	// 对于每个日志记录，我们生成uuid。
-	for sklIter.SeekToFirst(); sklIter.Valid(); sklIter.Next() {
-		key, valueStruct := y.ParseKey(sklIter.Key()), sklIter.Value()
-		if valueStruct.Meta == LogRecordDeleted {
+	// 遍历内存表中的所有最新记录，将已删除与已过期的键归入 deletedKeys，存活键写入 VLog 并透传 ExpireAt。
+	for sklIter.Rewind(); sklIter.Valid(); sklIter.Next() {
+		key := append([]byte(nil), sklIter.Key()...)
+		valueStruct := sklIter.Value()
+		if valueStruct.Meta == LogRecordDeleted || (valueStruct.ExpireAt > 0 && valueStruct.ExpireAt <= nowMs) {
 			deletedKeys = append(deletedKeys, key)
+			if valueStruct.ExpireAt > 0 && valueStruct.ExpireAt <= nowMs {
+				db.ttlIndex.remove(key)
+			}
 		} else {
-			logRecord := ValueLogRecord{key: key, value: valueStruct.Value, uid: uuid.New()}
+			logRecord := ValueLogRecord{
+				key:      key,
+				value:    valueStruct.Value,
+				uid:      uuid.New(),
+				expireAt: valueStruct.ExpireAt,
+			}
 			logRecords = append(logRecords, &logRecord)
 		}
 	}
 	_ = sklIter.Close()
-	// log.Println("len del:",len(deletedKeys),len(logRecords))
 
 	// 写入值日志，获取键的位置
 	keyPos, err := db.vlog.writeBatch(logRecords)
@@ -878,25 +1081,29 @@ func (db *DB) flushMemtableE(table *memtable) error {
 		}
 	}
 
-	// 将所有键和位置写入索引。
-	oldKeyPostions, err := db.index.PutBatch(keyPos)
-	if err != nil {
-		return fmt.Errorf("index PutBatch: %w", err)
-	}
-
-	// 将旧键 uuid 加入废弃表（覆盖写的旧版本）。
-	for _, oldKeyPostion := range oldKeyPostions {
-		db.vlog.setDiscard(oldKeyPostion.partition, oldKeyPostion.uid)
-	}
-
-	// 删除键：删除索引，最后把旧 uuid 加入废弃表。
-	if oldKeyPostions, err = db.index.DeleteBatch(deletedKeys); err != nil {
-		return fmt.Errorf("index DeleteBatch: %w", err)
-	}
-
-	// 删除的 key 也必须进入废弃表，否则增量压缩会把它当有效记录重新插回索引。
-	for _, oldKeyPostion := range oldKeyPostions {
-		db.vlog.setDiscard(oldKeyPostion.partition, oldKeyPostion.uid)
+	// 优先使用单事务升序 ApplyBatch 同时提交 Put 与 Delete，减少 bbolt 事务与页分裂开销。
+	if bt, ok := db.index.(*BPTree); ok {
+		oldKeyPositions, err := bt.ApplyBatch(keyPos, deletedKeys)
+		if err != nil {
+			return fmt.Errorf("index ApplyBatch: %w", err)
+		}
+		for _, oldKeyPosition := range oldKeyPositions {
+			db.vlog.setDiscard(oldKeyPosition.partition, oldKeyPosition.uid)
+		}
+	} else {
+		oldKeyPositions, err := db.index.PutBatch(keyPos)
+		if err != nil {
+			return fmt.Errorf("index PutBatch: %w", err)
+		}
+		for _, oldKeyPosition := range oldKeyPositions {
+			db.vlog.setDiscard(oldKeyPosition.partition, oldKeyPosition.uid)
+		}
+		if oldKeyPositions, err = db.index.DeleteBatch(deletedKeys); err != nil {
+			return fmt.Errorf("index DeleteBatch: %w", err)
+		}
+		for _, oldKeyPosition := range oldKeyPositions {
+			db.vlog.setDiscard(oldKeyPosition.partition, oldKeyPosition.uid)
+		}
 	}
 
 	// 同步索引
@@ -910,39 +1117,47 @@ func (db *DB) flushMemtableE(table *memtable) error {
 	}
 	db.releaseBatchRefs(table.batchIDs)
 
-	// 删除内存中保存的旧内存表
+	// 删除内存中保存的旧内存表（严格使用闭包 defer Unlock 杜绝错误路径死锁）
 	s = db.shards[table.shardID]
-	s.mu.Lock()
-	oldTableID := table.options.tableID
-	if table == s.active {
-		options := s.active.options
-		options.tableID = makeTableID(s.id, (options.tableID&0xffff)+1)
-		table, err = openMemtable(options)
-		if err != nil {
-			return fmt.Errorf("open active memtable: %w", err)
-		}
-		s.active = table
-		if s.id == 0 {
-			db.activeMem = table
-		}
-		db.memtablesMu.Lock()
-		db.memtables[table.options.tableID] = table
-		db.memtablesMu.Unlock()
-	} else {
-		for i, t := range s.immu {
-			if t == table {
-				s.immu = append(s.immu[:i], s.immu[i+1:]...)
-				break
+	if err := func() error {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		oldTableID := table.options.tableID
+		if table == s.active {
+			nextOpts := s.active.options
+			nextOpts.legacyExt = false
+			nextOpts.legacyID = 0
+			nextOpts.tableID = nextTableID(s.id, nextOpts.tableID)
+			newTable, openErr := openMemtable(nextOpts)
+			if openErr != nil {
+				return fmt.Errorf("open active memtable: %w", openErr)
+			}
+			s.active = newTable
+			if s.id == 0 {
+				db.activeMem = newTable
+			}
+			db.memtablesMu.Lock()
+			db.memtables[newTable.options.tableID] = newTable
+			db.memtablesMu.Unlock()
+		} else {
+			for i, t := range s.immu {
+				if t == table {
+					s.immu = append(s.immu[:i], s.immu[i+1:]...)
+					break
+				}
+			}
+			if s.id == 0 {
+				db.immuMems = s.immu
 			}
 		}
-		if s.id == 0 {
-			db.immuMems = s.immu
-		}
+		db.memtablesMu.Lock()
+		delete(db.memtables, oldTableID)
+		db.memtablesMu.Unlock()
+		return nil
+	}(); err != nil {
+		return err
 	}
-	db.memtablesMu.Lock()
-	delete(db.memtables, oldTableID)
-	db.memtablesMu.Unlock()
-	s.mu.Unlock()
+	s.notifySpaceFreed()
 	db.sendThresholdState()
 	if err := db.writeDBManifest(); err != nil {
 		return fmt.Errorf("write manifest after flush: %w", err)
@@ -952,14 +1167,17 @@ func (db *DB) flushMemtableE(table *memtable) error {
 
 func (db *DB) sendThresholdState() {
 	if db.options.AutoCompactSupport {
-		// 检查废弃表大小
+		// 检查废弃表大小；totalNumber == 0 时不触发压缩。
 		totalNumber, discardNumber := db.vlog.stats()
-		lowerThreshold := uint32((float32)(totalNumber) * db.options.AdvisedCompactionRate)
-		upperThreshold := uint32((float32)(totalNumber) * db.options.ForceCompactionRate)
+		if totalNumber == 0 {
+			return
+		}
+		lowerThreshold := uint64(float64(totalNumber) * float64(db.options.AdvisedCompactionRate))
+		upperThreshold := uint64(float64(totalNumber) * float64(db.options.ForceCompactionRate))
 		thresholdState := discardState{
 			thresholdState: ThresholdState(UnarriveThreshold),
 		}
-		if discardNumber >= upperThreshold {
+		if discardNumber >= upperThreshold && upperThreshold > 0 {
 			thresholdState = discardState{
 				thresholdState: ThresholdState(ArriveForceThreshold),
 			}
@@ -975,39 +1193,44 @@ func (db *DB) sendThresholdState() {
 	}
 }
 
-func (db *DB) listenMemtableFlush() {
-	sig := make(chan os.Signal, 1)
-	signal.Notify(sig, os.Interrupt, syscall.SIGHUP, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT)
-	var workers sync.WaitGroup
+// runShardFlusher 为单个分片按严格 FIFO 顺序刷新 immutable memtable，
+// 消除多协程乱序刷盘覆盖新值或复活已删除键的风险，且不劫持进程信号。
+func (db *DB) runShardFlusher(s *shard) {
+	popNext := func() *memtable {
+		s.mu.RLock()
+		defer s.mu.RUnlock()
+		if len(s.immu) == 0 {
+			return nil
+		}
+		return s.immu[0]
+	}
+
 	for {
+		if next := popNext(); next != nil {
+			db.flushMemtable(next)
+			db.maybePruneCommitLog()
+			continue
+		}
 		select {
-		case table, ok := <-db.flushChan:
-			if ok {
-				workers.Add(1)
-				go func(t *memtable) {
-					defer workers.Done()
-					db.flushMemtable(t)
-					db.maybePruneCommitLog()
-				}(table)
-			} else {
-				workers.Wait()
-				db.closeflushChan <- struct{}{}
-				return
+		case <-s.flushNotify:
+		case <-db.flushStopCh:
+			for {
+				next := popNext()
+				if next == nil {
+					return
+				}
+				db.flushMemtable(next)
+				db.maybePruneCommitLog()
 			}
-		case <-sig:
-			workers.Wait()
-			return
 		}
 	}
 }
 
-// listenAutoComapct 是一种自动化且更细粒度的方法，不会阻塞Bptree。
-// 它动态检测每个分片的冗余情况，并根据当前IO状态决定是否进行压缩。
+// listenAutoCompact 动态检测每个分片的冗余情况，并根据当前 IO 状态决定是否进行压缩。
+// 退出完全由 db.closeCompactChan 驱动，不在库内劫持进程 OS 信号。
 //
 //nolint:gocognit
 func (db *DB) listenAutoCompact() {
-	sig := make(chan os.Signal, 1)
-	signal.Notify(sig, os.Interrupt, syscall.SIGHUP, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT)
 	firstCompact := true
 	thresholdstate := ThresholdState(UnarriveThreshold)
 	ticker := time.NewTicker(1 * time.Second)
@@ -1024,8 +1247,6 @@ func (db *DB) listenAutoCompact() {
 			thresholdstate = state.thresholdState
 		case <-db.closeCompactChan:
 			return
-		case <-sig:
-			return
 		case <-ticker.C:
 			if !nextRetryAt.IsZero() && time.Now().Before(nextRetryAt) {
 				continue
@@ -1033,8 +1254,10 @@ func (db *DB) listenAutoCompact() {
 			if thresholdstate == ThresholdState(ArriveForceThreshold) {
 				var err error
 				if firstCompact {
-					firstCompact = false
 					err = db.Compact()
+					if err == nil {
+						firstCompact = false
+					}
 				} else {
 					err = db.CompactWithDiscardtable()
 				}
@@ -1065,8 +1288,10 @@ func (db *DB) listenAutoCompact() {
 				}
 				if free {
 					if firstCompact {
-						firstCompact = false
 						err = db.Compact()
+						if err == nil {
+							firstCompact = false
+						}
 					} else {
 						err = db.CompactWithDiscardtable()
 					}
@@ -1082,7 +1307,7 @@ func (db *DB) listenAutoCompact() {
 					nextRetryAt = time.Time{}
 					retryDelay = 1 * time.Second
 				} else {
-					log.Println("IO 当前繁忙")
+					log.Println("IO busy, deferring advised compaction")
 				}
 			}
 		}
@@ -1090,12 +1315,8 @@ func (db *DB) listenAutoCompact() {
 }
 
 func (db *DB) listenDiskIOState() {
-	sig := make(chan os.Signal, 1)
-	signal.Notify(sig, os.Interrupt, syscall.SIGHUP, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT)
 	for {
 		select {
-		case <-sig:
-			return
 		case <-db.closeCompactChan:
 			return
 		default:
@@ -1128,71 +1349,64 @@ func (db *DB) CompactWithDiscardtable() error {
 	return db.compact(true)
 }
 
-func (db *DB) compact(useDiscardTable bool) error {
-	db.flushLock.Lock()
-	defer db.flushLock.Unlock()
+type compactPendingItem struct {
+	oldPos   *wal.ChunkPosition
+	key      []byte
+	uid      uuid.UUID
+	expireAt int64
+}
 
-	shard := db.shards[0]
-	shard.mu.RLock()
-	closed := db.closed
-	shard.mu.RUnlock()
-	if closed {
+func (db *DB) compact(useDiscardTable bool) error {
+	// 仅串行化压缩本身，不持有全局 flushLock，写入与后台 Memtable Flush 可全程并发执行。
+	db.compactMu.Lock()
+	defer db.compactMu.Unlock()
+
+	if db.closed.Load() {
 		return ErrDBClosed
 	}
 
-	stageDir, err := os.MkdirTemp(db.vlog.options.dirPath, ".vlog-compact-")
-	if err != nil {
-		return err
+	cutoffSegments := make([]wal.SegmentID, len(db.vlog.walFiles))
+	const maxCompactBatchBytes = 8 * MB
+	batchLimit := max(1, db.vlog.options.compactBatchCapacity/len(cutoffSegments))
+	if batchLimit > maxCompactBatchBytes {
+		batchLimit = maxCompactBatchBytes
 	}
-	defer os.RemoveAll(stageDir)
 
-	firstSegments := make([]wal.SegmentID, len(db.vlog.walFiles))
-	batchLimit := max(1, db.vlog.options.compactBatchCapacity/len(firstSegments))
-	var copyGroup errgroup.Group
+	var compactGroup errgroup.Group
 	for part, source := range db.vlog.walFiles {
-		copyGroup.Go(func() error {
-			firstID, err := db.copyCompactPartition(part, source, stageDir, batchLimit, useDiscardTable)
-			firstSegments[part] = firstID
+		partIdx := part
+		src := source
+		compactGroup.Go(func() error {
+			cutoffID, err := db.compactPartitionOnline(partIdx, src, batchLimit, useDiscardTable)
+			cutoffSegments[partIdx] = cutoffID
 			if err != nil {
-				return fmt.Errorf("copy compact partition %d: %w", part, err)
+				return fmt.Errorf("compact partition %d: %w", partIdx, err)
 			}
 			return nil
 		})
 	}
-	if err := copyGroup.Wait(); err != nil {
-		return err
-	}
-	if err := util.SyncDir(db.vlog.options.dirPath); err != nil {
-		return fmt.Errorf("sync compacted segment names: %w", err)
-	}
-
-	// 新段已经可读且同步。索引即使只更新一部分，新旧位置也都有效。
-	var indexGroup errgroup.Group
-	for part, source := range db.vlog.walFiles {
-		indexGroup.Go(func() error {
-			if err := db.indexCompactPartition(part, source, firstSegments[part], batchLimit); err != nil {
-				return fmt.Errorf("index compact partition %d: %w", part, err)
-			}
-			return nil
-		})
-	}
-	if err := indexGroup.Wait(); err != nil {
+	if err := compactGroup.Wait(); err != nil {
 		return err
 	}
 	if err := db.index.Sync(); err != nil {
 		return fmt.Errorf("sync compacted index: %w", err)
 	}
 
-	// 旧索引视图可能仍被点读或迭代器持有。
+	// 旧索引视图可能仍被点读或迭代器持有，在 vlogGuard 写锁下安全回收已迁移的封存段。
+	var reclaimErr error
 	db.vlogGuard.Lock()
 	for part, source := range db.vlog.walFiles {
-		if err = source.DeleteSegmentsBelow(firstSegments[part]); err != nil {
+		if cutoffSegments[part] == 0 {
+			continue
+		}
+		if err := source.DeleteSegmentsBelow(cutoffSegments[part]); err != nil {
+			reclaimErr = err
 			break
 		}
 	}
 	db.vlogGuard.Unlock()
-	if err != nil {
-		return fmt.Errorf("reclaim compacted value log: %w", err)
+	if reclaimErr != nil {
+		return fmt.Errorf("reclaim compacted value log: %w", reclaimErr)
 	}
 
 	db.vlog.cleanDiscardTable()
@@ -1202,203 +1416,214 @@ func (db *DB) compact(useDiscardTable bool) error {
 	return nil
 }
 
-func (db *DB) copyCompactPartition(part int, source *wal.WAL, stageDir string, batchLimit int, useDiscardTable bool) (wal.SegmentID, error) {
-	firstID := source.ActiveSegmentID() + 1
-	if firstID == 0 {
-		return 0, fmt.Errorf("value log segment IDs exhausted")
+// compactPartitionOnline 在线增量压缩单个 VLog 分区：
+// 1. 轮转活跃段使所有待压缩段成为不可变封存段（< cutoffID），与并发 Flush 写入的新段天然隔离；
+// 2. 分批（上限 8MB）扫描封存段中的存活且未过期记录，追加写回该分区当前活跃段并落盘；
+// 3. 通过 BPTree.CompareAndSwapBatch 仅当索引仍指向 oldPos 时更新为 newPos，绝不覆盖并发新写入。
+func (db *DB) compactPartitionOnline(part int, source *wal.WAL, batchLimit int, useDiscardTable bool) (wal.SegmentID, error) {
+	if source.IsEmpty() {
+		return 0, nil
 	}
-	staged, err := wal.Open(wal.Options{
-		DirPath:          stageDir,
-		SegmentSize:      db.vlog.options.segmentSize,
-		SegmentFileExt:   fmt.Sprintf(valueLogFileExt, part),
-		InitialSegmentID: firstID,
-	})
-	if err != nil {
+	if err := source.OpenNewActiveSegment(); err != nil {
 		return 0, err
 	}
-	err = db.copyIndexedValues(part, source.NewReader(), staged, batchLimit, useDiscardTable)
-	if err == nil {
-		err = staged.Sync()
+	cutoffID := source.ActiveSegmentID()
+	if cutoffID <= 1 {
+		return 0, nil
 	}
-	lastID := staged.ActiveSegmentID()
-	if err := errors.Join(err, staged.Close()); err != nil {
-		return 0, err
-	}
-	if err := source.PublishSegments(stageDir, lastID); err != nil {
-		return 0, err
-	}
-	return firstID, nil
-}
 
-func (db *DB) copyIndexedValues(part int, reader *wal.Reader, staged *wal.WAL, batchLimit int, useDiscardTable bool) error {
+	reader := source.NewReaderWithMax(cutoffID - 1)
 	var chunks [][]byte
+	var pending []compactPendingItem
 	var batchBytes int
-	for {
-		chunk, pos, err := reader.Next()
-		if errors.Is(err, io.EOF) {
-			return writeCompactedValues(staged, chunks)
+	var unsyncedBytes int
+	const syncThresholdBytes = 1 * MB
+	nowMs := time.Now().UnixMilli()
+
+	flushBatch := func(final bool) error {
+		if len(chunks) == 0 {
+			if final && unsyncedBytes > 0 {
+				unsyncedBytes = 0
+				return source.Sync()
+			}
+			return nil
 		}
+		positions, err := writeCompactedBatch(source, chunks)
 		if err != nil {
 			return err
 		}
+		unsyncedBytes += batchBytes
+		if final || unsyncedBytes >= syncThresholdBytes {
+			if err := source.Sync(); err != nil {
+				return err
+			}
+			unsyncedBytes = 0
+		}
+		if bt, ok := db.index.(*BPTree); ok {
+			updates := make([]indexCASUpdate, len(pending))
+			for i, item := range pending {
+				updates[i] = indexCASUpdate{
+					oldPos: item.oldPos,
+					newPos: &KeyPosition{
+						key:       item.key,
+						partition: uint32(part),
+						uid:       item.uid,
+						position:  positions[i],
+						expireAt:  item.expireAt,
+					},
+				}
+			}
+			if err := bt.CompareAndSwapBatch(part, updates); err != nil {
+				return err
+			}
+		} else {
+			keyPositions := make([]*KeyPosition, len(pending))
+			for i, item := range pending {
+				keyPositions[i] = &KeyPosition{
+					key:       item.key,
+					partition: uint32(part),
+					uid:       item.uid,
+					position:  positions[i],
+					expireAt:  item.expireAt,
+				}
+			}
+			if _, err := db.index.PutBatch(keyPositions); err != nil {
+				return err
+			}
+		}
+		clear(chunks)
+		chunks = chunks[:0]
+		clear(pending)
+		pending = pending[:0]
+		batchBytes = 0
+		return nil
+	}
+
+	for {
+		chunk, pos, err := reader.Next()
+		if errors.Is(err, io.EOF) {
+			if err := flushBatch(true); err != nil {
+				return 0, err
+			}
+			return cutoffID, nil
+		}
+		if err != nil {
+			return 0, err
+		}
 		record := decodeValueLogRecord(chunk)
 		if record == nil {
-			return fmt.Errorf("invalid value log record at %+v", pos)
+			return 0, fmt.Errorf("invalid value log record at %+v", pos)
 		}
 		if useDiscardTable && db.vlog.isDiscard(part, record.uid) {
 			continue
 		}
 		current, err := db.index.Get(record.key)
 		if err != nil {
-			return err
+			return 0, err
 		}
 		if current == nil || current.partition != uint32(part) || !sameChunkPosition(current.position, pos) {
 			continue
 		}
+		if current.expireAt > 0 && current.expireAt <= nowMs {
+			continue
+		}
 		chunks = append(chunks, chunk)
-		batchBytes += len(chunk)
-		if batchBytes >= batchLimit {
-			if err := writeCompactedValues(staged, chunks); err != nil {
-				return err
-			}
-			clear(chunks)
-			chunks = chunks[:0]
-			batchBytes = 0
-		}
-	}
-}
-
-func writeCompactedValues(staged *wal.WAL, chunks [][]byte) error {
-	for _, chunk := range chunks {
-		staged.PendingWrites(chunk)
-	}
-	_, err := staged.WriteAll()
-	if !errors.Is(err, wal.ErrPendingSizeTooLarge) {
-		return err
-	}
-	// 值可以放进一个段，但批次加上记录头后未必能放进一个段。
-	for _, chunk := range chunks {
-		if _, err := staged.Write(chunk); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func (db *DB) indexCompactPartition(part int, source *wal.WAL, firstID wal.SegmentID, batchLimit int) error {
-	reader := source.NewReader()
-	for reader.CurrentSegmentId() < firstID {
-		reader.SkipCurrentSegment()
-	}
-
-	var positions []*KeyPosition
-	var batchBytes int
-	for {
-		chunk, pos, err := reader.Next()
-		if errors.Is(err, io.EOF) {
-			_, err := db.index.PutBatch(positions)
-			return err
-		}
-		if err != nil {
-			return err
-		}
-		record := decodeValueLogRecord(chunk)
-		if record == nil {
-			return fmt.Errorf("invalid compacted value at %+v", pos)
-		}
-		positions = append(positions, &KeyPosition{
-			key:       record.key,
-			partition: uint32(part),
-			uid:       record.uid,
-			position:  pos,
+		pending = append(pending, compactPendingItem{
+			oldPos:   pos,
+			key:      record.key,
+			uid:      record.uid,
+			expireAt: current.expireAt,
 		})
 		batchBytes += len(chunk)
 		if batchBytes >= batchLimit {
-			if _, err := db.index.PutBatch(positions); err != nil {
-				return err
+			if err := flushBatch(false); err != nil {
+				return 0, err
 			}
-			clear(positions)
-			positions = positions[:0]
-			batchBytes = 0
 		}
 	}
+}
+
+func writeCompactedBatch(target *wal.WAL, chunks [][]byte) ([]*wal.ChunkPosition, error) {
+	positions, err := target.WriteBatch(chunks)
+	if !errors.Is(err, wal.ErrPendingSizeTooLarge) {
+		return positions, err
+	}
+	positions = make([]*wal.ChunkPosition, 0, len(chunks))
+	for _, chunk := range chunks {
+		pos, werr := target.Write(chunk)
+		if werr != nil {
+			return nil, werr
+		}
+		positions = append(positions, pos)
+	}
+	return positions, nil
 }
 
 func (db *DB) GetOptions() Options {
 	return db.options
 }
 
-// 加载废弃条目元数据，如果首次打开则创建元数据文件。
-func loadDiscardEntryMeta(discardMetaPath string) (uint32, uint32, error) {
-	var err error
-	var discardNumber uint32
-	var totalEntryNumber uint32
-	if _, err = os.Stat(discardMetaPath); os.IsNotExist(err) {
-		// 不存在则创建一个
-		var file *os.File
-		file, err = os.Create(discardMetaPath)
-		if err != nil {
-			return discardNumber, totalEntryNumber, err
+// 加载废弃条目元数据：
+// - 不存在时立即原子写入 16 字节合法初始头（消除首次正常关闭前崩溃导致 0 字节文件砖库）；
+// - 兼容旧版 8 字节 (2×uint32) 与新版 16 字节 (2×uint64)；
+// - 若检测到 0 字节或损坏短文件，记录日志并自动归零重建而非拒绝启动。
+func loadDiscardEntryMeta(discardMetaPath string) (uint64, uint64, error) {
+	data, err := os.ReadFile(discardMetaPath)
+	if os.IsNotExist(err) {
+		if err := storeDiscardEntryMeta(discardMetaPath, 0, 0); err != nil {
+			return 0, 0, err
 		}
-		discardNumber = 0
-		totalEntryNumber = 0
-		file.Close()
-	} else if err != nil {
-		return discardNumber, totalEntryNumber, err
-	} else {
-		// 没有错误，我们加载元数据
-		var file *os.File
-		file, err = os.Open(discardMetaPath)
-		if err != nil {
-			return discardNumber, totalEntryNumber, err
-		}
-		defer file.Close()
-
-		// 将文件指针设置为0
-		_, err = file.Seek(0, 0)
-		if err != nil {
-			return discardNumber, totalEntryNumber, err
-		}
-
-		// 读取废弃数量
-		err = binary.Read(file, binary.LittleEndian, &discardNumber)
-		if err != nil {
-			return discardNumber, totalEntryNumber, err
-		}
-
-		// 读取总条目数量
-		err = binary.Read(file, binary.LittleEndian, &totalEntryNumber)
-		if err != nil {
-			return discardNumber, totalEntryNumber, err
-		}
+		return 0, 0, nil
 	}
-	return discardNumber, totalEntryNumber, nil
+	if err != nil {
+		return 0, 0, err
+	}
+	switch len(data) {
+	case 16:
+		discardNumber := binary.LittleEndian.Uint64(data[0:8])
+		totalEntryNumber := binary.LittleEndian.Uint64(data[8:16])
+		return discardNumber, totalEntryNumber, nil
+	case 8:
+		discardNumber := uint64(binary.LittleEndian.Uint32(data[0:4]))
+		totalEntryNumber := uint64(binary.LittleEndian.Uint32(data[4:8]))
+		return discardNumber, totalEntryNumber, nil
+	default:
+		log.Printf("recovering corrupt/empty discard metadata (%d bytes) at %s", len(data), discardMetaPath)
+		if err := storeDiscardEntryMeta(discardMetaPath, 0, 0); err != nil {
+			return 0, 0, err
+		}
+		return 0, 0, nil
+	}
 }
 
-// 持久化废弃数量和总条目数量.
-func storeDiscardEntryMeta(discardMetaPath string, discardNumber uint32, totalNumber uint32) error {
-	file, err := os.OpenFile(discardMetaPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0666)
-	if err != nil {
-		return err
-	}
-	defer file.Close()
+// 持久化废弃数量和总条目数量（原子临时文件 + Sync + RenameDurable + SyncDir）。
+func storeDiscardEntryMeta(discardMetaPath string, discardNumber uint64, totalNumber uint64) error {
+	var buf [16]byte
+	binary.LittleEndian.PutUint64(buf[0:8], discardNumber)
+	binary.LittleEndian.PutUint64(buf[8:16], totalNumber)
 
-	// 将文件指针设置为0并覆盖
-	_, err = file.Seek(0, 0)
+	tmpPath := discardMetaPath + ".tmp"
+	file, err := os.OpenFile(tmpPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
 	if err != nil {
 		return err
 	}
-
-	// 写入废弃数量
-	err = binary.Write(file, binary.LittleEndian, &discardNumber)
-	if err != nil {
+	if _, err := file.Write(buf[:]); err != nil {
+		_ = file.Close()
+		_ = os.Remove(tmpPath)
 		return err
 	}
-
-	// 写入总条目数量
-	err = binary.Write(file, binary.LittleEndian, &totalNumber)
-	if err != nil {
+	if err := file.Sync(); err != nil {
+		_ = file.Close()
+		_ = os.Remove(tmpPath)
 		return err
 	}
-	return nil
+	if err := file.Close(); err != nil {
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	if err := util.RenameDurable(tmpPath, discardMetaPath); err != nil {
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	return util.SyncDir(filepath.Dir(discardMetaPath))
 }

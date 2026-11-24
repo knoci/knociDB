@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"sort"
+	"sync/atomic"
 	"time"
 
 	"github.com/cespare/xxhash/v2"
@@ -11,9 +12,10 @@ import (
 )
 
 type clusterShard struct {
-	id      uint32
-	groupID uint64
-	sm      *KVStateMachine
+	id       uint32
+	groupID  uint64
+	sm       *KVStateMachine
+	leaderID atomic.Uint64
 }
 
 // ShardInfo 描述 ClusterDB 中的一个固定 Raft group。
@@ -61,7 +63,11 @@ func (c *ClusterDB) shardFor(key []byte) uint32 {
 func (c *ClusterDB) leaderForShard(shard uint32) (uint64, error) {
 	c.mu.RLock()
 	nodeHost := c.nodeHost
-	started := c.state && nodeHost != nil
+	started := c.state.Load() && nodeHost != nil
+	var sh *clusterShard
+	if int(shard) < len(c.shards) {
+		sh = c.shards[shard]
+	}
 	groupID := c.config.GroupIDForShard(shard)
 	c.mu.RUnlock()
 	if !started {
@@ -75,31 +81,53 @@ func (c *ClusterDB) leaderForShard(shard uint32) (uint64, error) {
 	if !valid {
 		return 0, ErrNotLeader
 	}
-	c.mu.Lock()
-	if int(shard) < len(c.leaderIDs) {
-		c.leaderIDs[shard] = leader
+	// 无锁更新每分片 Leader 缓存，消除热路径全局写锁争用。
+	if sh != nil {
+		sh.leaderID.Store(leader)
 	}
 	if shard == 0 {
-		c.leaderID = leader
+		c.leaderID.Store(leader)
 	}
-	c.mu.Unlock()
 	return leader, nil
 }
 
 func (c *ClusterDB) stateMachineForShard(shard uint32) (*KVStateMachine, error) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	if c.nodeHost == nil || !c.state || int(shard) >= len(c.shards) {
+	if c.nodeHost == nil || !c.state.Load() || int(shard) >= len(c.shards) {
 		return nil, ErrNodeNotStarted
 	}
 	return c.shards[shard].sm, nil
 }
 
+// ReadConsistency 控制分布式读取的一致性级别。
+type ReadConsistency uint8
+
+const (
+	// ReadLinearizable 默认强一致读：通过 Leader ReadIndex 屏障确保读到最新已提交状态。
+	ReadLinearizable ReadConsistency = iota
+	// ReadFollowerIndex 在本地节点（含 Follower）通过 ReadIndex 屏障提供线性一致读。
+	ReadFollowerIndex
+	// ReadStaleLocal 直接读取本地状态机，零网络往返，允许读到略微滞后的状态。
+	ReadStaleLocal
+)
+
 // Scan 在单分片布局下扫描本地副本，区间包含 start 和 end，空边界表示无界。
 // 调用方应在使用完毕后关闭迭代器。
 func (c *ClusterDB) Scan(start, end []byte) (*Iterator, error) {
+	return c.ScanContext(context.Background(), start, end, ReadStaleLocal)
+}
+
+// ScanContext 在单分片布局下按指定一致级别扫描区间 [start, end]。
+// 当 consistency 为 ReadLinearizable 或 ReadFollowerIndex 时，先执行 Raft ReadIndex 屏障再打开 MVCC 迭代器。
+func (c *ClusterDB) ScanContext(ctx context.Context, start, end []byte, consistency ReadConsistency) (*Iterator, error) {
 	if c.config.ShardCount != 1 {
 		return nil, ErrCrossShardScan
+	}
+	if consistency == ReadLinearizable || consistency == ReadFollowerIndex {
+		if err := c.readIndexBarrier(ctx, 0); err != nil {
+			return nil, err
+		}
 	}
 	sm, err := c.stateMachineForShard(0)
 	if err != nil {
@@ -170,7 +198,7 @@ type ShardMembership struct {
 // ShardMembership 返回指定分片 Raft group 的成员信息。
 func (c *ClusterDB) ShardMembership(shardID uint32) (*ShardMembership, error) {
 	c.mu.RLock()
-	if c.nodeHost == nil || !c.state || int(shardID) >= c.config.ShardCount {
+	if c.nodeHost == nil || !c.state.Load() || int(shardID) >= c.config.ShardCount {
 		c.mu.RUnlock()
 		return nil, ErrNodeNotStarted
 	}
@@ -202,7 +230,7 @@ func (c *ClusterDB) ShardMembership(shardID uint32) (*ShardMembership, error) {
 
 func (c *ClusterDB) requireShardLeader(shardID uint32) (uint64, error) {
 	c.mu.RLock()
-	if c.nodeHost == nil || !c.state || int(shardID) >= c.config.ShardCount {
+	if c.nodeHost == nil || !c.state.Load() || int(shardID) >= c.config.ShardCount {
 		c.mu.RUnlock()
 		return 0, ErrNodeNotStarted
 	}
@@ -276,8 +304,8 @@ func (c *ClusterDB) Shards() []ShardInfo {
 	out := make([]ShardInfo, 0, c.config.ShardCount)
 	for i := 0; i < c.config.ShardCount; i++ {
 		info := ShardInfo{ID: uint32(i), GroupID: c.config.GroupIDForShard(uint32(i))}
-		if i < len(c.leaderIDs) {
-			info.LeaderID = c.leaderIDs[i]
+		if i < len(c.shards) && c.shards[i] != nil {
+			info.LeaderID = c.shards[i].leaderID.Load()
 		}
 		out = append(out, info)
 	}
@@ -287,7 +315,7 @@ func (c *ClusterDB) Shards() []ShardInfo {
 // LeaderOf 返回 key 所属分片 group 的 leader 节点 ID。
 func (c *ClusterDB) LeaderOf(key []byte) (uint64, error) {
 	c.mu.RLock()
-	if c.nodeHost == nil || !c.state {
+	if c.nodeHost == nil || !c.state.Load() {
 		c.mu.RUnlock()
 		return 0, ErrNodeNotStarted
 	}

@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"sync"
+	"sync/atomic"
 
 	"github.com/valyala/bytebufferpool"
 )
@@ -23,8 +24,9 @@ const (
 )
 
 var (
-	ErrClosed     = errors.New("the segment file is closed")
-	ErrInvalidCRC = errors.New("invalid crc, the data may be corrupted")
+	ErrClosed           = errors.New("the segment file is closed")
+	ErrInvalidCRC       = errors.New("invalid crc, the data may be corrupted")
+	ErrInvalidChunkType = errors.New("invalid chunk type, the data may be corrupted")
 )
 
 const (
@@ -52,19 +54,21 @@ type segment struct {
 	fd                 *os.File
 	currentBlockNumber uint32
 	currentBlockSize   uint32
-	closed             bool
+	committedSize      atomic.Int64
+	closed             atomic.Bool
+	ioMu               sync.RWMutex
 	header             []byte
-	startupBlock       *startupBlock
-	isStartupTraversal bool
 }
 
 // segmentIter 是用于遍历段文件中的所有数据的迭代器。
-// 你可以调用 Next 获取下一个数据块，
-// 当没有数据时会返回 io.EOF。
+// 每个迭代器持有独立的 32KB 流式块缓存，顺序遍历时每个物理块仅触发一次 pread 系统调用。
 type segmentIter struct {
 	segment     *segment
 	blockNumber uint32
 	chunkOffset int64
+	blockBuf    []byte
+	cachedBlock int64
+	cachedSize  int64
 }
 
 // ChunkPosition 表示在段文件中的位置信息。 用于从段文件中读取范围数据。
@@ -79,26 +83,24 @@ type ChunkPosition struct {
 	ChunkSize uint32
 }
 
-// 启动遍历时只有一个读取器（单个 goroutine），
-// 因此我们可以复用一个块来完成整个遍历过程,以避免额外内存分配。
-type startupBlock struct {
-	block       []byte
-	blockNumber int64
-}
+var zeroPadding [chunkHeaderSize]byte
 
-// block池，用于作为block缓冲区
+// block池，池化 *[]byte 指针避免 Put 时切片头逃逸装箱。
 var blockPool = sync.Pool{
 	New: func() interface{} {
-		return make([]byte, blockSize)
+		b := make([]byte, blockSize)
+		return &b
 	},
 }
 
-func getBuffer() []byte {
-	return blockPool.Get().([]byte)
+func getBuffer() *[]byte {
+	return blockPool.Get().(*[]byte)
 }
 
-func putBuffer(buf []byte) {
-	blockPool.Put(buf)
+func putBuffer(buf *[]byte) {
+	if buf != nil && len(*buf) == blockSize {
+		blockPool.Put(buf)
+	}
 }
 
 // openSegmentFile 打开一个新的段文件。
@@ -116,21 +118,19 @@ func openSegmentFile(dirPath, extName string, id uint32) (*segment, error) {
 	// 设置当前块号和块大小
 	offset, err := fd.Seek(0, io.SeekEnd)
 	if err != nil {
+		_ = fd.Close()
 		return nil, fmt.Errorf("seek to the end of segment file %d%s failed: %v", id, extName, err)
 	}
 
-	return &segment{
+	seg := &segment{
 		id:                 id,
 		fd:                 fd,
 		header:             make([]byte, chunkHeaderSize),
 		currentBlockNumber: uint32(offset / blockSize),
 		currentBlockSize:   uint32(offset % blockSize),
-		startupBlock: &startupBlock{
-			block:       make([]byte, blockSize),
-			blockNumber: -1,
-		},
-		isStartupTraversal: false,
-	}, nil
+	}
+	seg.committedSize.Store(offset)
+	return seg, nil
 }
 
 // NewIter 创建一个新的段文件读取器。
@@ -139,14 +139,15 @@ func (seg *segment) NewIter() *segmentIter {
 		segment:     seg,
 		blockNumber: 0,
 		chunkOffset: 0,
+		cachedBlock: -1,
 	}
 }
 
 // recoverTail 截断文件尾部不完整的 chunk。
 // 崩溃可能留下“头部完整但数据不足”或只有半个 chunk 头的尾部；
-// 这里从前往后扫描，保留最后一条完整记录，把后面的垃圾截掉。
+// 仅对文件尾部的残缺/全零尾块进行截断，段中间的 CRC/类型/IO 损坏会直接报错而不静默丢弃后续数据。
 func (seg *segment) recoverTail() error {
-	if seg.closed {
+	if seg.closed.Load() {
 		return ErrClosed
 	}
 	size := seg.Size()
@@ -157,9 +158,24 @@ func (seg *segment) recoverTail() error {
 	iter := seg.NewIter()
 	var lastEnd int64
 	for {
-		_, next, err := seg.readInternal(iter.blockNumber, iter.chunkOffset)
+		next, err := iter.nextSkipPayload()
 		if err != nil {
-			break
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			if errors.Is(err, io.ErrUnexpectedEOF) {
+				break
+			}
+			if errors.Is(err, ErrInvalidCRC) || errors.Is(err, ErrInvalidChunkType) {
+				// 检查是否为尾部残余（例如崩溃留下的最后一条损毁记录或尾随全零填充）。
+				// 如果失败记录之后仍有非零数据，说明是段中间损坏，必须报错而非静默截断。
+				if seg.isTailCorruption(iter.blockNumber, iter.chunkOffset, size) {
+					break
+				}
+				return fmt.Errorf("segment %d corruption at offset %d: %w",
+					seg.id, int64(iter.blockNumber)*blockSize+iter.chunkOffset, err)
+			}
+			return err
 		}
 		end := int64(next.BlockNumber)*blockSize + next.ChunkOffset
 		if end <= lastEnd {
@@ -175,15 +191,75 @@ func (seg *segment) recoverTail() error {
 		if err := os.Truncate(seg.fd.Name(), lastEnd); err != nil {
 			return err
 		}
+		if err := seg.fd.Sync(); err != nil {
+			return err
+		}
 		seg.currentBlockNumber = uint32(lastEnd / blockSize)
 		seg.currentBlockSize = uint32(lastEnd % blockSize)
+		seg.committedSize.Store(lastEnd)
 	}
 	return nil
 }
 
+// isTailCorruption 判断从 (blockNumber, chunkOffset) 开始的损坏是否位于文件尾部
+// （即损坏记录直达文件末尾，或剩余字节全为 0）。
+func (seg *segment) isTailCorruption(blockNumber uint32, chunkOffset int64, segSize int64) bool {
+	failPos := int64(blockNumber)*blockSize + chunkOffset
+	if failPos >= segSize {
+		return true
+	}
+	// 如果剩余字节全为 0（常见于预分配或崩溃尾零），属于尾部无效数据。
+	if seg.allZeroRange(failPos, segSize) {
+		return true
+	}
+	// 读取失败 chunk 的头，看其声明的结束位置是否已经延伸到文件末尾（无后续记录）。
+	var hdr [chunkHeaderSize]byte
+	if failPos+chunkHeaderSize > segSize {
+		return true
+	}
+	if _, err := seg.fd.ReadAt(hdr[:], failPos); err != nil {
+		return false
+	}
+	length := int64(binary.LittleEndian.Uint16(hdr[4:6]))
+	chunkEnd := failPos + chunkHeaderSize + length
+	if chunkEnd >= segSize {
+		return true
+	}
+	// 若 chunkEnd 之后全是 0，同样可视为尾部损坏。
+	return seg.allZeroRange(chunkEnd, segSize)
+}
+
+func (seg *segment) allZeroRange(start, end int64) bool {
+	bufPtr := getBuffer()
+	defer putBuffer(bufPtr)
+	buf := *bufPtr
+	for pos := start; pos < end; {
+		n := end - pos
+		if n > int64(len(buf)) {
+			n = int64(len(buf))
+		}
+		readN, err := seg.fd.ReadAt(buf[:n], pos)
+		if err != nil && !errors.Is(err, io.EOF) {
+			return false
+		}
+		for i := 0; i < readN; i++ {
+			if buf[i] != 0 {
+				return false
+			}
+		}
+		if readN == 0 {
+			break
+		}
+		pos += int64(readN)
+	}
+	return true
+}
+
 // Sync 将段文件刷新到磁盘。
 func (seg *segment) Sync() error {
-	if seg.closed {
+	seg.ioMu.RLock()
+	defer seg.ioMu.RUnlock()
+	if seg.closed.Load() {
 		return nil
 	}
 	return seg.fd.Sync()
@@ -191,8 +267,9 @@ func (seg *segment) Sync() error {
 
 // Remove 删除段文件。
 func (seg *segment) Remove() error {
-	if !seg.closed {
-		seg.closed = true
+	seg.ioMu.Lock()
+	defer seg.ioMu.Unlock()
+	if !seg.closed.Swap(true) {
 		if err := seg.fd.Close(); err != nil {
 			return err
 		}
@@ -202,17 +279,17 @@ func (seg *segment) Remove() error {
 
 // Close 关闭段文件。
 func (seg *segment) Close() error {
-	if seg.closed {
+	seg.ioMu.Lock()
+	defer seg.ioMu.Unlock()
+	if seg.closed.Swap(true) {
 		return nil
 	}
-	seg.closed = true
 	return seg.fd.Close()
 }
 
-// Size 返回段文件的大小。
+// Size 返回段文件的已提交大小（并发安全）。
 func (seg *segment) Size() int64 {
-	size := int64(seg.currentBlockNumber) * int64(blockSize)
-	return size + int64(seg.currentBlockSize)
+	return seg.committedSize.Load()
 }
 
 // writeToBuffer 计算数据的块位置，将数据写入字节缓冲池，更新段文件状态
@@ -224,17 +301,17 @@ func (seg *segment) writeToBuffer(data []byte, chunkBuffer *bytebufferpool.ByteB
 	startBufferLen := chunkBuffer.Len()
 	padding := uint32(0)
 
-	if seg.closed {
+	if seg.closed.Load() {
 		return nil, ErrClosed
 	}
 
-	// 如果剩余的块大小不足以容纳块头部，则填充该块
+	// 如果剩余的块大小不足以容纳块头部，则填充该块（零分配静态零数组）
 	if seg.currentBlockSize+chunkHeaderSize >= blockSize {
 		// 必要时进行填充
 		if seg.currentBlockSize < blockSize {
-			p := make([]byte, blockSize-seg.currentBlockSize)
-			chunkBuffer.B = append(chunkBuffer.B, p...)
-			padding += blockSize - seg.currentBlockSize
+			padLen := blockSize - seg.currentBlockSize
+			chunkBuffer.B = append(chunkBuffer.B, zeroPadding[:padLen]...)
+			padding += padLen
 			// 切换到新块
 			seg.currentBlockNumber += 1
 			seg.currentBlockSize = 0
@@ -311,27 +388,37 @@ func (seg *segment) writeToBuffer(data []byte, chunkBuffer *bytebufferpool.ByteB
 
 // writeAll 将批量数据写入段文件。
 func (seg *segment) writeAll(data [][]byte) (positions []*ChunkPosition, err error) {
-	if seg.closed {
+	if seg.closed.Load() {
 		return nil, ErrClosed
 	}
 
 	// 如果发生任何错误，恢复段文件状态
 	originBlockNumber := seg.currentBlockNumber
 	originBlockSize := seg.currentBlockSize
+	originOffset := int64(originBlockNumber)*blockSize + int64(originBlockSize)
 
 	// 初始化数据块缓冲区
 	chunkBuffer := bytebufferpool.Get()
 	chunkBuffer.Reset()
-	// 如果出错，就回滚
+	// 如果出错，就回滚内存偏移并截断可能部分写入的文件尾部
 	defer func() {
 		if err != nil {
 			seg.currentBlockNumber = originBlockNumber
 			seg.currentBlockSize = originBlockSize
+			seg.committedSize.Store(originOffset)
+			_ = os.Truncate(seg.fd.Name(), originOffset)
 		}
 		bytebufferpool.Put(chunkBuffer)
 	}()
 
-	// 将所有数据写入数据块缓冲区
+	// 将所有数据写入数据块缓冲区（预扩容避免大批量触发多次 runtime.growslice）
+	var est int
+	for _, rec := range data {
+		est += len(rec) + chunkHeaderSize*(len(rec)/(blockSize-chunkHeaderSize)+2)
+	}
+	if cap(chunkBuffer.B) < est {
+		chunkBuffer.B = make([]byte, 0, est)
+	}
 	var pos *ChunkPosition
 	positions = make([]*ChunkPosition, len(data))
 	for i := 0; i < len(positions); i++ {
@@ -345,26 +432,129 @@ func (seg *segment) writeAll(data [][]byte) (positions []*ChunkPosition, err err
 	if err = seg.writeChunkBuffer(chunkBuffer); err != nil {
 		return
 	}
+	seg.committedSize.Store(int64(seg.currentBlockNumber)*blockSize + int64(seg.currentBlockSize))
 	return
+}
+
+// writeToBufferNoPos 与 writeToBuffer 等价，但不分配 *ChunkPosition 堆对象，专供 WAL 顺序追加热路径使用。
+func (seg *segment) writeToBufferNoPos(data []byte, chunkBuffer *bytebufferpool.ByteBuffer) (uint32, error) {
+	if seg.closed.Load() {
+		return 0, ErrClosed
+	}
+	if seg.currentBlockSize+chunkHeaderSize >= blockSize {
+		if seg.currentBlockSize < blockSize {
+			padLen := blockSize - seg.currentBlockSize
+			chunkBuffer.B = append(chunkBuffer.B, zeroPadding[:padLen]...)
+			seg.currentBlockNumber += 1
+			seg.currentBlockSize = 0
+		}
+	}
+
+	dataSize := uint32(len(data))
+	var chunkBytes uint32
+	if seg.currentBlockSize+dataSize+chunkHeaderSize <= blockSize {
+		seg.appendChunkBuffer(chunkBuffer, data, ChunkTypeFull)
+		chunkBytes = dataSize + chunkHeaderSize
+	} else {
+		var (
+			leftSize             = dataSize
+			blockCount    uint32 = 0
+			currBlockSize        = seg.currentBlockSize
+		)
+		for leftSize > 0 {
+			chunkSize := blockSize - currBlockSize - chunkHeaderSize
+			if chunkSize > leftSize {
+				chunkSize = leftSize
+			}
+			end := dataSize - leftSize + chunkSize
+			if end > dataSize {
+				end = dataSize
+			}
+			var chunkType ChunkType
+			switch leftSize {
+			case dataSize:
+				chunkType = ChunkTypeFirst
+			case chunkSize:
+				chunkType = ChunkTypeLast
+			default:
+				chunkType = ChunkTypeMiddle
+			}
+			seg.appendChunkBuffer(chunkBuffer, data[dataSize-leftSize:end], chunkType)
+			leftSize -= chunkSize
+			blockCount += 1
+			currBlockSize = (currBlockSize + chunkSize + chunkHeaderSize) % blockSize
+		}
+		chunkBytes = blockCount*chunkHeaderSize + dataSize
+	}
+
+	seg.currentBlockSize += chunkBytes
+	if seg.currentBlockSize >= blockSize {
+		seg.currentBlockNumber += seg.currentBlockSize / blockSize
+		seg.currentBlockSize = seg.currentBlockSize % blockSize
+	}
+	return chunkBytes, nil
+}
+
+// writeAllNoPos 批量写入段文件，预扩容 chunkBuffer 且跳过 []*ChunkPosition 分配。
+func (seg *segment) writeAllNoPos(data [][]byte, estBytes int64) (written uint32, err error) {
+	if seg.closed.Load() {
+		return 0, ErrClosed
+	}
+
+	originBlockNumber := seg.currentBlockNumber
+	originBlockSize := seg.currentBlockSize
+	originOffset := int64(originBlockNumber)*blockSize + int64(originBlockSize)
+
+	chunkBuffer := bytebufferpool.Get()
+	chunkBuffer.Reset()
+	defer func() {
+		if err != nil {
+			seg.currentBlockNumber = originBlockNumber
+			seg.currentBlockSize = originBlockSize
+			seg.committedSize.Store(originOffset)
+			_ = os.Truncate(seg.fd.Name(), originOffset)
+		}
+		bytebufferpool.Put(chunkBuffer)
+	}()
+
+	if estBytes > 0 && int64(cap(chunkBuffer.B)) < estBytes {
+		chunkBuffer.B = make([]byte, 0, estBytes)
+	}
+	for i := 0; i < len(data); i++ {
+		var n uint32
+		n, err = seg.writeToBufferNoPos(data[i], chunkBuffer)
+		if err != nil {
+			return 0, err
+		}
+		written += n
+	}
+	if err = seg.writeChunkBuffer(chunkBuffer); err != nil {
+		return 0, err
+	}
+	seg.committedSize.Store(int64(seg.currentBlockNumber)*blockSize + int64(seg.currentBlockSize))
+	return written, nil
 }
 
 // Write 将数据写入段文件。
 func (seg *segment) Write(data []byte) (pos *ChunkPosition, err error) {
-	if seg.closed {
+	if seg.closed.Load() {
 		return nil, ErrClosed
 	}
 
 	originBlockNumber := seg.currentBlockNumber
 	originBlockSize := seg.currentBlockSize
+	originOffset := int64(originBlockNumber)*blockSize + int64(originBlockSize)
 
 	// 初始化数据块缓冲区
 	chunkBuffer := bytebufferpool.Get()
 	chunkBuffer.Reset()
-	// 如果出错，就回滚
+	// 如果出错，就回滚内存偏移并截断可能部分写入的文件尾部
 	defer func() {
 		if err != nil {
 			seg.currentBlockNumber = originBlockNumber
 			seg.currentBlockSize = originBlockSize
+			seg.committedSize.Store(originOffset)
+			_ = os.Truncate(seg.fd.Name(), originOffset)
 		}
 		bytebufferpool.Put(chunkBuffer)
 	}()
@@ -378,6 +568,7 @@ func (seg *segment) Write(data []byte) (pos *ChunkPosition, err error) {
 	if err = seg.writeChunkBuffer(chunkBuffer); err != nil {
 		return
 	}
+	seg.committedSize.Store(int64(seg.currentBlockNumber)*blockSize + int64(seg.currentBlockSize))
 
 	return
 }
@@ -407,42 +598,103 @@ func (seg *segment) writeChunkBuffer(buf *bytebufferpool.ByteBuffer) error {
 	if _, err := seg.fd.Write(buf.Bytes()); err != nil {
 		return err
 	}
-
-	// 写入后缓存的块不能再次重用。
-	seg.startupBlock.blockNumber = -1
 	return nil
 }
 
 // Read 根据块号和数据块偏移量从段文件中读取数据。
 func (seg *segment) Read(blockNumber uint32, chunkOffset int64) ([]byte, error) {
-	value, _, err := seg.readInternal(blockNumber, chunkOffset)
+	value, _, err := seg.readInternal(blockNumber, chunkOffset, nil, 0, true)
 	return value, err
 }
 
-func (seg *segment) readInternal(blockNumber uint32, chunkOffset int64) ([]byte, *ChunkPosition, error) {
-	if seg.closed {
+// readAtPos 供 WAL.Read 点读使用：
+// 1. 优先命中共享不可变满块缓存（零系统调用）；
+// 2. 若未开启缓存且 ChunkSize 明确落在单个块内，仅精准读取该 chunk 字节（消除 512x 读放大）；
+// 3. 否则走分块读取并回填满块缓存。
+func (seg *segment) readAtPos(pos *ChunkPosition, cache *blockCache) ([]byte, error) {
+	if cache == nil && pos.ChunkSize > chunkHeaderSize && pos.ChunkOffset+int64(pos.ChunkSize) <= blockSize {
+		val, ok, err := seg.readSingleChunkExact(pos.BlockNumber, pos.ChunkOffset, int64(pos.ChunkSize))
+		if ok || err != nil {
+			return val, err
+		}
+	}
+	value, _, err := seg.readInternal(pos.BlockNumber, pos.ChunkOffset, cache, pos.ChunkSize, true)
+	return value, err
+}
+
+func (seg *segment) readSingleChunkExact(blockNumber uint32, chunkOffset, chunkSize int64) ([]byte, bool, error) {
+	seg.ioMu.RLock()
+	defer seg.ioMu.RUnlock()
+
+	if seg.closed.Load() {
+		return nil, false, ErrClosed
+	}
+	segSize := seg.Size()
+	fileOffset := int64(blockNumber)*blockSize + chunkOffset
+	if fileOffset >= segSize {
+		return nil, false, io.EOF
+	}
+	if fileOffset+chunkSize > segSize {
+		return nil, false, nil // 回退常规读取以精确区分 EOF / ErrUnexpectedEOF
+	}
+
+	buf := make([]byte, chunkSize)
+	if _, err := seg.fd.ReadAt(buf, fileOffset); err != nil {
+		return nil, false, err
+	}
+	length := binary.LittleEndian.Uint16(buf[4:6])
+	if int64(length)+chunkHeaderSize != chunkSize {
+		return nil, false, nil // ChunkSize 可能是迭代器估算值，回退常规读取
+	}
+	if buf[6] != ChunkTypeFull {
+		return nil, false, nil
+	}
+	checksum := crc32.ChecksumIEEE(buf[4:])
+	savedSum := binary.LittleEndian.Uint32(buf[:4])
+	if savedSum != checksum {
+		return nil, false, ErrInvalidCRC
+	}
+	return buf[chunkHeaderSize:], true, nil
+}
+
+func (seg *segment) readInternal(blockNumber uint32, chunkOffset int64, cache *blockCache, hintSize uint32, collectPayload bool) ([]byte, *ChunkPosition, error) {
+	return seg.readInternalWithStreamBuf(blockNumber, chunkOffset, cache, hintSize, collectPayload, nil, nil, nil)
+}
+
+func (seg *segment) readInternalWithStreamBuf(
+	blockNumber uint32,
+	chunkOffset int64,
+	cache *blockCache,
+	hintSize uint32,
+	collectPayload bool,
+	streamBuf []byte,
+	cachedBlock *int64,
+	cachedSize *int64,
+) ([]byte, *ChunkPosition, error) {
+	seg.ioMu.RLock()
+	defer seg.ioMu.RUnlock()
+
+	if seg.closed.Load() {
 		return nil, nil, ErrClosed
 	}
 
 	var (
 		result    []byte
+		poolPtr   *[]byte
 		block     []byte
 		segSize   = seg.Size()
 		nextChunk = &ChunkPosition{SegmentId: seg.id}
+		isFirst   = true
 	)
-
-	if seg.isStartupTraversal {
-		// 复用startupBlock
-		block = seg.startupBlock.block
-	} else {
-		// 请求block内存池
-		block = getBuffer()
-		if len(block) != blockSize {
-			block = make([]byte, blockSize)
-		}
-		// 释放
-		defer putBuffer(block)
+	if collectPayload && hintSize > chunkHeaderSize {
+		result = make([]byte, 0, hintSize-chunkHeaderSize)
 	}
+
+	defer func() {
+		if poolPtr != nil {
+			putBuffer(poolPtr)
+		}
+	}()
 
 	for {
 		size := int64(blockSize)
@@ -452,26 +704,42 @@ func (seg *segment) readInternal(blockNumber uint32, chunkOffset int64) ([]byte,
 		}
 
 		if chunkOffset >= size {
+			if !isFirst {
+				return nil, nil, io.ErrUnexpectedEOF
+			}
 			return nil, nil, io.EOF
 		}
 		if chunkOffset+chunkHeaderSize > size {
 			return nil, nil, io.ErrUnexpectedEOF
 		}
 
-		if seg.isStartupTraversal {
-			// 有两种情况我们需要从文件中读取块：
-			// 1. 获取的块不是缓存的块
-			// 2. 新的写入追加到块中，且块仍小于 32KB，由于新的写入，我们必须再次读取它。
-			if seg.startupBlock.blockNumber != int64(blockNumber) || size != blockSize {
-				// 从指定偏移量处读取段文件中的块。
-				_, err := seg.fd.ReadAt(block[0:size], offset)
-				if err != nil {
+		if streamBuf != nil && cachedBlock != nil && cachedSize != nil {
+			block = streamBuf
+			if *cachedBlock != int64(blockNumber) || *cachedSize < size {
+				if _, err := seg.fd.ReadAt(block[0:size], offset); err != nil {
 					return nil, nil, err
 				}
-				// 记住该块
-				seg.startupBlock.blockNumber = int64(blockNumber)
+				*cachedBlock = int64(blockNumber)
+				*cachedSize = size
+			}
+		} else if size == blockSize && cache != nil {
+			if cached, ok := cache.get(seg.id, blockNumber); ok {
+				block = cached
+			} else {
+				if poolPtr == nil {
+					poolPtr = getBuffer()
+				}
+				block = *poolPtr
+				if _, err := seg.fd.ReadAt(block[0:size], offset); err != nil {
+					return nil, nil, err
+				}
+				cache.put(seg.id, blockNumber, block)
 			}
 		} else {
+			if poolPtr == nil {
+				poolPtr = getBuffer()
+			}
+			block = *poolPtr
 			if _, err := seg.fd.ReadAt(block[0:size], offset); err != nil {
 				return nil, nil, err
 			}
@@ -489,7 +757,6 @@ func (seg *segment) readInternal(blockNumber uint32, chunkOffset int64) ([]byte,
 		if checksumEnd > size {
 			return nil, nil, io.ErrUnexpectedEOF
 		}
-		result = append(result, block[start:checksumEnd]...)
 
 		// 校验和
 		checksum := crc32.ChecksumIEEE(block[chunkOffset+4 : checksumEnd])
@@ -498,8 +765,21 @@ func (seg *segment) readInternal(blockNumber uint32, chunkOffset int64) ([]byte,
 			return nil, nil, ErrInvalidCRC
 		}
 
-		// 类型
+		// 类型状态机校验：Full | First -> Middle* -> Last
 		chunkType := header[6]
+		if isFirst {
+			if chunkType != ChunkTypeFull && chunkType != ChunkTypeFirst {
+				return nil, nil, ErrInvalidChunkType
+			}
+		} else {
+			if chunkType != ChunkTypeMiddle && chunkType != ChunkTypeLast {
+				return nil, nil, ErrInvalidChunkType
+			}
+		}
+
+		if collectPayload {
+			result = append(result, block[start:checksumEnd]...)
+		}
 
 		if chunkType == ChunkTypeFull || chunkType == ChunkTypeLast {
 			nextChunk.BlockNumber = blockNumber
@@ -512,18 +792,47 @@ func (seg *segment) readInternal(blockNumber uint32, chunkOffset int64) ([]byte,
 			}
 			break
 		}
+		isFirst = false
 		blockNumber += 1
 		chunkOffset = 0
 	}
 	return result, nextChunk, nil
 }
 
+func (segReader *segmentIter) ensureBuf() {
+	if segReader.blockBuf == nil {
+		segReader.blockBuf = make([]byte, blockSize)
+		segReader.cachedBlock = -1
+		segReader.cachedSize = 0
+	}
+}
+
+// nextSkipPayload 供 recoverTail 使用：仅校验 chunk 头部与 CRC，零负载内存分配，且按 32KB 块流式缓存。
+func (segReader *segmentIter) nextSkipPayload() (*ChunkPosition, error) {
+	if segReader.segment.closed.Load() {
+		return nil, ErrClosed
+	}
+	segReader.ensureBuf()
+	_, nextChunk, err := segReader.segment.readInternalWithStreamBuf(
+		segReader.blockNumber,
+		segReader.chunkOffset,
+		nil,
+		0,
+		false,
+		segReader.blockBuf,
+		&segReader.cachedBlock,
+		&segReader.cachedSize,
+	)
+	return nextChunk, err
+}
+
 // Next 返回下一个数据块。
 func (segReader *segmentIter) Next() ([]byte, *ChunkPosition, error) {
 	// 段文件已关闭
-	if segReader.segment.closed {
+	if segReader.segment.closed.Load() {
 		return nil, nil, ErrClosed
 	}
+	segReader.ensureBuf()
 
 	// 此位置描述当前数据块信息
 	chunkPosition := &ChunkPosition{
@@ -532,9 +841,15 @@ func (segReader *segmentIter) Next() ([]byte, *ChunkPosition, error) {
 		ChunkOffset: segReader.chunkOffset,
 	}
 
-	value, nextChunk, err := segReader.segment.readInternal(
+	value, nextChunk, err := segReader.segment.readInternalWithStreamBuf(
 		segReader.blockNumber,
 		segReader.chunkOffset,
+		nil,
+		0,
+		true,
+		segReader.blockBuf,
+		&segReader.cachedBlock,
+		&segReader.cachedSize,
 	)
 	if err != nil {
 		return nil, nil, err
@@ -585,22 +900,40 @@ func (cp *ChunkPosition) encode(shrink bool) []byte {
 
 // DecodeChunkPosition 从字节切片解码数据块位置。
 func DecodeChunkPosition(buf []byte) *ChunkPosition {
+	pos, _ := DecodeChunkPositionWithSize(buf)
+	return pos
+}
+
+// DecodeChunkPositionWithSize 解码数据块位置并返回消耗的字节数，供索引值附加元数据（如 ExpireAt）使用。
+func DecodeChunkPositionWithSize(buf []byte) (*ChunkPosition, int) {
 	if len(buf) == 0 {
-		return nil
+		return nil, 0
 	}
 
 	var index = 0
 	// SegmentId
 	segmentId, n := binary.Uvarint(buf[index:])
+	if n <= 0 {
+		return nil, 0
+	}
 	index += n
 	// BlockNumber
 	blockNumber, n := binary.Uvarint(buf[index:])
+	if n <= 0 {
+		return nil, 0
+	}
 	index += n
 	// ChunkOffset
 	chunkOffset, n := binary.Uvarint(buf[index:])
+	if n <= 0 {
+		return nil, 0
+	}
 	index += n
 	// ChunkSize
 	chunkSize, n := binary.Uvarint(buf[index:])
+	if n <= 0 {
+		return nil, 0
+	}
 	index += n
 
 	return &ChunkPosition{
@@ -608,5 +941,5 @@ func DecodeChunkPosition(buf []byte) *ChunkPosition {
 		BlockNumber: uint32(blockNumber),
 		ChunkOffset: int64(chunkOffset),
 		ChunkSize:   uint32(chunkSize),
-	}
+	}, index
 }

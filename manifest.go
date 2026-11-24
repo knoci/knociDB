@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"sort"
 	"time"
+
+	"github.com/knoci/knocidb/util"
 )
 
 const (
@@ -15,14 +17,15 @@ const (
 	dbManifestVersion = 1
 )
 
-// dbManifest 是数据库目录的文件清单。它不是事务日志，
-// 而是用于记录某次提交点对应的索引/VLOG/WAL 文件名和大小。
+// dbManifest 是数据库目录的文件清单与拓扑元数据。
 type dbManifest struct {
-	Version    int              `json:"version"`
-	Generation uint64           `json:"generation"`
-	CreatedAt  time.Time        `json:"created_at"`
-	UpdatedAt  time.Time        `json:"updated_at"`
-	Files      []dbManifestFile `json:"files"`
+	Version      int              `json:"version"`
+	Generation   uint64           `json:"generation"`
+	PartitionNum int              `json:"partition_num,omitempty"`
+	HasCommitLog bool             `json:"has_commit_log,omitempty"`
+	CreatedAt    time.Time        `json:"created_at"`
+	UpdatedAt    time.Time        `json:"updated_at"`
+	Files        []dbManifestFile `json:"files"`
 }
 
 type dbManifestFile struct {
@@ -30,20 +33,28 @@ type dbManifestFile struct {
 	Size int64  `json:"size"`
 }
 
-func readDBManifest(dir string) (uint64, error) {
+func readDBManifestInfo(dir string) (*dbManifest, error) {
 	data, err := os.ReadFile(filepath.Join(dir, dbManifestName))
 	if errors.Is(err, os.ErrNotExist) {
-		return 0, nil
+		return nil, nil
 	}
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
 	var manifest dbManifest
 	if err := json.Unmarshal(data, &manifest); err != nil {
-		return 0, err
+		return nil, err
 	}
 	if manifest.Version != dbManifestVersion {
-		return 0, fmt.Errorf("unsupported manifest version %d", manifest.Version)
+		return nil, fmt.Errorf("unsupported manifest version %d", manifest.Version)
+	}
+	return &manifest, nil
+}
+
+func readDBManifest(dir string) (uint64, error) {
+	manifest, err := readDBManifestInfo(dir)
+	if err != nil || manifest == nil {
+		return 0, err
 	}
 	return manifest.Generation, nil
 }
@@ -76,12 +87,19 @@ func (db *DB) writeDBManifest() error {
 	}
 	sort.Slice(files, func(i, j int) bool { return files[i].Name < files[j].Name })
 	now := time.Now().UTC()
+	createdAt := db.manifestCreatedAt
+	if createdAt.IsZero() {
+		createdAt = now
+		db.manifestCreatedAt = createdAt
+	}
 	manifest := dbManifest{
-		Version:    dbManifestVersion,
-		Generation: db.manifestGeneration + 1,
-		CreatedAt:  now,
-		UpdatedAt:  now,
-		Files:      files,
+		Version:      dbManifestVersion,
+		Generation:   db.manifestGeneration + 1,
+		PartitionNum: db.options.PartitionNum,
+		HasCommitLog: true,
+		CreatedAt:    createdAt,
+		UpdatedAt:    now,
+		Files:        files,
 	}
 	data, err := json.MarshalIndent(&manifest, "", "  ")
 	if err != nil {
@@ -107,14 +125,10 @@ func (db *DB) writeDBManifest() error {
 		return err
 	}
 	path := filepath.Join(db.options.DirPath, dbManifestName)
-	if err := os.Rename(tmp, path); err != nil {
+	if err := util.RenameDurable(tmp, path); err != nil {
 		_ = os.Remove(tmp)
 		return err
 	}
 	db.manifestGeneration = manifest.Generation
-	if dir, err := os.Open(db.options.DirPath); err == nil {
-		_ = dir.Sync()
-		_ = dir.Close()
-	}
-	return nil
+	return util.SyncDir(db.options.DirPath)
 }

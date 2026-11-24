@@ -38,8 +38,8 @@ go run ./examples/gRPC/server \
 ```
 
 说明：
-- 同时开启 `--mtls` 与 `--tls-ca` 时，客户端必须提供证书。
-- 开启 `--token` 后，所有 RPC 必须携带 Token，否则返回 `Unauthenticated`。
+- `--mtls` 要求配置客户端 CA，客户端必须提供证书和私钥。
+- `--token` 要求服务端启用 TLS，所有 RPC 必须携带 Token，否则返回 `Unauthenticated`。
 
 ## 运行客户端
 
@@ -49,33 +49,41 @@ go run ./examples/gRPC/server \
 go run ./examples/gRPC/client --addr 127.0.0.1:50051
 ```
 
-启用 TLS/mTLS + Token：
+启用 mTLS + Token：
 
 ```bash
 go run ./examples/gRPC/client \
   --addr localhost:8443 \
   --tls-ca ca.crt \
   --tls-server-name localhost \
+  --client-cert client.crt \
+  --client-key client.key \
   --token secret
 ```
 
-支持命令：`HELP`、`GET key`、`PUT key value`、`DEL key [key...]`、`SCAN start end`、`BEGIN`、`BPUT key value`、`BDEL key`、`COMMIT`、`DISCARD`、`EXIT`。
+单向 TLS 连接可以省略客户端证书和私钥。使用 `--tls` 且省略 `--tls-ca` 时，客户端使用系统信任根验证服务端。
+
+支持命令：`HELP`、`GET key`、`PUT key value`、`PUTTTL key value ttl_ms`、`TTL key`、`PERSIST key`、`DEL key [key...]`、`SCAN start end [limit]`、`HEALTH`、`BEGIN`、`BPUT key value`、`BDEL key`、`COMMIT`、`DISCARD`、`EXIT`。
 
 ## API 说明
 
-- 基础：
+- 基础与 TTL：
   - `Put(key,value)`：写入一条 KV
   - `Get(key)`：读取 KV；不存在返回 `NotFound`
+  - `PutWithTTL(key,value,ttl)`：写入带 TTL 的 KV（内嵌元数据）
+  - `GetTTL(key)`：查询剩余 TTL（无 TTL 或不存在返回 `hasTTL=false`）
+  - `Persist(key)`：移除指定键的 TTL
   - `Delete(key)`：删除 KV
+  - `HealthCheck(service)`：通过标准 `grpc.health.v1` 查询服务状态
 
 - 批量（客户端流）：
   - 载荷格式：`op(1=Put,2=Delete) | uint32 key_len | key | [value]`
   - 调用方式：客户端多次 `Send`，服务端一次性 `Commit`
 
 - 扫描（服务端流）：
-  - 载荷格式：`uint32 start_len | start | uint32 end_len | end`
+  - 载荷格式：`uint32 start_len | start | uint32 end_len | end | [uint32 limit]`
   - 响应格式：`uint32 key_len | key | value`
-  - 使用当前唯一支持的 B+Tree 索引
+  - 支持分页条数上限（`ScanLimit`）与提前取消流释放迭代器
 
 ## 错误码映射
 

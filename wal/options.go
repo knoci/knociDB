@@ -37,6 +37,9 @@ type Options struct {
 
 	// ObjectStorage 指定对象存储是否开启。true将使用对象存储。
 	ObjectStorage bool
+
+	// BlockCacheSize 指定用于缓存已写满 32KB 块的内存上限（字节）；0 表示禁用块缓存。
+	BlockCacheSize int64
 }
 
 const (

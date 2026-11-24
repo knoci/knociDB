@@ -270,10 +270,13 @@ func hasDatabaseFiles(dir string) bool {
 			continue
 		}
 		if name == discardMetaName ||
+			name == commitLogName ||
+			name == ttlDBFileName ||
+			name == dbManifestName ||
 			strings.Contains(name, ".VLOG.") ||
-			strings.HasSuffix(name, ".SEG") ||
+			strings.Contains(name, ".SEG.") ||
 			strings.HasPrefix(name, "INDEX.") ||
-			strings.HasPrefix(name, "BLOOM.") {
+			strings.HasSuffix(name, bloomFileExt) {
 			return true
 		}
 	}

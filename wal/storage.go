@@ -1,18 +1,20 @@
 package wal
 
 import (
+	"bufio"
 	"context"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
-	"github.com/spf13/viper"
+	"github.com/knoci/knocidb/util"
 )
 
 // ObjectStorageType 表示对象存储的类型
@@ -63,25 +65,59 @@ type S3Storage struct {
 	bucket string
 }
 
-// NewObjectStorage 从当前目录的 config.yaml 创建一个新的对象存储。
-// 该入口保留给旧代码；新代码应使用 NewObjectStorageWithConfig，避免全局配置。
+// NewObjectStorage 从当前目录的 config.yaml 创建一个新的对象存储（纯标准库解析，无 viper 依赖）。
+// 该入口保留给旧代码；新代码应使用 NewObjectStorageWithConfig，避免全局配置文件。
 func NewObjectStorage() (ObjectStorage, error) {
-	viper.SetConfigName("config")
-	viper.SetConfigType("yaml")
-	viper.AddConfigPath("./")
-
-	if err := viper.ReadInConfig(); err != nil {
-		return nil, fmt.Errorf("failed to read config file: %v", err)
+	f, err := os.Open("config.yaml")
+	if err != nil {
+		return nil, fmt.Errorf("failed to read config file: %w", err)
 	}
+	defer f.Close()
 
-	return NewObjectStorageWithConfig(ObjectStorageConfig{
-		Type:      ObjectStorageType(viper.GetString("object_storage.type")),
-		Endpoint:  viper.GetString("object_storage.endpoint"),
-		Region:    viper.GetString("object_storage.region"),
-		Bucket:    viper.GetString("object_storage.bucket"),
-		AccessKey: viper.GetString("object_storage.accesskey"),
-		SecretKey: viper.GetString("object_storage.secretkey"),
-	})
+	var cfg ObjectStorageConfig
+	inSection := false
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		raw := sc.Text()
+		trimmed := strings.TrimSpace(raw)
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		if !strings.HasPrefix(raw, " ") && !strings.HasPrefix(raw, "\t") {
+			inSection = strings.HasPrefix(trimmed, "object_storage:")
+			continue
+		}
+		if !inSection {
+			continue
+		}
+		k, v, ok := strings.Cut(trimmed, ":")
+		if !ok {
+			continue
+		}
+		v = strings.TrimSpace(v)
+		if idx := strings.Index(v, " #"); idx >= 0 {
+			v = strings.TrimSpace(v[:idx])
+		}
+		v = strings.Trim(v, `"'`)
+		switch strings.ToLower(strings.TrimSpace(k)) {
+		case "type":
+			cfg.Type = ObjectStorageType(v)
+		case "endpoint":
+			cfg.Endpoint = v
+		case "region":
+			cfg.Region = v
+		case "bucket":
+			cfg.Bucket = v
+		case "accesskey":
+			cfg.AccessKey = v
+		case "secretkey":
+			cfg.SecretKey = v
+		}
+	}
+	if err := sc.Err(); err != nil {
+		return nil, fmt.Errorf("failed to parse config file: %w", err)
+	}
+	return NewObjectStorageWithConfig(cfg)
 }
 
 // NewObjectStorageWithConfig 使用显式配置创建对象存储。
@@ -164,25 +200,16 @@ func (s *S3Storage) Upload(localPath, objectKey string) error {
 	return nil
 }
 
-// Download 从S3对象存储下载文件
+// Download 从S3对象存储原子下载文件（写入临时文件并落盘后再 RenameDurable，避免中断产生半截文件）
 func (s *S3Storage) Download(objectKey, localPath string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
-	// 确保目录存在
 	dir := filepath.Dir(localPath)
 	if err := os.MkdirAll(dir, os.ModePerm); err != nil {
 		return fmt.Errorf("failed to create directory %s: %w", dir, err)
 	}
 
-	// 创建本地文件
-	file, err := os.Create(localPath)
-	if err != nil {
-		return fmt.Errorf("failed to create file %s: %w", localPath, err)
-	}
-	defer file.Close()
-
-	// 从S3下载对象
 	resp, err := s.client.GetObject(ctx, &s3.GetObjectInput{
 		Bucket: aws.String(s.bucket),
 		Key:    aws.String(objectKey),
@@ -190,20 +217,36 @@ func (s *S3Storage) Download(objectKey, localPath string) error {
 	if err != nil {
 		return fmt.Errorf("failed to download file from S3: %w", err)
 	}
-	defer func(Body io.ReadCloser) {
-		err = Body.Close()
-		if err != nil {
+	defer resp.Body.Close()
 
-		}
-	}(resp.Body)
-
-	// 将对象内容写入本地文件
-	_, err = io.Copy(file, resp.Body)
+	tmpFile, err := os.CreateTemp(dir, ".download-*")
 	if err != nil {
+		return fmt.Errorf("failed to create temp file in %s: %w", dir, err)
+	}
+	tmpPath := tmpFile.Name()
+	cleanup := true
+	defer func() {
+		if cleanup {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+
+	if _, err := io.Copy(tmpFile, resp.Body); err != nil {
+		_ = tmpFile.Close()
 		return fmt.Errorf("failed to write file content: %w", err)
 	}
-
-	return nil
+	if err := tmpFile.Sync(); err != nil {
+		_ = tmpFile.Close()
+		return fmt.Errorf("failed to sync downloaded file: %w", err)
+	}
+	if err := tmpFile.Close(); err != nil {
+		return fmt.Errorf("failed to close downloaded file: %w", err)
+	}
+	if err := util.RenameDurable(tmpPath, localPath); err != nil {
+		return fmt.Errorf("failed to publish downloaded file: %w", err)
+	}
+	cleanup = false
+	return util.SyncDir(dir)
 }
 
 // List 列出S3对象存储中的文件

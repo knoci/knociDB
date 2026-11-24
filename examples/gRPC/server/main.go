@@ -21,17 +21,19 @@ func main() {
 	token := flag.String("token", "", "enable token auth when set")
 	flag.Parse()
 
-	opts := knocidb.DefaultOptions
-	opts.DirPath = *dir
+	opts := knocidb.NewDefaultOptions(*dir)
 	db, err := knocidb.Open(opts)
 	if err != nil {
 		panic(err)
 	}
 	defer func() { _ = db.Close() }()
 
-	var lisAddr string
+	var (
+		gs      interface{ GracefulStop() }
+		lisAddr string
+	)
 	if *tlsCert != "" || *tlsKey != "" || *token != "" || *mtls || *tlsCA != "" {
-		_, lis, err := knocigrpc.StartSecure(*addr, db, knocigrpc.ServerSecurityOptions{
+		srv, lis, err := knocigrpc.StartSecure(*addr, db, knocigrpc.ServerSecurityOptions{
 			TLSCertFile:       *tlsCert,
 			TLSKeyFile:        *tlsKey,
 			TLSClientCAFile:   *tlsCA,
@@ -42,19 +44,21 @@ func main() {
 		if err != nil {
 			panic(err)
 		}
+		gs = srv
 		lisAddr = lis.Addr().String()
 		fmt.Println("listening on", lisAddr)
 	} else {
-		gs, lis, err := knocigrpc.Start(*addr, db)
+		srv, lis, err := knocigrpc.Start(*addr, db)
 		if err != nil {
 			panic(err)
 		}
+		gs = srv
 		lisAddr = lis.Addr().String()
 		fmt.Println("listening on", lisAddr)
-		_ = gs
 	}
 
 	ch := make(chan os.Signal, 1)
 	signal.Notify(ch, syscall.SIGINT, syscall.SIGTERM)
 	<-ch
+	gs.GracefulStop()
 }

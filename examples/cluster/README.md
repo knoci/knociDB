@@ -1,6 +1,6 @@
 # KnociDB Cluster Example
 
-This example demonstrates KnociDB's sharded transparent cluster: one Raft group per fixed shard, with hash routing and leader-aware write forwarding. With the internal RPC addresses configured, `put/get/delete` can be sent to any node.
+This example demonstrates KnociDB's production Multi-Raft cluster (`IOnDiskStateMachine`, online streaming `KRS2` snapshots without closing DB, hash-routed fixed shards, leader-aware write forwarding, Raft-deterministic TTL, read consistency levels, and optional mTLS). With internal RPC addresses configured, `put/get/delete` can be sent to any node.
 
 ## Usage
 
@@ -48,13 +48,20 @@ On Windows, use `.\cluster-example` instead of `./cluster-example`.
 - `--shards`: Number of fixed Raft shards (default is 1; all nodes must match)
 - `--sync`: Whether to use synchronous mode (default is true)
 - `--interactive`: Whether to enable interactive mode (default is true)
+- `--mtls`: Enable mutual TLS (mTLS) for Dragonboat Raft transport and internal forwarding RPC
+- `--ca-file`: CA certificate file for mTLS peer verification
+- `--cert-file`: Node TLS certificate file for mTLS
+- `--key-file`: Node TLS private key file for mTLS
+- `--admin-addr`: Optional Admin HTTP address exposing `/healthz`, `/readyz`, `/metrics`, and `/debug/pprof/`
 
 ### Interactive Commands
 
 After starting a node, you can interact with the system using the following commands:
 
 - `put <key> <value>`: Write a key-value pair
-- `get <key>`: Read a key's value
+- `putttl <key> <value> <ttl_ms>`: Write a key-value pair with Raft-deterministic absolute TTL
+- `get <key>`: Linearizable read (forwards to shard leader if needed)
+- `get-stale <key>`: Fast local state machine read (`ReadStaleLocal`)
 - `delete <key>`: Delete a key-value pair
 - `leader`: Display current Leader information
 - `members`: Display cluster members
@@ -73,6 +80,6 @@ After starting a node, you can interact with the system using the following comm
 
 ## Notes
 
-- Ensure all nodes have synchronized clocks
+- Ensure all nodes have synchronized clocks (required for Raft-deterministic TTL expiration comparisons)
 - The cluster requires a majority of nodes to be online to function properly (e.g., a three-node cluster needs at least two nodes online)
 - In a production environment, different data directories should be configured for each node

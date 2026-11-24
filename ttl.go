@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	bolt "go.etcd.io/bbolt"
@@ -27,7 +28,7 @@ func openTTLStore(dir string) (*ttlStore, error) {
 	if err := os.MkdirAll(dir, os.ModePerm); err != nil {
 		return nil, err
 	}
-	db, err := bolt.Open(filepath.Join(dir, ttlDBFileName), 0o600, &bolt.Options{Timeout: time.Second})
+	db, err := bolt.Open(filepath.Join(dir, ttlDBFileName), 0o600, &bolt.Options{Timeout: time.Second, NoSync: true})
 	if err != nil {
 		return nil, fmt.Errorf("open ttl store: %w", err)
 	}
@@ -186,4 +187,60 @@ func (t *ttlStore) expired(now int64) ([][]byte, error) {
 		}
 	}
 	return keys, nil
+}
+
+// ttlTracker 是纯内存的轻量过期键跟踪器，仅记录带 ExpireAt > 0 的键，
+// 供后台 ttlSweeper 按需触发带锁复检删除；真正权威的过期时间已内嵌于 WAL/Memtable/BPTree 记录中。
+type ttlTracker struct {
+	mu      sync.RWMutex
+	entries map[string]int64
+	count   atomic.Int64 // 无锁快速路径：无任何 TTL 键时 Put/Batch/Get 零锁零 map 查找
+}
+
+func newTTLTracker() *ttlTracker {
+	return &ttlTracker{
+		entries: make(map[string]int64),
+	}
+}
+
+func (t *ttlTracker) set(key []byte, expireAt int64) {
+	if t == nil {
+		return
+	}
+	if expireAt <= 0 && t.count.Load() == 0 {
+		return
+	}
+	t.mu.Lock()
+	if expireAt <= 0 {
+		delete(t.entries, string(key))
+	} else {
+		t.entries[string(key)] = expireAt
+	}
+	t.count.Store(int64(len(t.entries)))
+	t.mu.Unlock()
+}
+
+func (t *ttlTracker) remove(key []byte) {
+	if t == nil || t.count.Load() == 0 {
+		return
+	}
+	t.mu.Lock()
+	delete(t.entries, string(key))
+	t.count.Store(int64(len(t.entries)))
+	t.mu.Unlock()
+}
+
+func (t *ttlTracker) expired(now int64) [][]byte {
+	if t == nil {
+		return nil
+	}
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	var keys [][]byte
+	for k, exp := range t.entries {
+		if exp > 0 && exp <= now {
+			keys = append(keys, []byte(k))
+		}
+	}
+	return keys
 }

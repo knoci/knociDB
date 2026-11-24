@@ -77,7 +77,11 @@ func (c *ClusterDB) MigrateShard(shardID uint32, fromNode, toNode uint64, toAddr
 				return fmt.Errorf("add learner: %w", err)
 			}
 		}
-		if err := c.waitForLearnerApplied(shardID, toNode, 10*time.Second); err != nil {
+		timeout := c.config.MigrationTimeout
+		if timeout <= 0 {
+			timeout = 60 * time.Second
+		}
+		if err := c.waitForLearnerApplied(shardID, toNode, timeout); err != nil {
 			return fmt.Errorf("wait learner applied: %w", err)
 		}
 		members, err = c.ShardMembership(shardID)
@@ -135,6 +139,37 @@ func (c *ClusterDB) transferMigrationLeadership(shardID uint32, target uint64) e
 	return nil
 }
 
+// AbortShardMigration 中止一条未完成的分片迁移并清理可能遗留的孤儿 Learner，
+// 防止目标节点故障导致分片永久卡死在 Pending 状态。
+func (c *ClusterDB) AbortShardMigration(shardID uint32, fromNode, toNode uint64, toAddress string) error {
+	if _, err := c.requireShardLeader(shardID); err != nil {
+		return err
+	}
+	move := ShardMove{ShardID: shardID, FromNode: fromNode, ToNode: toNode, ToAddress: toAddress}
+	change := migrationChange{Move: move, Abort: true}
+	if !change.valid(c.config.ShardCount) {
+		return ErrInvalidRaftCommand
+	}
+	members, err := c.ShardMembership(shardID)
+	if err != nil {
+		return err
+	}
+	// 如果目标节点已晋升为 Voter，说明已越过不可逆点，应继续重试 MigrateShard 而非回滚。
+	if containsID(members.Voters, toNode) {
+		return ErrShardMigrationConflict
+	}
+	if containsID(members.NonVoters, toNode) {
+		if err := c.changeShardMembershipAt(members, toNode, "", false, false); err != nil {
+			return fmt.Errorf("remove orphan learner %d: %w", toNode, err)
+		}
+	}
+	_, err = c.submitMigration(change)
+	if err != nil {
+		return fmt.Errorf("abort shard migration: %w", err)
+	}
+	return nil
+}
+
 func (c *ClusterDB) finishMigration(move ShardMove) error {
 	_, err := c.submitMigration(migrationChange{Move: move, Complete: true})
 	if err != nil {
@@ -146,7 +181,7 @@ func (c *ClusterDB) finishMigration(move ShardMove) error {
 func (c *ClusterDB) submitMigration(change migrationChange) (uint64, error) {
 	c.mu.RLock()
 	nodeHost := c.nodeHost
-	started := c.state && nodeHost != nil
+	started := c.state.Load() && nodeHost != nil
 	c.mu.RUnlock()
 	if !started {
 		return 0, ErrNodeNotStarted
@@ -224,7 +259,7 @@ func syncMigrationProposal(nodeHost *dragonboat.NodeHost, groupID uint64, data [
 }
 
 func migrationResult(value uint64) (uint64, error) {
-	if value != migrationPending && value != migrationDone {
+	if value != migrationPending && value != migrationDone && value != migrationAborted {
 		return 0, fmt.Errorf("invalid migration result")
 	}
 	return value, nil

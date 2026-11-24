@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/klauspost/compress/zstd"
+	"github.com/knoci/knocidb/util"
 )
 
 var (
@@ -77,7 +78,7 @@ func (t *SnapshotTask) Wait() error {
 func (db *DB) StartSnapshot() (*SnapshotTask, error) {
 	db.snapshotMu.Lock()
 	defer db.snapshotMu.Unlock()
-	if db.closed || db.snapshotsClosed {
+	if db.closed.Load() || db.snapshotsClosed {
 		return nil, ErrDBClosed
 	}
 	if db.snapshotRunning {
@@ -86,7 +87,7 @@ func (db *DB) StartSnapshot() (*SnapshotTask, error) {
 	if db.options.SnapshotPath == "" {
 		return nil, fmt.Errorf("SnapshotPath is empty")
 	}
-	timestamp := time.Now().Format(snapshotLayout)
+	timestamp := nextSnapshotStamp()
 	path := filepath.Join(db.options.SnapshotPath, timestamp+snapshotExt)
 	if _, err := os.Stat(path); err == nil {
 		return nil, ErrSnapshotExists
@@ -126,18 +127,12 @@ func (db *DB) snapshotTo(path string) error {
 	}
 	defer os.RemoveAll(tmpDir)
 
-	if err := db.Sync(); err != nil {
-		return fmt.Errorf("sync before snapshot: %w", err)
+	// 在 flushLock 下先捕获一致点文件尺寸、TTL 与索引/段拷贝，
+	// 拷贝完成后立刻释放 flushLock，压缩与云端上传全部在锁外异步执行，不阻塞写入与刷盘。
+	if err := db.captureSnapshotFiles(tmpDir); err != nil {
+		return err
 	}
-	db.flushLock.Lock()
-	defer db.flushLock.Unlock()
-	var sizes map[string]int64
-	shards := db.lockAllShards()
-	sizes, _ = db.snapshotFileSizes()
-	db.unlockAllShards(shards)
-	if copyErr := db.copySnapshotFiles(tmpDir, sizes); copyErr != nil {
-		return copyErr
-	}
+
 	if err := writeSnapshotArchive(tmpDir, path); err != nil {
 		return err
 	}
@@ -155,7 +150,70 @@ func (db *DB) snapshotTo(path string) error {
 	return nil
 }
 
-func (db *DB) copySnapshotFiles(dst string, sizes map[string]int64) error {
+func (db *DB) captureSnapshotFiles(tmpDir string) error {
+	db.compactMu.Lock()
+	defer db.compactMu.Unlock()
+	db.flushLock.Lock()
+	defer db.flushLock.Unlock()
+
+	if db.closed.Load() {
+		return ErrDBClosed
+	}
+
+	shards := db.lockAllShards()
+	// 在统一屏障内同步所有 WAL/COMMIT/索引/VLOG/TTL 并记录精确截断尺寸与 TTL 快照，消除时间点撕裂。
+	var barrierErr error
+	for _, s := range shards {
+		for _, table := range s.memTables() {
+			if err := table.sync(); err != nil {
+				barrierErr = fmt.Errorf("sync memtable wal: %w", err)
+				break
+			}
+		}
+		if barrierErr != nil {
+			break
+		}
+	}
+	if barrierErr == nil {
+		if err := db.index.Sync(); err != nil {
+			barrierErr = fmt.Errorf("sync index: %w", err)
+		}
+	}
+	if barrierErr == nil {
+		if err := db.vlog.sync(); err != nil {
+			barrierErr = fmt.Errorf("sync vlog: %w", err)
+		}
+	}
+	if barrierErr == nil && db.commitLog != nil {
+		if err := db.commitLog.Sync(); err != nil {
+			barrierErr = fmt.Errorf("sync commit log: %w", err)
+		}
+	}
+	if barrierErr == nil && db.ttl != nil {
+		if err := db.ttl.sync(); err != nil {
+			barrierErr = fmt.Errorf("sync ttl: %w", err)
+		} else if err := db.ttl.writeTo(filepath.Join(tmpDir, ttlDBFileName)); err != nil {
+			barrierErr = fmt.Errorf("snapshot ttl: %w", err)
+		}
+	}
+	var sizes map[string]int64
+	if barrierErr == nil {
+		var err error
+		sizes, err = db.snapshotFileSizes()
+		if err != nil {
+			barrierErr = fmt.Errorf("snapshot file sizes: %w", err)
+		}
+	}
+	totalNumber, discardNumber := db.vlog.stats()
+	db.unlockAllShards(shards)
+	if barrierErr != nil {
+		return barrierErr
+	}
+
+	return db.copySnapshotFiles(tmpDir, sizes, discardNumber, totalNumber)
+}
+
+func (db *DB) copySnapshotFiles(dst string, sizes map[string]int64, discardNumber, totalNumber uint64) error {
 	bt, ok := db.index.(*BPTree)
 	if !ok {
 		return ErrSnapshotUnsupportedIndex
@@ -187,42 +245,19 @@ func (db *DB) copySnapshotFiles(dst string, sizes map[string]int64) error {
 		}
 	}
 
-	entries, err := os.ReadDir(db.options.DirPath)
-	if err != nil {
-		return err
+	// 严格仅按屏障时刻记录的 sizes 集合拷贝 COMMIT / .SEG. / .VLOG.，
+	// 避免拷贝屏障之后新轮转出的文件，也避免 sizes 缺失时静默写出 0 字节文件。
+	names := make([]string, 0, len(sizes))
+	for name := range sizes {
+		names = append(names, name)
 	}
-	for _, entry := range entries {
-		if entry.IsDir() {
-			continue
-		}
-		name := entry.Name()
-		switch {
-		case name == fileLockName, name == ttlDBFileName, name == discardMetaName:
-			continue
-		case strings.Contains(name, ".BLOOM"):
-			// Bloom 可由 Open 重建，避免复制自动保存中的文件。
-			continue
-		case name == commitLogName:
-			if err := copyFileSize(filepath.Join(db.options.DirPath, name), filepath.Join(dst, name), sizes[name]); err != nil {
-				return err
-			}
-		case strings.Contains(name, ".SEG."):
-			if err := copyFileSize(filepath.Join(db.options.DirPath, name), filepath.Join(dst, name), sizes[name]); err != nil {
-				return err
-			}
-		case strings.Contains(name, ".VLOG."):
-			if strings.Contains(name, ".temp") {
-				continue
-			}
-			if err := copyFileSize(filepath.Join(db.options.DirPath, name), filepath.Join(dst, name), sizes[name]); err != nil {
-				return err
-			}
+	sort.Strings(names)
+	for _, name := range names {
+		if err := copyFileSize(filepath.Join(db.options.DirPath, name), filepath.Join(dst, name), sizes[name]); err != nil {
+			return err
 		}
 	}
-	if err := db.ttl.writeTo(filepath.Join(dst, ttlDBFileName)); err != nil {
-		return fmt.Errorf("snapshot ttl: %w", err)
-	}
-	if err := storeDiscardEntryMeta(filepath.Join(dst, discardMetaName), db.vlog.discardNumber, db.vlog.totalNumber); err != nil {
+	if err := storeDiscardEntryMeta(filepath.Join(dst, discardMetaName), discardNumber, totalNumber); err != nil {
 		return fmt.Errorf("snapshot discard metadata: %w", err)
 	}
 	return nil
@@ -357,19 +392,11 @@ func writeSnapshotManifest(path string, manifest *SnapshotManifest) error {
 		_ = os.Remove(tmp)
 		return err
 	}
-	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+	if err := util.RenameDurable(tmp, path); err != nil {
 		_ = os.Remove(tmp)
 		return err
 	}
-	if err := os.Rename(tmp, path); err != nil {
-		_ = os.Remove(tmp)
-		return err
-	}
-	if dir, err := os.Open(filepath.Dir(path)); err == nil {
-		_ = dir.Sync()
-		_ = dir.Close()
-	}
-	return nil
+	return util.SyncDir(filepath.Dir(path))
 }
 
 func writeSnapshotArchive(srcDir, snapFile string) error {
@@ -466,15 +493,11 @@ func writeSnapshotArchive(srcDir, snapFile string) error {
 	if err := f.Close(); err != nil {
 		return err
 	}
-	if err := os.Rename(tmpFile, snapFile); err != nil {
+	if err := util.RenameDurable(tmpFile, snapFile); err != nil {
 		return err
 	}
 	ok = true
-	if dir, err := os.Open(filepath.Dir(snapFile)); err == nil {
-		_ = dir.Sync()
-		_ = dir.Close()
-	}
-	return nil
+	return util.SyncDir(filepath.Dir(snapFile))
 }
 
 func binaryWriteUint32(w io.Writer, v uint32) error {

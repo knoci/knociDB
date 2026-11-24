@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bufio"
+	"context"
 	"flag"
 	"fmt"
 	"github.com/knoci/knocidb"
@@ -11,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 )
 
 const (
@@ -31,6 +34,11 @@ var (
 	shards         = flag.Int("shards", 1, "Number of fixed Raft shards")
 	sync           = flag.Bool("sync", true, "Use synchronous mode")
 	interactive    = flag.Bool("interactive", true, "Enable interactive mode")
+	mtls           = flag.Bool("mtls", false, "Enable mutual TLS for Raft and internal forwarding RPC")
+	caFile         = flag.String("ca-file", "", "CA certificate file for mTLS")
+	certFile       = flag.String("cert-file", "", "Node certificate file for mTLS")
+	keyFile        = flag.String("key-file", "", "Node private key file for mTLS")
+	adminAddr      = flag.String("admin-addr", "", "Optional admin HTTP listen address (/healthz, /readyz, /metrics, /debug/pprof/)")
 )
 
 // 解析peers字符串为map
@@ -60,10 +68,24 @@ func parsePeers(peersStr string) (map[uint64]string, error) {
 
 // 处理用户输入命令
 func handleCommand(clusterDB *knocidb.ClusterDB) {
+	scanner := bufio.NewScanner(os.Stdin)
 	for {
 		fmt.Print("KnociDB> ")
+		if !scanner.Scan() {
+			return
+		}
+		fields := strings.Fields(scanner.Text())
+		if len(fields) == 0 {
+			continue
+		}
 		var cmd, key, value string
-		fmt.Scanf("%s %s %s", &cmd, &key, &value)
+		cmd = fields[0]
+		if len(fields) > 1 {
+			key = fields[1]
+		}
+		if len(fields) > 2 {
+			value = strings.Join(fields[2:], " ")
+		}
 
 		switch strings.ToLower(cmd) {
 		case "put":
@@ -88,6 +110,35 @@ func handleCommand(clusterDB *knocidb.ClusterDB) {
 				fmt.Printf("Error: %v\n", err)
 			} else {
 				fmt.Printf("%s\n", string(val))
+			}
+
+		case "get-stale":
+			if key == "" {
+				fmt.Println("Usage: get-stale <key>")
+				continue
+			}
+			val, err := clusterDB.GetContext(context.Background(), []byte(key), knocidb.ReadStaleLocal)
+			if err != nil {
+				fmt.Printf("Error: %v\n", err)
+			} else {
+				fmt.Printf("%s\n", string(val))
+			}
+
+		case "putttl":
+			if len(fields) < 4 {
+				fmt.Println("Usage: putttl <key> <value> <ttl_ms>")
+				continue
+			}
+			ms, err := strconv.ParseInt(fields[len(fields)-1], 10, 64)
+			if err != nil || ms <= 0 {
+				fmt.Println("Error: ttl_ms must be a positive integer")
+				continue
+			}
+			val := strings.Join(fields[2:len(fields)-1], " ")
+			if err := clusterDB.PutWithTTL([]byte(key), []byte(val), time.Duration(ms)*time.Millisecond); err != nil {
+				fmt.Printf("Error: %v\n", err)
+			} else {
+				fmt.Println("Success")
 			}
 
 		case "delete":
@@ -161,14 +212,16 @@ func handleCommand(clusterDB *knocidb.ClusterDB) {
 
 		case "help":
 			fmt.Println("Available commands:")
-			fmt.Println("  put <key> <value>  - Write key-value pair")
-			fmt.Println("  get <key>         - Read key value")
-			fmt.Println("  delete <key>      - Delete key-value pair")
-			fmt.Println("  leader            - Show current Leader info")
-			fmt.Println("  members           - Show cluster members")
-			fmt.Println("  add <id> <addr>   - Add new node")
-			fmt.Println("  remove <id>       - Remove node")
-			fmt.Println("  exit              - Exit program")
+			fmt.Println("  put <key> <value>            - Write key-value pair")
+			fmt.Println("  putttl <key> <val> <ttl_ms>  - Write key-value pair with Raft-deterministic TTL")
+			fmt.Println("  get <key>                    - Linearizable read key value")
+			fmt.Println("  get-stale <key>              - Fast local stale read")
+			fmt.Println("  delete <key>                 - Delete key-value pair")
+			fmt.Println("  leader                       - Show current Leader info")
+			fmt.Println("  members                      - Show cluster members")
+			fmt.Println("  add <id> <addr>              - Add new node")
+			fmt.Println("  remove <id>                  - Remove node")
+			fmt.Println("  exit                         - Exit program")
 
 		case "exit":
 			return
@@ -205,8 +258,7 @@ func main() {
 	}
 
 	// 创建DB配置
-	options := knocidb.DefaultOptions
-	options.DirPath = nodeDir
+	options := knocidb.NewDefaultOptions(nodeDir)
 	options.ClusterPath = filepath.Join(nodeDir, "cluster")
 	options.SnapshotPath = filepath.Join(nodeDir, "snapshot")
 
@@ -219,6 +271,10 @@ func main() {
 	config.PeerRPC = rpcPeers
 	config.RPCSecret = *rpcSecret
 	config.Sync = *sync
+	config.MutualTLS = *mtls
+	config.CAFile = *caFile
+	config.CertFile = *certFile
+	config.KeyFile = *keyFile
 
 	// 打开ClusterDB
 	clusterDB, err := knocidb.OpenCluster(config, options)
@@ -226,6 +282,19 @@ func main() {
 		log.Fatalf("Failed to start Cluster node: %v", err)
 	}
 	defer clusterDB.Close()
+
+	if *adminAddr != "" {
+		adminSrv, adminLis, err := knocidb.StartAdminServer(*adminAddr, nil, clusterDB)
+		if err != nil {
+			log.Fatalf("Failed to start admin HTTP server: %v", err)
+		}
+		defer func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_ = adminSrv.Shutdown(ctx)
+		}()
+		fmt.Printf("  Admin HTTP: http://%s (/healthz, /readyz, /metrics, /debug/pprof/)\n", adminLis.Addr().String())
+	}
 
 	// 打印节点信息
 	fmt.Printf("KnociDB Cluster node started:\n")

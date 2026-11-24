@@ -3,13 +3,12 @@ package main
 import (
 	"bytes"
 	"fmt"
+
 	"github.com/knoci/knocidb"
 )
 
 func main() {
-
-	options := knocidb.DefaultOptions
-	options.DirPath = "/tmp/knocidb_iter"
+	options := knocidb.NewDefaultOptions("/tmp/knocidb_iter")
 
 	// 打开数据库
 	db, err := knocidb.Open(options)
@@ -20,66 +19,71 @@ func main() {
 		_ = db.Close()
 	}()
 
-	// 放入数据
+	// 写入示例数据
 	for i := 0; i < 100; i++ {
-		err = db.Put([]byte(fmt.Sprintf("key %d", i)), []byte(fmt.Sprintf("key %d", i)))
-		if err != nil {
+		if err := db.Put([]byte(fmt.Sprintf("key %02d", i)), []byte(fmt.Sprintf("key %02d", i))); err != nil {
 			panic(err)
 		}
-		err = db.Put([]byte(fmt.Sprintf("abc %d", i)), []byte(fmt.Sprintf("abc %d", i)))
-		if err != nil {
+		if err := db.Put([]byte(fmt.Sprintf("abc %02d", i)), []byte(fmt.Sprintf("abc %02d", i))); err != nil {
 			panic(err)
 		}
 	}
+
+	// 1. 正向全量迭代
 	iter, err := db.NewIterator(knocidb.IteratorOptions{Reverse: false})
 	if err != nil {
 		panic(err)
 	}
-	for iter.Valid() {
-		fmt.Println(string(iter.Key()), string(iter.Value()))
-		iter.Next()
+	// 创建迭代器后并发写入的新键值不会污染当前 MVCC 快照视图，也不会触发 memtable 冻结轮转
+	if err := db.Put([]byte("key 999-after-snap"), []byte("invisible-in-open-iter")); err != nil {
+		panic(err)
 	}
-	err = iter.Close()
-	if err != nil {
+	for iter.Rewind(); iter.Valid(); iter.Next() {
+		if string(iter.Key()) == "key 999-after-snap" {
+			panic("mvcc snapshot isolation violated")
+		}
+	}
+	if err := iter.Err(); err != nil {
+		panic(err)
+	}
+	if err := iter.Close(); err != nil {
 		panic(err)
 	}
 
+	// 2. 反向全量迭代
 	iter, err = db.NewIterator(knocidb.IteratorOptions{Reverse: true})
 	if err != nil {
 		panic(err)
 	}
-	for iter.Valid() {
-		fmt.Println(string(iter.Key()), string(iter.Value()))
-		iter.Next()
+	count := 0
+	for iter.Rewind(); iter.Valid(); iter.Next() {
+		count++
 	}
-	err = iter.Close()
-	if err != nil {
+	if err := iter.Err(); err != nil {
 		panic(err)
 	}
-	iter, err = db.NewIterator(knocidb.IteratorOptions{Reverse: false, Prefix: []byte("abc")})
+	if err := iter.Close(); err != nil {
+		panic(err)
+	}
+	fmt.Println("reverse scan count:", count)
+
+	// 3. O(log N) 前缀 Seek 扫描
+	iter, err = db.NewIterator(knocidb.IteratorOptions{Reverse: false, Prefix: []byte("abc ")})
 	if err != nil {
 		panic(err)
 	}
 	iter.Seek([]byte("abc 91"))
-	i := 0
 	for iter.Valid() {
-		if bytes.Compare(iter.Key(), []byte("abc 30")) == -1 {
-			panic("seek wrong")
+		if !bytes.HasPrefix(iter.Key(), []byte("abc ")) {
+			panic("prefix wrong")
 		}
 		fmt.Println(string(iter.Key()), string(iter.Value()))
-		if !bytes.HasPrefix(iter.Key(), []byte("abc")) {
-			panic("prefix wrong.")
-		}
-		i++
-		if i > 100 {
-			break
-		}
 		iter.Next()
 	}
-
-	err = iter.Close()
-	if err != nil {
+	if err := iter.Err(); err != nil {
 		panic(err)
 	}
-
+	if err := iter.Close(); err != nil {
+		panic(err)
+	}
 }

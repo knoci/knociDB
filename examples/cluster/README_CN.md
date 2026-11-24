@@ -1,6 +1,6 @@
 # KnociDB Cluster 示例
 
-这个示例展示 knociDB 的分片透明集群：每个固定 shard 一个 Raft Group，按 key 哈希路由，并支持 Leader-aware 写转发。配置内部 RPC 地址后，`put/get/delete` 可以发给任意节点。
+这个示例展示 knociDB 的生产级分片 Multi-Raft 集群（`IOnDiskStateMachine`、零停服 `KRS2` 在线流式快照、按 key 哈希路由的固定分片、Leader-aware 写转发、Raft 确定性 TTL、一致读分级与可选双向 TLS）。配置内部 RPC 地址后，`put/get/delete` 可以发给任意节点。
 
 ## 使用方法
 
@@ -48,13 +48,20 @@ Windows 下把 `./cluster-example` 换成 `.\cluster-example`。
 - `--shards`: 固定 Raft 分片数（默认 1；所有节点必须一致）
 - `--sync`: 是否使用同步模式（默认为true）
 - `--interactive`: 是否启用交互模式（默认为true）
+- `--mtls`: 为 Dragonboat Raft 传输与内部转发 RPC 同时启用双向 TLS (mTLS)
+- `--ca-file`: mTLS 对端校验证书的 CA 文件路径
+- `--cert-file`: 本节点 mTLS 证书文件路径
+- `--key-file`: 本节点 mTLS 私钥文件路径
+- `--admin-addr`: 可选运维 HTTP 监听地址（提供 `/healthz`、`/readyz`、Prometheus `/metrics` 与 `/debug/pprof/`）
 
 ### 交互命令
 
 启动节点后，可以使用以下命令与系统交互：
 
 - `put <key> <value>`: 写入键值对
-- `get <key>`: 读取键值
+- `putttl <key> <value> <ttl_ms>`: 写入带 Raft 确定性绝对 TTL 的键值对
+- `get <key>`: 线性一致读取键值（必要时转发至分片 Leader）
+- `get-stale <key>`: 本地状态机极速只读（`ReadStaleLocal`）
 - `delete <key>`: 删除键值对
 - `leader`: 显示当前Leader信息
 - `members`: 显示集群成员
@@ -73,6 +80,6 @@ Windows 下把 `./cluster-example` 换成 `.\cluster-example`。
 
 ## 注意事项
 
-- 确保所有节点的时钟同步
+- 确保所有节点的时钟同步（用于 Raft 确定性 TTL 过期判定）
 - 集群需要多数节点在线才能正常工作（如三节点集群至少需要两个节点在线）
 - 在生产环境中，应该为每个节点配置不同的数据目录

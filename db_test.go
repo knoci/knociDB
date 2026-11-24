@@ -38,7 +38,7 @@ func valueLogSize(t *testing.T, dir string) int64 {
 }
 
 func destroyDB(db *DB) {
-	if !db.closed {
+	if !db.closed.Load() {
 		err := db.Close()
 		if err != nil {
 			panic(err)

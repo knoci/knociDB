@@ -10,28 +10,27 @@
 ### [English](README.md) | 中文 | [日本語](README_JP.md)
 
 ## 特性
-- ⚡ **高性能**键值存储
-- 🔄 **批量操作**具有ACD保证
-- 🌲 **B+树索引**支持
-- 🌐 **分片 ClusterDB** 多 Raft Group、key 哈希路由、Leader-aware 转发
-- 💾 **对象冷层** 快照 + VLOG 冷段（S3/R2/COS/OSS）
-- 📋 **原子 DB manifest** 文件清单与 generation 跟踪
-- 🔌 **gRPC 支持** 客户端流式批量、服务端流式扫描、可选鉴权与 TLS
-- 🧩 **Redis 兼容子集** string/hash/list/set/zset、TTL、SCAN、Pub/Sub、集群协议
+- ⚡ **极致单机引擎**：自研 MVCC Arena 跳表（`arenaskl`）、WAL Group Commit 与 32 KB 块缓存、零冻结快照迭代器与 O(log N) 前缀寻址
+- 🔄 **原子批量与内嵌 TTL**：跨分片 ACD 原子提交，内嵌 `ExpireAt` 元数据彻底消除独立 `TTL.DB` 双写放大
+- 🌲 **B+Tree 索引与在线 CAS 压缩**：单事务升序刷盘（`ApplyBatch`）与无锁并发 `CompareAndSwapBatch` 增量压缩
+- 🌐 **生产级分片 Multi-Raft（`ClusterDB`）**：Dragonboat `IOnDiskStateMachine`、零停服 `KRS2` 流式快照、紧凑二进制编码、双向 mTLS、一致读分级（`ReadConsistency`）、`BatchID` 幂等与 Raft 确定性 TTL
+- 💾 **对象冷层与原子清单**：支持 S3/R2/COS/OSS 快照及 VLOG 冷段下沉与原子 MANIFEST 版本追踪
+- 🔌 **gRPC v2 与可观测性**：`PutWithTTL`/`GetTTL`/`Persist`、分页 `ScanLimit`、`grpc.health.v1`、Server Reflection、`DB.Stats()`、`/metrics`（Prometheus）、`/healthz`、`/readyz`、`/debug/pprof/`、统一入口 `cmd/knocidb` 与 `Dockerfile`
 
 ## 快速开始
 ```go
 package main
 
 import (
+	"fmt"
 	"time"
+
 	"github.com/knoci/knocidb"
 )
 
 // 此文件展示了如何使用knociDB的基本操作
 func main() {
-	options := knocidb.DefaultOptions
-	options.DirPath = "/tmp/knocidb_basic"
+	options := knocidb.NewDefaultOptions("/tmp/knocidb_basic")
 
 	// 打开数据库
 	db, err := knocidb.Open(options)
@@ -43,8 +42,7 @@ func main() {
 	}()
 
 	// 存入一个键
-	err = db.Put([]byte("name"), []byte("knocidb"))
-	if err != nil {
+	if err := db.Put([]byte("name"), []byte("knocidb")); err != nil {
 		panic(err)
 	}
 
@@ -53,32 +51,37 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
-	println(string(val))
+	fmt.Println(string(val))
 
-	// 存入一个带 TTL 的键
-	err = db.PutWithTTL([]byte("session"), []byte("alive"), 30*time.Second)
-	if err != nil {
+	// 存入一个带内嵌元数据 TTL 的键
+	if err := db.PutWithTTL([]byte("session"), []byte("alive"), 30*time.Second); err != nil {
 		panic(err)
 	}
 
 	// 读取剩余 TTL
-	ttl, ok, err := db.GetTTL([]byte("session"))
-	if err != nil {
+	if ttl, ok, err := db.GetTTL([]byte("session")); err != nil {
 		panic(err)
-	}
-	if ok {
-		println(ttl.String())
+	} else if ok {
+		fmt.Println(ttl.String())
 	}
 
+	// 读取引擎实时指标
+	stats := db.Stats()
+	fmt.Printf("shards=%d seq=%d\n", stats.Shards, stats.Sequence)
+
 	// 删除一个键
-	err = db.Delete([]byte("name"))
-	if err != nil {
+	if err := db.Delete([]byte("name")); err != nil {
 		panic(err)
 	}
 }
 ```
 
 ## 示例
+🚀 生产环境部署单机 gRPC 服务或 Multi-Raft 集群守护进程（带 `/metrics`、`/healthz`、`/readyz`、`/debug/pprof/`），请使用统一入口 `cmd/knocidb` 或根目录 `Dockerfile`：
+```bash
+$ go run ./cmd/knocidb --mode=standalone --data-dir=./data --grpc-addr=:9090 --admin-addr=:9091
+```
+
 💡 关于 Cluster 的使用，请查看 `examples/cluster` 目录中的使用示例，您可以通过该文件中的 README 文档获取使用 Cluster 的具体方法。
 ```bash
 $ cd examples/cluster
@@ -87,7 +90,7 @@ $ go build -o cluster-example main.go
 
 在 `OpenCluster` 前设置 `config.ShardCount` 即可创建多个固定 Raft Group。
 
-🔆 如果您想体验knociDB的更多功能，在`examples/cmd_client`中有一个命令行实现客户端，您可以通过该文件中的README文档获取使用cmd_client的具体方法。
+🔆 如果您想体验 knociDB 的更多功能，在 `examples/cmd_client` 中有一个命令行实现客户端，您可以通过该文件中的 README 文档获取使用 cmd_client 的具体方法。
 
 ```bash
 $ cd examples/cmd_client
@@ -103,57 +106,49 @@ $ cd ../client
 $ go run main.go --addr 127.0.0.1:50051
 ```
 
-🧩 关于 Redis 兼容子集，请查看 `examples/redis`。支持 string/hash/list/set/zset、TTL、SCAN 和 Pub/Sub。
-```bash
-$ cd examples/redis
-$ go run main.go --dir ./redis_data --addr 127.0.0.1:6379
-
-$ redis-cli -p 6379
-```
-
 ## 性能表现
 
-knociDB 读性能突出，大 value 批量导入效率高：测试中随机读约为 LevelDB 的 **2.1 倍**，顺序读约为 **9.8 倍**。单条写不是最快，但批量写很快，并且支持 WAL 崩溃恢复、原子 Batch、B+Tree 索引、对象冷层和分片多 Raft。
+升级后的 knociDB v2 存储引擎（零 GC 指针扁平偏移 MVCC Arena 跳表、WAL 零分配编码、32 KB 块缓存、内嵌元数据 TTL 与零冻结迭代器）在读吞吐与综合读写性能上均实现突破：实测随机读约为 LevelDB 的 **2.32 倍**，顺序读约为 **9.78 倍**（两项读指标均居所测 Go 引擎第一），同时完整具备 WAL 崩溃恢复、原子 Batch、在线 CAS 压缩、对象冷层与生产级分片 Multi-Raft 能力。
 
 **📖 吞吐**
 
-| 引擎          | 顺序写 | 随机写 |      随机读 |      顺序读 |
-| ------------- | -----: | -----: | ----------: | ----------: |
-| 🟢 **knociDB** | 228.6k | 172.2k | 🥇 **1.27M** | 🥇 **3.07M** |
-| LevelDB       | 294.0k | 205.4k |        610k |        313k |
-| LotusDB       | 289.8k | 213.3k |        543k |        145k |
-| BadgerDB      | 141.5k | 116.8k |        205k |        304k |
-| BoltDB        |  35.6k |  35.9k |        763k |       1.51M |
+| 引擎          | 顺序写 | 随机写 |        随机读 |        顺序读 |
+| ------------- | -----: | -----: | ------------: | ------------: |
+| 🟢 **knociDB** | 240.9k | 198.2k | 🥇 **1.42M** | 🥇 **3.06M** |
+| LevelDB       | 294.0k | 205.4k |          610k |          313k |
+| LotusDB       | 289.8k | 213.3k |          543k |          145k |
+| BadgerDB      | 141.5k | 116.8k |          205k |          304k |
+| BoltDB        |  35.6k |  35.9k |          763k |         1.51M |
 
 **📦 大 value 批量导入**
 
 | 引擎          |    批量写 |
 | ------------- | --------: |
-| 🟢 **knociDB** | **96.2k** |
+| 🟢 **knociDB** | **89.7k** |
 | BadgerDB      |     89.1k |
 | BoltDB        |    103.7k |
 | LevelDB       |     62.7k |
 
-<sub><i><span style="color:#777">Windows、Go 1.24.4、单线程、不 fsync。吞吐：10 万 key × 1 KB，5 万随机读/写（三次中位数）。批量导入：2 万 key × 16 KB，每批 100 条（三次最优）。结果与具体负载相关；BoltDB 吞吐使用单条 Update，批量导入使用事务批量提交。</span></i></sub>
+<sub><i><span style="color:#777">Windows、Go 1.24.4、单线程、不 fsync。吞吐：10 万 key × 1 KB，5 万随机读/写（新版 knociDB 为预热后三次中位数）。批量导入：2 万 key × 16 KB，每批 100 条（三次最优）。结果与具体负载相关；BoltDB 吞吐使用单条 Update，批量导入使用事务批量提交。另可运行 `go test -bench . -benchmem ./benchmark` 查看 Go 微基准（i9-13980HX 上 `BenchmarkPut`: 2,900 ns/op、0 allocs/op，`BenchmarkGet`: 202.9 ns/op、0 allocs/op，`BenchmarkParallelPutGet`: 612.3 ns/op、0 allocs/op，`BenchmarkBatch` 100 条: 116.7 µs/op）。</span></i></sub>
 
 **💡 功能对比**
 
-| 功能         | knociDB           | BadgerDB       | RocksDB | BoltDB | LevelDB | LotusDB        |
-| ------------ | ----------------- | -------------- | ------- | ------ | ------- | -------------- |
-| 存储设计     | B+Tree + ValueLog | LSM + ValueLog | LSM     | B+Tree | LSM     | LSM + ValueLog |
-| 纯 Go        | ✅                 | ✅              | ❌       | ✅      | ✅       | ✅              |
-| 可嵌入       | ✅                 | ✅              | ✅       | ✅      | ✅       | ✅              |
-| 有序遍历     | ✅                 | ✅              | ✅       | ✅      | ✅       | ✅              |
-| 原子批量     | ✅                 | ✅              | ✅       | ✅      | ✅       | ➖              |
-| ACID 事务    | ❌                 | ✅              | ✅       | ✅      | ❌       | ❌              |
-| TTL          | ✅                 | ✅              | ➖       | ❌      | ❌       | ➖              |
-| 快照         | ✅                 | ✅              | ✅       | ✅      | ✅       | ➖              |
-| 键值版本     | ❌                 | ✅              | ❌       | ❌      | ❌       | ❌              |
-| 分片多 Raft  | ✅                 | ❌              | ❌       | ❌      | ❌       | ❌              |
-| 对象冷层     | ✅                 | ❌              | ❌       | ❌      | ❌       | ❌              |
-| Redis + gRPC | ✅                 | ❌              | ❌       | ❌      | ❌       | ❌              |
+| 功能         | knociDB                  | BadgerDB       | RocksDB | BoltDB | LevelDB | LotusDB        |
+| ------------ | ------------------------ | -------------- | ------- | ------ | ------- | -------------- |
+| 存储设计     | B+Tree + ValueLog (MVCC) | LSM + ValueLog | LSM     | B+Tree | LSM     | LSM + ValueLog |
+| 纯 Go        | ✅                        | ✅              | ❌       | ✅      | ✅       | ✅              |
+| 可嵌入       | ✅                        | ✅              | ✅       | ✅      | ✅       | ✅              |
+| 有序遍历     | ✅（零冻结 MVCC）        | ✅              | ✅       | ✅      | ✅       | ✅              |
+| 原子批量     | ✅                        | ✅              | ✅       | ✅      | ✅       | ➖              |
+| ACID 事务    | ❌                        | ✅              | ✅       | ✅      | ❌       | ❌              |
+| TTL          | ✅（内嵌元数据）         | ✅              | ➖       | ❌      | ❌       | ➖              |
+| 快照         | ✅（在线流式快照）       | ✅              | ✅       | ✅      | ✅       | ➖              |
+| 键值版本     | ➖（内部 MVCC 快照）     | ✅              | ❌       | ❌      | ❌       | ❌              |
+| 分片多 Raft  | ✅（`IOnDiskStateMachine`）| ❌             | ❌       | ❌      | ❌       | ❌              |
+| 对象冷层     | ✅                        | ❌              | ❌       | ❌      | ❌       | ❌              |
+| gRPC         | ✅（v2 + 健康检查/反射） | ❌              | ❌       | ❌      | ❌       | ❌              |
 
-<sub><i><span style="color:#777">✅ 支持 · ❌ 不支持 · ➖ 有限支持或非原生能力</span></i></sub>
+<sub><i><span style="color:#777">✅ 支持 · ❌ 不支持 · ➖ 有限支持、内部能力或非原生能力</span></i></sub>
 
 ## 信息
 

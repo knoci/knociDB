@@ -9,19 +9,37 @@ const (
 	opShardMigration uint32 = 10
 	migrationPending uint64 = 1
 	migrationDone    uint64 = 2
+	migrationAborted uint64 = 3
 )
 
 type migrationChange struct {
 	Move     ShardMove `json:"move"`
 	CanStart bool      `json:"can_start,omitempty"`
 	Complete bool      `json:"complete,omitempty"`
+	Abort    bool      `json:"abort,omitempty"`
 }
 
 func (c migrationChange) valid(shardCount int) bool {
 	move := c.Move
+	flags := 0
+	if c.CanStart {
+		flags++
+	}
+	if c.Complete {
+		flags++
+	}
+	if c.Abort {
+		flags++
+	}
+	if flags > 1 {
+		return false
+	}
+	if c.Abort {
+		return shardCount > 0 && uint64(move.ShardID) < uint64(shardCount) && move.FromNode != 0 &&
+			move.ToNode != 0 && move.FromNode != move.ToNode
+	}
 	return shardCount > 0 && uint64(move.ShardID) < uint64(shardCount) && move.FromNode != 0 &&
-		move.ToNode != 0 && move.FromNode != move.ToNode && config.IsValidAddress(move.ToAddress) &&
-		!(c.CanStart && c.Complete)
+		move.ToNode != 0 && move.FromNode != move.ToNode && config.IsValidAddress(move.ToAddress)
 }
 
 // A removed Raft replica ID cannot be reused within the same shard.
@@ -37,6 +55,17 @@ func (s *shardMigrations) empty() bool {
 
 func (s *shardMigrations) apply(change migrationChange) (statemachine.Result, bool) {
 	move := change.Move
+	if change.Abort {
+		pending, ok := s.Pending[move.ShardID]
+		if !ok {
+			return statemachine.Result{Value: migrationAborted}, false
+		}
+		if pending.FromNode != move.FromNode || pending.ToNode != move.ToNode {
+			return rejectedRaftResult(ErrShardMigrationConflict), false
+		}
+		delete(s.Pending, move.ShardID)
+		return statemachine.Result{Value: migrationAborted}, false
+	}
 	if done, ok := s.Completed[move.ShardID][move.FromNode]; ok {
 		if done != move {
 			return rejectedRaftResult(ErrShardMigrationConflict), false

@@ -9,6 +9,8 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+
+	"github.com/knoci/knocidb/util"
 )
 
 // COMMIT 记录跨 shard 批次的提交点；恢复时只回放已提交批次的 WAL。
@@ -84,10 +86,18 @@ func openCommitLog(dir string, syncWrites bool) (*commitLog, map[uint64]struct{}
 			_ = f.Close()
 			return nil, nil, false, fmt.Errorf("truncate commit log: %w", err)
 		}
+		if err := f.Sync(); err != nil {
+			_ = f.Close()
+			return nil, nil, false, fmt.Errorf("sync truncated commit log: %w", err)
+		}
 	}
 	if _, err := f.Seek(0, io.SeekEnd); err != nil {
 		_ = f.Close()
 		return nil, nil, false, err
+	}
+	if legacy {
+		_ = f.Sync()
+		_ = util.SyncDir(dir)
 	}
 	cl := &commitLog{path: path, file: f, sync: syncWrites, records: len(committed)}
 	return cl, committed, legacy, nil
@@ -195,13 +205,16 @@ func (c *commitLog) rewrite(refs map[uint64]int) error {
 		_ = c.file.Close()
 		c.file = nil
 	}
-	if err := os.Rename(tmpPath, c.path); err != nil {
+	if err := util.RenameDurable(tmpPath, c.path); err != nil {
 		// Keep the old path usable for the next append attempt.
 		if reopened, openErr := os.OpenFile(c.path, os.O_RDWR, 0o600); openErr == nil {
 			_, _ = reopened.Seek(0, io.SeekEnd)
 			c.file = reopened
 		}
 		_ = os.Remove(tmpPath)
+		return err
+	}
+	if err := util.SyncDir(filepath.Dir(c.path)); err != nil {
 		return err
 	}
 	reopened, err := os.OpenFile(c.path, os.O_RDWR, 0o600)

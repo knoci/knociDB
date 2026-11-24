@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/knoci/knocidb/util"
@@ -41,11 +42,14 @@ type WAL struct {
 	pendingSize       int64
 	pendingWritesLock sync.Mutex
 	syncMu            sync.Mutex
-	writeSeq          uint64
-	durableSeq        uint64
+	writeSeq          atomic.Uint64
+	durableSeq        atomic.Uint64
 	closeC            chan struct{}
+	closeOnce         sync.Once
+	tickerWG          sync.WaitGroup
 	syncTicker        *time.Ticker
 	objectStorage     ObjectStorage // 对象存储接口
+	blockCache        *blockCache   // 不可变 32KB 满块分片缓存
 }
 
 // Reader 表示 WAL 的读取器。
@@ -72,6 +76,7 @@ func Open(options Options) (*WAL, error) {
 		olderSegments: make(map[SegmentID]*segment),
 		pendingWrites: make([][]byte, 0),
 		closeC:        make(chan struct{}),
+		blockCache:    newBlockCache(options.BlockCacheSize),
 	}
 
 	// 初始化对象存储
@@ -136,6 +141,13 @@ func Open(options Options) (*WAL, error) {
 		segmentIDs = append(segmentIDs, id)
 	}
 
+	var openedSegments []*segment
+	closeOpened := func() {
+		for _, s := range openedSegments {
+			_ = s.Close()
+		}
+	}
+
 	// 空目录，仅初始化一个新的段文件
 	if len(segmentIDs) == 0 {
 		initialID := options.InitialSegmentID
@@ -146,7 +158,12 @@ func Open(options Options) (*WAL, error) {
 		if err != nil {
 			return nil, err
 		}
+		openedSegments = append(openedSegments, segment)
 		wal.activeSegment = segment
+		if err := util.SyncDir(options.DirPath); err != nil {
+			closeOpened()
+			return nil, err
+		}
 	} else {
 		// 按顺序打开段文件，将最大的一个作为活动段文件
 		sort.Ints(segmentIDs)
@@ -155,8 +172,10 @@ func Open(options Options) (*WAL, error) {
 			segment, err := openSegmentFile(options.DirPath, options.SegmentFileExt,
 				uint32(segId))
 			if err != nil {
+				closeOpened()
 				return nil, err
 			}
+			openedSegments = append(openedSegments, segment)
 			if i == len(segmentIDs)-1 {
 				wal.activeSegment = segment
 			} else {
@@ -168,13 +187,16 @@ func Open(options Options) (*WAL, error) {
 	// 修复崩溃时写到一半的尾部记录：只需要扫描最后一个（active）段。
 	// 旧段在轮转前已经 Sync，正常情况下尾部是完整的；全量扫描会让 1GB vlog 启动变慢。
 	if err := wal.activeSegment.recoverTail(); err != nil {
+		closeOpened()
 		return nil, err
 	}
 
 	// 仅当 SyncInterval 大于 0 时启动同步操作
 	if wal.options.SyncInterval > 0 {
 		wal.syncTicker = time.NewTicker(wal.options.SyncInterval)
+		wal.tickerWG.Add(1)
 		go func() {
+			defer wal.tickerWG.Done()
 			for {
 				select {
 				case <-wal.syncTicker.C:
@@ -210,9 +232,13 @@ func (wal *WAL) OpenNewActiveSegment() error {
 	if err != nil {
 		return err
 	}
+	if err := util.SyncDir(wal.options.DirPath); err != nil {
+		_ = segment.Close()
+		return err
+	}
 	wal.olderSegments[wal.activeSegment.id] = wal.activeSegment
 	wal.activeSegment = segment
-	wal.durableSeq = wal.writeSeq
+	wal.advanceDurableSeq(wal.writeSeq.Load())
 	return nil
 }
 
@@ -233,30 +259,26 @@ func (wal *WAL) IsEmpty() bool {
 	return len(wal.olderSegments) == 0 && wal.activeSegment.Size() == 0
 }
 
-// SetIsStartupTraversal 仅在 WAL 启动遍历期间使用。
-// 注意，如果将其设置为 true，则只有一个读取器可以从 WAL 读取数据
-// （单线程）。
-func (wal *WAL) SetIsStartupTraversal(v bool) {
-	for _, seg := range wal.olderSegments {
-		seg.isStartupTraversal = v
-	}
-	wal.activeSegment.isStartupTraversal = v
-}
+// SetIsStartupTraversal 保留兼容接口；当前所有 segmentIter 均默认自带无竞态 32KB 流式块缓冲。
+func (wal *WAL) SetIsStartupTraversal(v bool) {}
 
 // NewReaderWithMax 返回一个新的 WAL 读取器
 func (wal *WAL) NewReaderWithMax(segId SegmentID) *Reader {
 	wal.mu.RLock()
 	defer wal.mu.RUnlock()
+	return wal.newReaderWithMaxLocked(segId)
+}
 
+func (wal *WAL) newReaderWithMaxLocked(segId SegmentID) *Reader {
 	// 获取所有段文件读取器。
 	var segmentIters []*segmentIter
 	for _, segment := range wal.olderSegments {
-		if !segment.closed && (segId == 0 || segment.id <= segId) {
+		if !segment.closed.Load() && (segId == 0 || segment.id <= segId) {
 			reader := segment.NewIter()
 			segmentIters = append(segmentIters, reader)
 		}
 	}
-	if segId == 0 || wal.activeSegment.id <= segId {
+	if wal.activeSegment != nil && !wal.activeSegment.closed.Load() && (segId == 0 || wal.activeSegment.id <= segId) {
 		reader := wal.activeSegment.NewIter()
 		segmentIters = append(segmentIters, reader)
 	}
@@ -282,16 +304,24 @@ func (wal *WAL) NewReaderWithStart(startPos *ChunkPosition) (*Reader, error) {
 	wal.mu.RLock()
 	defer wal.mu.RUnlock()
 
-	reader := wal.NewReader()
+	reader := wal.newReaderWithMaxLocked(0)
 	for {
+		if reader.currentIter >= len(reader.segmentIters) {
+			break
+		}
 		// 跳过段 ID 小于给定位置段 ID 的读取器。
 		if reader.CurrentSegmentId() < startPos.SegmentId {
 			reader.SkipCurrentSegment()
 			continue
 		}
-		// 跳过位置小于给定位置的数据块。
+		// 若当前段 ID 已经大于 startPos.SegmentId，直接停在段首。
+		if reader.CurrentSegmentId() > startPos.SegmentId {
+			break
+		}
+		// 跳过位置小于给定位置的数据块（按 (BlockNumber, ChunkOffset) 字典序比较）。
 		currentPos := reader.CurrentChunkPosition()
-		if currentPos.BlockNumber >= startPos.BlockNumber && currentPos.ChunkOffset >= startPos.ChunkOffset {
+		if currentPos.BlockNumber > startPos.BlockNumber ||
+			(currentPos.BlockNumber == startPos.BlockNumber && currentPos.ChunkOffset >= startPos.ChunkOffset) {
 			break
 		}
 		// 调用 Next 继续查找。
@@ -372,10 +402,15 @@ func (wal *WAL) rotateActiveSegment() error {
 	if err := wal.activeSegment.Sync(); err != nil {
 		return err
 	}
+	wal.advanceDurableSeq(wal.writeSeq.Load())
 	wal.bytesWrite = 0
 	segment, err := openSegmentFile(wal.options.DirPath, wal.options.SegmentFileExt,
 		wal.activeSegment.id+1)
 	if err != nil {
+		return err
+	}
+	if err := util.SyncDir(wal.options.DirPath); err != nil {
+		_ = segment.Close()
 		return err
 	}
 	wal.olderSegments[wal.activeSegment.id] = wal.activeSegment
@@ -383,52 +418,130 @@ func (wal *WAL) rotateActiveSegment() error {
 	return nil
 }
 
-// WriteAll 将 wal.pendingWrites 写入 WAL 然后清除 pendingWrites，
-// 它不会根据 wal.options 同步段文件，你应该手动调用 Sync()。
-func (wal *WAL) WriteAll() ([]*ChunkPosition, error) {
-	if len(wal.pendingWrites) == 0 {
+// WriteBatch 无状态并发安全批量写入多条记录。
+func (wal *WAL) WriteBatch(records [][]byte) ([]*ChunkPosition, error) {
+	if len(records) == 0 {
 		return make([]*ChunkPosition, 0), nil
+	}
+	var totalSize int64
+	for _, rec := range records {
+		totalSize += wal.maxDataWriteSize(int64(len(rec)))
+	}
+	return wal.writeBatchWithSize(records, totalSize)
+}
+
+// AppendBatch 无状态批量追加记录到 WAL 且不分配返回 []*ChunkPosition，降低 Memtable WAL 写路径分配开销。
+func (wal *WAL) AppendBatch(records [][]byte) error {
+	if len(records) == 0 {
+		return nil
+	}
+	var totalSize int64
+	for _, rec := range records {
+		totalSize += wal.maxDataWriteSize(int64(len(rec)))
 	}
 
 	wal.mu.Lock()
-	defer func() {
-		wal.ClearPendingWrites()
+	if totalSize > wal.options.SegmentSize {
 		wal.mu.Unlock()
-	}()
+		return ErrPendingSizeTooLarge
+	}
+	if wal.activeSegment.Size()+totalSize > wal.options.SegmentSize {
+		if err := wal.rotateActiveSegment(); err != nil {
+			wal.mu.Unlock()
+			return err
+		}
+	}
+	written, err := wal.activeSegment.writeAllNoPos(records, totalSize)
+	if err != nil {
+		wal.mu.Unlock()
+		return err
+	}
+	targetSeq := wal.writeSeq.Add(1)
+	wal.bytesWrite += written
+	needBytesSync := wal.options.BytesPerSync > 0 && wal.bytesWrite >= wal.options.BytesPerSync
+	if needBytesSync {
+		wal.bytesWrite = 0
+	}
+	wal.mu.Unlock()
+
+	if needBytesSync {
+		return wal.syncTo(targetSeq)
+	}
+	return nil
+}
+
+func (wal *WAL) writeBatchWithSize(records [][]byte, pendingSize int64) ([]*ChunkPosition, error) {
+	wal.mu.Lock()
 
 	// 如果待处理大小仍然大于段大小，返回错误
-	if wal.pendingSize > wal.options.SegmentSize {
+	if pendingSize > wal.options.SegmentSize {
+		wal.mu.Unlock()
 		return nil, ErrPendingSizeTooLarge
 	}
 
 	// 如果活动段文件已满，同步它并创建一个新的。
-	if wal.activeSegment.Size()+wal.pendingSize > wal.options.SegmentSize {
+	if wal.activeSegment.Size()+pendingSize > wal.options.SegmentSize {
 		if err := wal.rotateActiveSegment(); err != nil {
+			wal.mu.Unlock()
 			return nil, err
 		}
 	}
 
 	// 将所有数据写入活动段文件。
-	positions, err := wal.activeSegment.writeAll(wal.pendingWrites)
+	positions, err := wal.activeSegment.writeAll(records)
 	if err != nil {
+		wal.mu.Unlock()
 		return nil, err
 	}
-	wal.writeSeq++
+	targetSeq := wal.writeSeq.Add(1)
+	for _, p := range positions {
+		wal.bytesWrite += p.ChunkSize
+	}
+	needBytesSync := wal.options.BytesPerSync > 0 && wal.bytesWrite >= wal.options.BytesPerSync
+	if needBytesSync {
+		wal.bytesWrite = 0
+	}
+	wal.mu.Unlock()
+
+	if needBytesSync {
+		if err := wal.syncTo(targetSeq); err != nil {
+			return nil, err
+		}
+	}
 
 	return positions, nil
+}
+
+// WriteAll 将 wal.pendingWrites 写入 WAL 然后清除 pendingWrites，
+// 若配置了 BytesPerSync 则在达到阈值时自动合批 Sync，否则由调用方按需调用 Sync()。
+func (wal *WAL) WriteAll() ([]*ChunkPosition, error) {
+	wal.pendingWritesLock.Lock()
+	if len(wal.pendingWrites) == 0 {
+		wal.pendingWritesLock.Unlock()
+		return make([]*ChunkPosition, 0), nil
+	}
+	batch := make([][]byte, len(wal.pendingWrites))
+	copy(batch, wal.pendingWrites)
+	pendingSize := wal.pendingSize
+	wal.pendingWrites = wal.pendingWrites[:0]
+	wal.pendingSize = 0
+	wal.pendingWritesLock.Unlock()
+
+	return wal.writeBatchWithSize(batch, pendingSize)
 }
 
 // Write 将数据写入 WAL。 实际上，它将数据写入活动段文件。
 // 它返回数据在 WAL 中的位置，如果有错误则返回错误。
 func (wal *WAL) Write(data []byte) (*ChunkPosition, error) {
 	wal.mu.Lock()
-	defer wal.mu.Unlock()
-	if int64(len(data))+chunkHeaderSize > wal.options.SegmentSize {
+	if wal.maxDataWriteSize(int64(len(data))) > wal.options.SegmentSize {
+		wal.mu.Unlock()
 		return nil, ErrValueTooLarge
 	}
 	// 如果活动段文件已满，同步它并创建一个新的。
 	if wal.isFull(int64(len(data))) {
 		if err := wal.rotateActiveSegment(); err != nil {
+			wal.mu.Unlock()
 			return nil, err
 		}
 	}
@@ -436,23 +549,28 @@ func (wal *WAL) Write(data []byte) (*ChunkPosition, error) {
 	// 将数据写入活动段文件。
 	position, err := wal.activeSegment.Write(data)
 	if err != nil {
+		wal.mu.Unlock()
 		return nil, err
 	}
 
 	// 更新 group sync 使用的写序列。
-	wal.writeSeq++
+	targetSeq := wal.writeSeq.Add(1)
 	wal.bytesWrite += position.ChunkSize
 
-	// 如果开启了Sync。
-	var needSync = wal.options.Sync
+	// 如果开启了 Sync 或达到 BytesPerSync，先释放 wal.mu 再走流水线 Group Commit。
+	needSync := wal.options.Sync
 	if !needSync && wal.options.BytesPerSync > 0 {
 		needSync = wal.bytesWrite >= wal.options.BytesPerSync
 	}
 	if needSync {
-		if err := wal.activeSegment.Sync(); err != nil {
+		wal.bytesWrite = 0
+	}
+	wal.mu.Unlock()
+
+	if needSync {
+		if err := wal.syncTo(targetSeq); err != nil {
 			return nil, err
 		}
-		wal.bytesWrite = 0
 	}
 
 	return position, nil
@@ -461,34 +579,37 @@ func (wal *WAL) Write(data []byte) (*ChunkPosition, error) {
 // Read 根据给定的位置从 WAL 中读取数据。
 func (wal *WAL) Read(pos *ChunkPosition) ([]byte, error) {
 	wal.mu.RLock()
-	defer wal.mu.RUnlock()
-
-	// 根据位置信息找到段文件
+	// 根据位置信息找到段文件，立即释放 wal.mu，由 segment.ioMu 保护并发读与段关闭。
 	var segment *segment
-	if pos.SegmentId == wal.activeSegment.id {
+	if wal.activeSegment != nil && pos.SegmentId == wal.activeSegment.id {
 		segment = wal.activeSegment
 	} else {
 		segment = wal.olderSegments[pos.SegmentId]
 	}
+	ext := wal.options.SegmentFileExt
+	wal.mu.RUnlock()
 
 	if segment == nil {
-		return nil, fmt.Errorf("segment file %d%s not found", pos.SegmentId, wal.options.SegmentFileExt)
+		return nil, fmt.Errorf("segment file %d%s not found", pos.SegmentId, ext)
 	}
 
-	return segment.Read(pos.BlockNumber, pos.ChunkOffset)
+	return segment.readAtPos(pos, wal.blockCache)
+}
+
+func (wal *WAL) stopSyncTicker() {
+	wal.closeOnce.Do(func() {
+		close(wal.closeC)
+	})
+	wal.tickerWG.Wait()
 }
 
 // Close 关闭 WAL。
 // 如果配置了对象存储，它会将所有段文件上传到对象存储。
 func (wal *WAL) Close() error {
+	wal.stopSyncTicker()
+
 	wal.mu.Lock()
 	defer wal.mu.Unlock()
-
-	select {
-	case <-wal.closeC:
-	default:
-		close(wal.closeC)
-	}
 
 	// 如果配置了对象存储，上传所有段文件
 	if wal.objectStorage != nil {
@@ -511,7 +632,6 @@ func (wal *WAL) Close() error {
 			if err != nil {
 				return fmt.Errorf("failed to upload segment file %s: %w", fileName, err)
 			}
-			wal.renameIds = append(wal.renameIds, segment.id)
 		}
 
 		// 上传活动段文件
@@ -522,29 +642,23 @@ func (wal *WAL) Close() error {
 		if err != nil {
 			return fmt.Errorf("failed to upload active segment file %s: %w", fileName, err)
 		}
-		wal.renameIds = append(wal.renameIds, wal.activeSegment.id)
 
 		// 关闭对象存储连接
 		if err := wal.objectStorage.Close(); err != nil {
 			return fmt.Errorf("failed to close object storage: %w", err)
 		}
-
-		// 不再使用临时目录，无需清理
-	} else {
-		// 关闭所有段文件。
-		for _, segment := range wal.olderSegments {
-			if err := segment.Close(); err != nil {
-				return err
-			}
-			wal.renameIds = append(wal.renameIds, segment.id)
-		}
 	}
 
+	// 无论是否启用对象存储，都必须关闭所有旧段文件句柄防止 FD 泄漏。
+	for _, segment := range wal.olderSegments {
+		if err := segment.Close(); err != nil {
+			return err
+		}
+		wal.renameIds = append(wal.renameIds, segment.id)
+	}
 	wal.olderSegments = nil
 
-	if wal.objectStorage == nil {
-		wal.renameIds = append(wal.renameIds, wal.activeSegment.id)
-	}
+	wal.renameIds = append(wal.renameIds, wal.activeSegment.id)
 	// 关闭活跃段。
 	return wal.activeSegment.Close()
 }
@@ -561,7 +675,7 @@ func (wal *WAL) PublishSegments(stagingDir string, lastID SegmentID) error {
 	if err := wal.activeSegment.Sync(); err != nil {
 		return err
 	}
-	wal.durableSeq = wal.writeSeq
+	wal.advanceDurableSeq(wal.writeSeq.Load())
 	ext := wal.options.SegmentFileExt
 	for wal.activeSegment.id < lastID {
 		id := wal.activeSegment.id + 1
@@ -576,7 +690,7 @@ func (wal *WAL) PublishSegments(stagingDir string, lastID SegmentID) error {
 		wal.activeSegment = newSegment
 		wal.bytesWrite = 0
 	}
-	return nil
+	return util.SyncDir(wal.options.DirPath)
 }
 
 // DeleteSegmentsBelow 删除所有 ID 小于 id 的旧段文件。
@@ -585,6 +699,7 @@ func (wal *WAL) DeleteSegmentsBelow(id SegmentID) error {
 	wal.mu.Lock()
 	defer wal.mu.Unlock()
 
+	deleted := false
 	for segID, segment := range wal.olderSegments {
 		if segID >= id {
 			continue
@@ -592,46 +707,81 @@ func (wal *WAL) DeleteSegmentsBelow(id SegmentID) error {
 		if err := segment.Remove(); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return err
 		}
+		wal.blockCache.evictSegment(segID)
 		delete(wal.olderSegments, segID)
+		deleted = true
+	}
+	if deleted {
+		return util.SyncDir(wal.options.DirPath)
 	}
 	return nil
 }
 
 // Delete 删除 WAL 的所有段文件。
 func (wal *WAL) Delete() error {
+	wal.stopSyncTicker()
+
 	wal.mu.Lock()
 	defer wal.mu.Unlock()
 
 	// 删除所有段文件。
-	for _, segment := range wal.olderSegments {
+	for segID, segment := range wal.olderSegments {
 		if err := segment.Remove(); err != nil {
 			return err
 		}
+		wal.blockCache.evictSegment(segID)
 	}
 	wal.olderSegments = nil
 
 	// 删除活跃段。
-	return wal.activeSegment.Remove()
+	if err := wal.activeSegment.Remove(); err != nil {
+		return err
+	}
+	wal.blockCache.evictSegment(wal.activeSegment.id)
+	return util.SyncDir(wal.options.DirPath)
 }
 
-// Sync 将活动段文件同步到稳定存储（如磁盘）。
+func (wal *WAL) advanceDurableSeq(seq uint64) {
+	for {
+		cur := wal.durableSeq.Load()
+		if seq <= cur {
+			return
+		}
+		if wal.durableSeq.CompareAndSwap(cur, seq) {
+			return
+		}
+	}
+}
+
+// Sync 将活动段文件同步到稳定存储（流水线 Group Commit：不持 wal.mu 执行 fsync，允许并发写入继续累积进下一批）。
 func (wal *WAL) Sync() error {
-	wal.mu.Lock()
-	target := wal.writeSeq
-	wal.mu.Unlock()
+	return wal.syncTo(wal.writeSeq.Load())
+}
+
+func (wal *WAL) syncTo(target uint64) error {
+	if wal.durableSeq.Load() >= target {
+		return nil
+	}
 
 	wal.syncMu.Lock()
 	defer wal.syncMu.Unlock()
 
-	wal.mu.Lock()
-	defer wal.mu.Unlock()
-	if wal.durableSeq >= target {
+	if wal.durableSeq.Load() >= target {
 		return nil
 	}
-	if err := wal.activeSegment.Sync(); err != nil {
+
+	wal.mu.RLock()
+	seg := wal.activeSegment
+	seq := wal.writeSeq.Load()
+	wal.mu.RUnlock()
+
+	if seg == nil {
+		return nil
+	}
+	if err := seg.Sync(); err != nil {
 		return err
 	}
-	wal.durableSeq = wal.writeSeq
+	wal.advanceDurableSeq(seq)
 	return nil
 }
 

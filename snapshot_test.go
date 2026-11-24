@@ -199,7 +199,8 @@ func TestSnapshotCleanup(t *testing.T) {
 }
 
 func TestExportSnapshotError(t *testing.T) {
-	db := &DB{closed: true}
+	db := &DB{}
+	db.closed.Store(true)
 	err := db.ExportSnapshot()
 	if err == nil {
 		t.Fatalf("should fail when db is closed")
@@ -207,7 +208,8 @@ func TestExportSnapshotError(t *testing.T) {
 }
 
 func TestImportSnapshotError(t *testing.T) {
-	db := &DB{closed: true}
+	db := &DB{}
+	db.closed.Store(true)
 	err := db.ImportSnapshot("not_exist.zst")
 	if err == nil {
 		t.Fatalf("should fail when db is closed")

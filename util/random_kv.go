@@ -2,27 +2,21 @@ package util
 
 import (
 	"fmt"
-	"math/rand"
-	"sync"
-	"time"
+	"math/rand/v2"
 )
 
-var (
-	lock    = sync.Mutex{}
-	randStr = rand.New(rand.NewSource(time.Now().Unix()))
-	letters = []byte("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
-)
+const letters = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 
 func GetTestKey(i int64) []byte {
 	return []byte(fmt.Sprintf("knocidb-test-key-%09d", i))
 }
 
 func RandomValue(n int) []byte {
-	b := make([]byte, n)
-	for i := range b {
-		lock.Lock()
-		b[i] = letters[randStr.Intn(len(letters))]
-		lock.Unlock()
+	const prefix = "knocidb-test-value-"
+	buf := make([]byte, len(prefix)+n)
+	copy(buf, prefix)
+	for i := 0; i < n; i++ {
+		buf[len(prefix)+i] = letters[rand.IntN(len(letters))]
 	}
-	return []byte("knocidb-test-value-" + string(b))
+	return buf
 }
